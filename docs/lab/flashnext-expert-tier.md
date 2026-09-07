@@ -226,6 +226,20 @@ boundaries:
   keep the gate closed (everything staged only); `enable_heat` opens it.
   This relaxes the exclusive placement deliberately (RAM copies allowed
   within the fixed RAM footprint) and is not verified on a GPU.
+- **RAM backing** (`VLLM_LAB_EXPERT_TIER_RAM_BACKING`, default 0; needs
+  `PROMOTE=1`). The loader's pinned UVA source of every expert (row =
+  expert id, the same allocation the loader already holds at READY) is
+  kept as the RAM bank instead of compacting the cold rows into a new
+  pinned allocation, so RAM row `e` holds expert `e` for the life of the
+  process, as in FreeToken. An eviction then only flips the tables: no
+  D2H copy, no RAM pool, no shadows (`ram_free` is a placeholder of the
+  VRAM ring's length so the planner capacity stays the ring length, and
+  `ram_shadow` is the identity). The evict launch is skipped in
+  `split_promote`, and the init-verification swap copies in only. Host
+  bytes: the full expert source stays resident (63.3 GiB for 48 x 512
+  experts, the loader's own peak) instead of the cold rows plus pool;
+  no bank is held twice. VRAM budget and addresses are unchanged. The
+  READY log carries `host_bytes` and `ram_backing`.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.

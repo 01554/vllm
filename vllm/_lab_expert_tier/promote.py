@@ -39,6 +39,13 @@ Ownership contract (a deliberate relaxation of the exclusive placement):
   promoted expert's RAM row enters the pool as its shadow, so the pool size
   is invariant and RAM never grows.
 
+RAM backing (`backing=True`, opt-in) keeps every expert's RAM row for the
+life of the process: RAM row `e` always holds expert `e`, so an eviction
+only flips the tables and never writes back (FreeToken keeps the same
+invariant). The RAM pool and shadows are unused; `ram_free` is a
+placeholder of the VRAM ring's length so the planner's capacity stays
+min(F, R) = F, and `cold_rows[slot]` is the evicted expert's own row.
+
 This module holds the device state, the torch reference implementations
 (the CPU tests and non-CUDA devices run them), and the Triton kernels for
 the gather, the evict, and the flip. The planner lives in `device_lru.py`
@@ -72,6 +79,7 @@ class PromoteTables:
     clock: Any  # [1] int64
     error: Any  # [1] int32 sticky device error
     lru_state: Any = None  # planner-owned state (device_lru.allocate_state)
+    backing: bool = False  # RAM row e always holds expert e; no write-back
 
 
 @dataclass(frozen=True)
@@ -89,10 +97,24 @@ class StepPlan:
 
 
 def allocate_tables(
-    device, num_experts, hot_slots, cold_slots, vram_free_rows, ram_free_rows
+    device,
+    num_experts,
+    hot_slots,
+    cold_slots,
+    vram_free_rows,
+    ram_free_rows,
+    backing=False,
 ):
-    """Initial tables: logical slot i lives in physical row i; rings full."""
+    """Initial tables: logical slot i lives in physical row i; rings full.
+
+    With `backing` the RAM bank has `num_experts` rows indexed by expert,
+    logical cold slot i starts at row hot_slots + i, and `ram_free_rows`
+    must be empty (the placeholder pool is sized like the VRAM ring).
+    """
     import torch
+
+    if backing and len(list(ram_free_rows)):
+        raise ValueError("RAM backing has no RAM pool")
 
     hot_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
     cold_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
@@ -108,13 +130,18 @@ def allocate_tables(
     ram_shadow[:cold_slots] = torch.arange(
         hot_slots, hot_slots + cold_slots, dtype=torch.int32, device=device
     )
+    if backing:
+        cold_rows = cold_rows + hot_slots
+        ram_free = torch.full_like(vram_free, -1)
+        ram_shadow = torch.arange(num_experts, dtype=torch.int32, device=device)
+    cold_phys = torch.where(cold_map >= 0, cold_rows[cold_map.clamp(min=0)], cold_map)
     tables = PromoteTables(
         hot_map=hot_map,
         cold_map=cold_map,
         hot_rows=hot_rows,
         cold_rows=cold_rows,
         hot_phys=hot_map.clone(),
-        cold_phys=cold_map.clone(),
+        cold_phys=cold_phys,
         vram_free=vram_free,
         ram_free=ram_free,
         ring_state=ring_state,
@@ -122,12 +149,17 @@ def allocate_tables(
         last_use=torch.zeros(num_experts, dtype=torch.int64, device=device),
         clock=torch.zeros(1, dtype=torch.int64, device=device),
         error=torch.zeros(1, dtype=torch.int32, device=device),
+        backing=backing,
     )
     return tables
 
 
 def capacity(tables):
-    """Promotions one step may make: min(free VRAM ring, RAM pool) by contract."""
+    """Promotions one step may make: min(free VRAM ring, RAM pool) by contract.
+
+    With RAM backing the pool is a placeholder of the ring's length, so the
+    same expression yields the ring length.
+    """
     return int(min(tables.vram_free.shape[0], tables.ram_free.shape[0]))
 
 
@@ -200,6 +232,9 @@ def apply_step_reference(tables, plan, staging_rows):
     - the logical slot of the victim is taken over by the promoted expert,
       and the victim takes the promoted expert's logical cold slot;
     - staged-only misses map to the staging rows in order.
+    With RAM backing the victim's destination is its own RAM row (its bytes
+    are still there), nothing is evicted, and the pool and shadows are
+    untouched.
     Recency is the planner's; the flip never touches last_use or the clock.
     Returns row lists for the copies and the physical step map [E].
     """
@@ -227,7 +262,7 @@ def apply_step_reference(tables, plan, staging_rows):
     # first, so a later victim's write never invalidates a reclaimable one.
     positions = [-1] * count
     taken: set[int] = set()
-    for i in range(count):
+    for i in range(count if not tables.backing else 0):
         victim = int(plan.victim_expert[i])
         for j, row in enumerate(ram_free):
             if j not in taken and shadow[row] == victim:
@@ -248,7 +283,9 @@ def apply_step_reference(tables, plan, staging_rows):
         # RAM: pass 2 writes the round-robin head, skipping reclaimed
         # positions, after invalidating that row's old shadow.
         position = positions[i]
-        if position < 0:
+        if tables.backing:
+            dst_ram = victim
+        elif position < 0:
             while ram_head in taken:
                 ram_head = (ram_head + 1) % len(ram_free)
             position = ram_head
@@ -259,9 +296,10 @@ def apply_step_reference(tables, plan, staging_rows):
             evicts.append((victim_row, dst_ram))
         else:
             dst_ram = ram_free[position]
-        # The promoted expert's RAM row enters the pool as its shadow.
-        ram_free[position] = src_ram
-        shadow[src_ram] = expert
+        if not tables.backing:
+            # The promoted expert's RAM row enters the pool as its shadow.
+            ram_free[position] = src_ram
+            shadow[src_ram] = expert
         # Flip the logical slots and physical rows.
         hot_rows[hot_slot] = dst_vram
         cold_rows[cold_slot] = dst_ram
@@ -337,13 +375,22 @@ def check_tables(tables, hot_slots, cold_slots):
     if len(set(vram_free)) != len(vram_free) or set(vram_free) & set(hot_rows):
         raise AssertionError("A VRAM row is both hot and free, or listed twice")
     ram_free = tables.ram_free.tolist()
-    if len(set(ram_free)) != len(ram_free) or set(ram_free) & set(cold_rows):
-        raise AssertionError("A RAM row is both cold and free, or listed twice")
     shadow = tables.ram_shadow.tolist()
-    for c, row in enumerate(cold_rows):
-        expert = cold_map.index(c)
-        if shadow[row] != expert:
-            raise AssertionError(f"Cold row {row} must shadow its expert {expert}")
+    if tables.backing:
+        if ram_free != [-1] * len(vram_free):
+            raise AssertionError("RAM backing keeps a placeholder pool only")
+        if shadow != list(range(len(hot_map))):
+            raise AssertionError("RAM backing keeps every expert in its own row")
+        for c, row in enumerate(cold_rows):
+            if row != cold_map.index(c):
+                raise AssertionError(f"Cold slot {c} must point at its expert's row")
+    else:
+        if len(set(ram_free)) != len(ram_free) or set(ram_free) & set(cold_rows):
+            raise AssertionError("A RAM row is both cold and free, or listed twice")
+        for c, row in enumerate(cold_rows):
+            expert = cold_map.index(c)
+            if shadow[row] != expert:
+                raise AssertionError(f"Cold row {row} must shadow its expert {expert}")
     if int(tables.error[0]):
         raise RuntimeError("Promote mode recorded a device error")
 
@@ -450,6 +497,7 @@ def flip_step(tables, plan, buffers, staging_rows):
         tables.ram_free.shape[0],
         WIDTH=PLAN_WIDTH,
         MAP_BLOCK=1024,
+        BACKING=bool(tables.backing),
     )
 
 
@@ -527,6 +575,7 @@ def _flip_kernel():
         ram_pool,
         WIDTH: tl.constexpr,
         MAP_BLOCK: tl.constexpr,
+        BACKING: tl.constexpr,
     ):
         count = tl.load(count_ptr)
         staged_count = tl.load(staged_count_ptr)
@@ -536,7 +585,11 @@ def _flip_kernel():
         # Pass 1: record, per promotion lane, the pool position whose shadow
         # is the victim (or -1); a position claimed by one lane is not
         # matched again by another.
-        for i in range(0, count):
+        if BACKING:  # noqa: SIM108 (constexpr branch inside the jit)
+            pass_count = count * 0
+        else:
+            pass_count = count
+        for i in range(0, pass_count):
             victim = tl.load(victim_expert_ptr + i)
             position = -1
             for j in range(0, ram_pool):
@@ -563,7 +616,10 @@ def _flip_kernel():
             tl.store(gather_src_ptr + i, src_ram)
             tl.store(gather_dst_ptr + i, dst_vram)
             position = tl.load(evict_pos_ptr + i)
-            if position < 0:
+            if BACKING:
+                # The victim's own RAM row still holds its bytes.
+                dst_ram = victim
+            elif position < 0:
                 # Round-robin head, skipping positions reclaimed in pass 1
                 # or already handed out this step.
                 claimed = 1
@@ -584,8 +640,9 @@ def _flip_kernel():
                 evicts += 1
             else:
                 dst_ram = tl.load(ram_free_ptr + position)
-            tl.store(ram_free_ptr + position, src_ram)
-            tl.store(ram_shadow_ptr + src_ram, expert)
+            if not BACKING:
+                tl.store(ram_free_ptr + position, src_ram)
+                tl.store(ram_shadow_ptr + src_ram, expert)
             tl.store(hot_rows_ptr + hot_slot, dst_vram)
             tl.store(cold_rows_ptr + cold_slot, dst_ram)
             tl.store(hot_map_ptr + expert, hot_slot)

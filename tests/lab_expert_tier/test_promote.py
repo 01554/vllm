@@ -192,6 +192,80 @@ class PromoteReferenceTests(unittest.TestCase):
         self.assertEqual(int(plan.promote_expert[0]), 3)
         pm.check_tables(tables, 2, 4)
 
+    def setup_backing(self, experts=6, hot=2, vram_free=2, staging=2):
+        """RAM backing: RAM row e holds expert e for good; no pool, no shadows."""
+        device = torch.device("cpu")
+        cold = experts - hot
+        bank_rows = hot + staging + vram_free
+        tables = pm.allocate_tables(
+            device, experts, hot, cold, range(hot + staging, bank_rows), (), True
+        )
+        bank, ram = make_banks(bank_rows, experts)
+        for e in range(hot):
+            fill_expert(bank, e, e, 0)
+        for e in range(experts):
+            fill_expert(ram, e, e, 0)
+        return tables, bank, ram, list(range(hot, hot + staging))
+
+    def test_backing_tables_start_consistent_and_reject_a_pool(self):
+        tables, bank, ram, staging_rows = self.setup_backing()
+        self.assertTrue(tables.backing)
+        self.assertEqual(tables.cold_rows.tolist(), [2, 3, 4, 5])
+        self.assertEqual(tables.cold_phys.tolist(), [-1, -1, 2, 3, 4, 5])
+        self.assertEqual(tables.ram_free.tolist(), [-1, -1])
+        self.assertEqual(pm.capacity(tables), 2)
+        pm.check_tables(tables, 2, 4)
+        with self.assertRaises(ValueError):
+            pm.allocate_tables(torch.device("cpu"), 6, 2, 4, range(4, 6), [4], True)
+
+    def test_backing_promotion_never_evicts_and_victim_keeps_its_own_row(self):
+        tables, bank, ram, staging_rows = self.setup_backing()
+        before = {name: t.clone() for name, t in ram.items()}
+        # Touch expert 1 so expert 0 is the victim; 4 and 5 are misses.
+        self.run_step(tables, bank, ram, staging_rows, torch.tensor([[1, 1]]))
+        plan, gathers, staged, evicts, step_map = self.run_step(
+            tables, bank, ram, staging_rows, torch.tensor([[4, 5]])
+        )
+        self.assertEqual(int(plan.count[0]), 2)
+        self.assertEqual(evicts, [])
+        self.assertEqual(gathers, [(4, 4), (5, 5)])
+        self.assertEqual(tables.hot_map.tolist(), [-1, -1, -1, -1, 0, 1])
+        # Victims 0 and 1 now own the cold slots of 4 and 5, at their own rows.
+        self.assertEqual(tables.cold_map.tolist(), [2, 3, 0, 1, -1, -1])
+        self.assertEqual(tables.cold_phys.tolist(), [0, 1, 2, 3, -1, -1])
+        self.assertEqual(tables.cold_rows.tolist(), [2, 3, 0, 1])
+        self.assertEqual(tables.ram_free.tolist(), [-1, -1])
+        pm.check_tables(tables, 2, 4)
+        self.assert_rows_hold_experts(tables, bank, ram)
+        for name in pm.TENSORS:
+            self.assertTrue(torch.equal(ram[name], before[name]), name)
+
+    def test_backing_random_steps_never_write_ram(self):
+        rng = random.Random(11)
+        for trial in range(30):
+            experts = rng.choice([4, 6, 8])
+            hot = rng.randint(1, experts - 1)
+            vram_free = rng.randint(1, 3)
+            staging = rng.randint(1, 3)
+            tables, bank, ram, staging_rows = self.setup_backing(
+                experts, hot, vram_free, staging
+            )
+            before = {name: t.clone() for name, t in ram.items()}
+            for step in range(25):
+                ids = torch.tensor(
+                    [[rng.choice([-1, rng.randrange(experts)]) for _ in range(staging)]]
+                )
+                _, _, _, evicts, step_map = self.run_step(
+                    tables, bank, ram, staging_rows, ids
+                )
+                self.assertEqual(evicts, [])
+                pm.check_tables(tables, hot, experts - hot)
+                self.assert_rows_hold_experts(tables, bank, ram)
+                for expert in {int(e) for e in ids.reshape(-1).tolist() if e >= 0}:
+                    self.assertGreaterEqual(int(step_map[expert]), 0)
+            for name in pm.TENSORS:
+                self.assertTrue(torch.equal(ram[name], before[name]))
+
     def test_random_steps_keep_ownership_and_bytes_consistent(self):
         rng = random.Random(5)
         for trial in range(30):
@@ -263,6 +337,37 @@ class PromoteSmokeSequenceTests(PromoteReferenceTests):
         self.assertEqual(expected_counts[1][:2], (8, 0))
         self.assertLess(expected_counts[1][2], 8)
         self.assertTrue(any(evicts > 0 for _, _, evicts in expected_counts[2:]))
+
+
+@unittest.skipIf(torch is None, "CPU torch is not installed")
+class BackingSmokeSequenceTests(PromoteReferenceTests):
+    def test_smoke_sequence_with_backing_promotes_fully_and_never_copies_out(self):
+        from lab_expert_tier import device_lru
+
+        tables, bank, ram, staging_rows = self.setup_backing(
+            experts=24, hot=12, vram_free=8, staging=10
+        )
+        state = device_lru.allocate_state(tables, 10)
+        device_lru.open_gate(state)
+        before = {name: t.clone() for name, t in ram.items()}
+        counts = []
+        for ids in smoke_sequence():
+            plan = device_lru.plan_step(ids, tables, 10)
+            gathers, staged, evicts, step_map = pm.apply_step_reference(
+                tables, plan, staging_rows
+            )
+            pm.copy_rows_reference(ram, bank, gathers + staged)
+            counts.append((int(plan.count[0]), int(plan.staged_only_count[0])))
+            self.assertEqual(evicts, [])
+            pm.check_tables(tables, 12, 12)
+            self.assert_rows_hold_experts(tables, bank, ram)
+            for expert in {int(e) for e in ids.reshape(-1).tolist()}:
+                self.assertGreaterEqual(int(step_map[expert]), 0)
+        # The placeholder pool never limits promotion below the VRAM ring.
+        self.assertEqual(counts[0], (8, 2))
+        self.assertEqual(counts[1], (8, 0))
+        for name in pm.TENSORS:
+            self.assertTrue(torch.equal(ram[name], before[name]))
 
 
 @unittest.skipIf(torch is None, "CPU torch is not installed")
