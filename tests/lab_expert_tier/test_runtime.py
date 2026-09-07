@@ -1,0 +1,572 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU-only invariants and real tensor byte/lifetime tests for the tier adapter."""
+
+import gc
+import importlib.util
+import json
+import os
+import sys
+import unittest
+import weakref
+from importlib.abc import Loader
+from importlib.machinery import ModuleSpec
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock, patch
+
+HERE = Path(__file__).resolve().parents[2] / "vllm" / "_lab_expert_tier"
+if "lab_expert_tier" not in sys.modules:
+    spec = cast(
+        ModuleSpec,
+        importlib.util.spec_from_file_location(
+            "lab_expert_tier",
+            HERE / "__init__.py",
+            submodule_search_locations=[str(HERE)],
+        ),
+    )
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = package
+    cast(Loader, spec.loader).exec_module(package)
+from lab_expert_tier import runtime as rt  # noqa: E402
+
+try:
+    import torch
+    from torch.multiprocessing.reductions import StorageWeakRef
+except ImportError:
+    torch = None
+
+
+class InvariantTests(unittest.TestCase):
+    def test_exact_six_tensor_budget_and_complementary_partition(self):
+        slots, size = rt.uniform_slots(32 * 2**30, [2764808] * 48, 512)
+        self.assertEqual((slots, size), (258, 34239382272))
+        h, c = tuple(range(258)) + (-1,) * 254, (-1,) * 258 + tuple(range(254))
+        rt.validate_partition(h, c, 258, 254)
+        self.assertEqual(size + 254 * 2764808 * 48, 67947921408)
+        h2, c2 = rt.maps_after_swap(h, c, 0, 258, 0, 0)
+        self.assertEqual((h2[0], c2[0], h2[258], c2[258]), (-1, 0, 0, -1))
+        self.assertEqual(rt.maps_after_swap(h2, c2, 258, 0, 0, 0), (h, c))
+
+    def test_partition_rejects_missing_duplicate_or_double_resident(self):
+        for h, c in (
+            ((0, -1), (0, -1)),
+            ((0, 0), (-1, 0)),
+            ((0, -2), (-1, 0)),
+            ((0, -1), (-1, -1)),
+        ):
+            with self.assertRaises(AssertionError):
+                rt.validate_partition(h, c, 1, 1)
+        with self.assertRaises(AssertionError):
+            rt.maps_after_swap((0, -1), (-1, 0), 1, 0, 0, 0)
+
+    def test_padding_and_zero_weight_activity_are_preserved(self):
+        packed = [[[0, 2, 1, 0, 1], [-1, -1, 0, 0, 0]]] * 2
+        routes, activity, mask, tokens = rt.unpack_routes(packed, 4)
+        self.assertEqual(routes[0], [[0, 2], [-1, -1]])
+        self.assertEqual(activity[0], [[1, 0], [0, 0]])
+        self.assertEqual((mask, tokens), ([True, False], 1))
+        self.assertEqual(rt.unpack_routes([[[-1, -1, 0, 0, 0]]], 4)[-1], 0)
+
+    def test_invalid_real_sentinel_and_bad_model_record_fail(self):
+        packed: list[Any]
+        for packed in (
+            [[[-1, 1, 1]]],
+            [[[4, 1, 1]]],
+            [[[-2, 1, 0]]],
+            [[[0, 1, 1]], [[0, 1, 0]]],
+            [[[0, 3, 1]]],
+            [[[0, 1, 2]]],
+            [],
+            [[[]]],
+        ):
+            with self.subTest(packed=packed), self.assertRaises(ValueError):
+                rt.unpack_routes(packed, 4)
+
+    def test_settings_reject_noop_or_unknown_knobs(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(rt.Settings.from_env())
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env(), rt.Settings(32 * 2**30))
+        for suffix, value in (
+            ("LRU", "1"),
+            ("GIB", "-1"),
+            ("VERIFY_INIT", "2"),
+            ("STATS_EVERY", "0"),
+        ):
+            env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
+            with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+                rt.Settings.from_env()
+
+    def test_tuning_settings_are_validated_and_wired_to_policy(self):
+        controls = {
+            "GIB": "32",
+            "SYNC_TOKENS": "10",
+            "SWAPS_PER_TOKEN": "0.25",
+            "DECAY": "0.9",
+            "HYSTERESIS": "0",
+            "DWELL_TOKENS": "12",
+            "MAX_SWAPS_PER_RESYNC": "3",
+            "STATS_EVERY": "1",
+        }
+        with patch.dict(
+            os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
+        ):
+            settings = rt.Settings.from_env()
+        coordinator = rt.TierCoordinator(
+            [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
+        )
+        self.assertEqual(settings.stats_every, 1)
+        expected = {
+            "sync_period": 10,
+            "swaps_per_token": 0.25,
+            "decay": 0.9,
+            "hysteresis": 0.0,
+            "dwell_tokens": 12,
+            "max_swaps_per_resync": 3,
+        }
+        self.assertEqual(settings.policy_kwargs(), expected)
+        for key, expected_value in expected.items():
+            self.assertEqual(getattr(coordinator.policy, key), expected_value)
+        for key, value in (
+            ("SYNC_TOKENS", "-1"),
+            ("SYNC_TOKENS", "1.5"),
+            ("DWELL_TOKENS", "-1"),
+            ("MAX_SWAPS_PER_RESYNC", "-1"),
+            ("SWAPS_PER_TOKEN", "nan"),
+            ("SWAPS_PER_TOKEN", "-1"),
+            ("DECAY", "1.001"),
+            ("DECAY", "-0.1"),
+            ("HYSTERESIS", "inf"),
+            ("HYSTERESIS", "-1"),
+        ):
+            with (
+                self.subTest(key=key, value=value),
+                patch.dict(
+                    os.environ,
+                    {rt.PREFIX + "GIB": "32", rt.PREFIX + key: value},
+                    clear=True,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                rt.Settings.from_env()
+
+    def test_stats_snapshot_has_explicit_zero_counters_and_effective_config(self):
+        coordinator = rt.TierCoordinator(
+            [SimpleNamespace(num_experts=4, hot_slots=2)],
+            rt.Settings(32 * 2**30, sync_tokens=0),
+            {},
+        )
+        with (
+            patch.object(rt.LOGGER, "warning") as logger,
+            patch.object(rt.time, "time_ns", return_value=1234),
+        ):
+            coordinator.report()
+        result = json.loads(logger.call_args.args[1])
+        self.assertEqual(
+            (result["route_hot"], result["route_total"], result["per_layer_swaps"]),
+            (0, 0, [0]),
+        )
+        self.assertEqual(
+            (result["tokens_total"], result["version"], result["timestamp_ns"]),
+            (0, 0, 1234),
+        )
+        self.assertEqual(result["policy_cpu_seconds"], 0)
+        self.assertEqual(result["migration_wall_seconds"], 0)
+        self.assertFalse(result["heat_enabled"])
+        self.assertTrue(result["route_counts_before_migration"])
+        self.assertEqual(result["policy_config"]["sync_period"], 0)
+        self.assertEqual(result["settings"]["capacity_bytes"], 32 * 2**30)
+
+    def test_registry_never_uses_tensor_equality_or_attaches_owner(self):
+        class Parameter:
+            __hash__: Any = None
+
+            def __eq__(self, other):
+                raise AssertionError("Tensor equality is not identity")
+
+        with (
+            patch.object(rt, "_CPU_SOURCES", {}),
+            patch.object(rt, "_CAPTURE_COUNT", 0),
+            patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True),
+        ):
+            p, first, second = Parameter(), object(), object()
+            rt.capture_cpu_source(p, first)
+            stale = rt._CPU_SOURCES[id(p)][0]
+            rt.capture_cpu_source(p, second)
+            stale.__callback__(stale)
+            self.assertIs(rt._get_cpu_source(p), second)
+            self.assertEqual(p.__dict__, {})
+            del p
+            gc.collect()
+            self.assertFalse(rt._CPU_SOURCES)
+
+    def test_ram_temp_order_waits_before_host_overwrite(self):
+        events: list[str | tuple[str, str, bool]] = []
+
+        class Row:
+            def __init__(self, name):
+                self.name = name
+
+            def copy_(self, source, non_blocking=False):
+                events.append((source.name, self.name, non_blocking))
+
+        hot = {name: [Row("hot:" + name)] for name in rt.TENSORS}
+        cold = {name: [Row("cold:" + name)] for name in rt.TENSORS}
+        temp = {name: Row("temp:" + name) for name in rt.TENSORS}
+        rt.swap_tensor_rows(hot, cold, temp, 0, 0, lambda: events.append("wait"))
+        self.assertEqual(events[6], "wait")
+        self.assertEqual(events[13], "wait")
+        self.assertEqual(len(events), 20)
+        for i, name in enumerate(rt.TENSORS):
+            self.assertEqual(events[i], ("hot:" + name, "temp:" + name, True))
+            self.assertEqual(events[7 + i], ("cold:" + name, "hot:" + name, True))
+            self.assertEqual(events[14 + i], ("temp:" + name, "cold:" + name, False))
+
+    def test_stream_handoff_waits_only_at_complete_model_boundaries(self):
+        layer = SimpleNamespace(num_experts=4, hot_slots=2)
+        coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
+        first = SimpleNamespace(cuda_stream=11, synchronize=Mock())
+        second = SimpleNamespace(cuda_stream=22, synchronize=Mock())
+        coordinator.adopt_stream(first, 0)
+        coordinator.adopt_stream(first, 0)
+        first.synchronize.assert_not_called()
+        coordinator.adopt_stream(second, 0)
+        first.synchronize.assert_called_once_with()
+        self.assertIs(coordinator.stream, second)
+        self.assertEqual(coordinator.stream_id, 22)
+        coordinator.adopt_stream(second, 0)
+        second.synchronize.assert_not_called()
+
+    def test_stream_handoff_rejects_midforward_and_keeps_previous_on_wait_failure(self):
+        layer = SimpleNamespace(num_experts=4, hot_slots=2)
+        coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
+        first = SimpleNamespace(cuda_stream=11, synchronize=Mock())
+        second = SimpleNamespace(cuda_stream=22, synchronize=Mock())
+        coordinator.adopt_stream(first, 0)
+        coordinator.pending.append(object())
+        with self.assertRaises(NotImplementedError):
+            coordinator.adopt_stream(second, 1)
+        with self.assertRaises(NotImplementedError):
+            coordinator.adopt_stream(second, 0)
+        coordinator.adopt_stream(first, 1)
+        first.synchronize.assert_not_called()
+        coordinator.pending.clear()
+        with self.assertRaises(NotImplementedError):
+            coordinator.adopt_stream(second, 1)
+        first.synchronize.side_effect = RuntimeError("failed previous stream")
+        with self.assertRaises(RuntimeError):
+            coordinator.adopt_stream(second, 0)
+        self.assertIs(coordinator.stream, first)
+        self.assertEqual(coordinator.stream_id, 11)
+
+    def test_heat_enable_requires_successful_complete_startup_and_waits_once(self):
+        layer = SimpleNamespace(num_experts=4, hot_slots=2)
+        coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
+        self.assertFalse(coordinator.heat_enabled)
+        stream = SimpleNamespace(cuda_stream=11, synchronize=Mock())
+        coordinator.adopt_stream(stream, 0)
+        coordinator.pending.append(object())
+        with self.assertRaises(RuntimeError):
+            coordinator.enable_heat()
+        coordinator.pending.clear()
+        coordinator.poisoned = True
+        with self.assertRaises(RuntimeError):
+            coordinator.enable_heat()
+        coordinator.poisoned = False
+        stream.synchronize.side_effect = RuntimeError("startup CUDA error")
+        with self.assertRaises(RuntimeError):
+            coordinator.enable_heat()
+        self.assertFalse(coordinator.heat_enabled)
+        stream.synchronize.side_effect = None
+        stream.synchronize.reset_mock()
+        coordinator.stats["model_forwards"] = 4
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.enable_heat()
+        stream.synchronize.assert_called_once_with()
+        self.assertTrue(coordinator.heat_enabled)
+        self.assertEqual(dict(coordinator.stats), {})
+        self.assertEqual(
+            (coordinator.policy.tokens_total, coordinator.policy.swaps_total), (0, 0)
+        )
+        self.assertIn('"model_forwards": 4', log.call_args.args[1])
+        with self.assertRaises(RuntimeError):
+            coordinator.enable_heat()
+
+    def test_model_heat_hook_disabled_noop_and_missing_enabled_model_fails(self):
+        with patch.dict(os.environ, {}, clear=True):
+            rt.enable_model_heat(SimpleNamespace())
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                rt.enable_model_heat(SimpleNamespace())
+            coordinator = SimpleNamespace(enable_heat=Mock())
+            rt.enable_model_heat(
+                SimpleNamespace(_lab_expert_tier_coordinator=coordinator)
+            )
+            coordinator.enable_heat.assert_called_once_with()
+
+
+@unittest.skipIf(torch is None, "CPU torch is not installed")
+class TensorTests(unittest.TestCase):
+    def test_six_tensor_partition_swap_and_restore_are_byte_exact(self):
+        dtypes = (
+            torch.int32,
+            torch.int32,
+            torch.uint8,
+            torch.uint8,
+            torch.float32,
+            torch.float32,
+        )
+        full = {
+            name: torch.arange(4 * (i + 1)).reshape(4, i + 1).to(dtype)
+            for i, (name, dtype) in enumerate(zip(rt.TENSORS, dtypes))
+        }
+        hot = {name: t[:2].clone() for name, t in full.items()}
+        cold = {name: t[2:].clone() for name, t in full.items()}
+        temp = {name: torch.empty_like(t[0]) for name, t in full.items()}
+        self.assertEqual(
+            sum(t.nbytes for t in full.values()),
+            sum(t.nbytes for t in hot.values()) + sum(t.nbytes for t in cold.values()),
+        )
+        waits = []
+        rt.swap_tensor_rows(hot, cold, temp, 0, 1, lambda: waits.append(1))
+        self.assertEqual(len(waits), 2)
+        for name in rt.TENSORS:
+            torch.testing.assert_close(hot[name][0], full[name][3], rtol=0, atol=0)
+            torch.testing.assert_close(cold[name][1], full[name][0], rtol=0, atol=0)
+        rt.swap_tensor_rows(hot, cold, temp, 0, 1, lambda: None)
+        for name in rt.TENSORS:
+            torch.testing.assert_close(
+                torch.cat((hot[name], cold[name])), full[name], rtol=0, atol=0
+            )
+
+    def test_compaction_frees_all_raw_storage_with_reload_metadata_alive(self):
+        with (
+            patch.object(rt, "_CPU_SOURCES", {}),
+            patch.object(rt, "_CAPTURE_COUNT", 0),
+            patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True),
+        ):
+            layer = torch.nn.Module()
+            refs, storage_refs, metadata, hot, cold = [], [], [], {}, {}
+            for i, name in enumerate(rt.TENSORS):
+                source = torch.arange(24, dtype=torch.int32).reshape(4, 6).clone()
+                parameter = torch.nn.Parameter(source, requires_grad=False)
+                parameter._vllm_is_uva_offloaded = True
+                setattr(layer, name, parameter)
+                rt.capture_cpu_source(parameter, source)
+                meta = parameter.data.to("meta")
+                meta.__class__ = parameter.__class__
+                meta.__dict__ = parameter.__dict__.copy()
+                metadata.append(meta)
+                refs.append(weakref.ref(source))
+                storage_refs.append(StorageWeakRef(source.untyped_storage()))
+                hot[name], cold[name] = source[:2].clone(), source[2:].clone()
+            # The method's quant/kernel roots deliberately retain old Parameters.
+            old = {name: getattr(layer, name) for name in rt.TENSORS}
+            method = SimpleNamespace(
+                moe_kernel=SimpleNamespace(weights=old), moe_quant_config=old
+            )
+            hot_quant = dict(hot)
+            hot_kernel = SimpleNamespace(weights=hot_quant)
+            rt.replace_full_source_references(layer, method, hot, hot_kernel, hot_quant)
+            del source, parameter, old
+            gc.collect()
+            self.assertTrue(all(ref() is None for ref in refs))
+            self.assertTrue(all(ref.expired() for ref in storage_refs))
+            self.assertFalse(rt._CPU_SOURCES)
+            self.assertEqual(len(metadata), 6)
+            self.assertIs(method.moe_kernel, hot_kernel)
+            for name in rt.TENSORS:
+                self.assertEqual(getattr(layer, name).shape[0], 2)
+                self.assertEqual(cold[name].shape[0], 2)
+
+    def test_split_preserves_hot_output_across_workspace_reuse(self):
+        tier = object.__new__(rt.TierLayer)
+        tier.hot_kernel, tier.cold_kernel = "hot", "cold"
+        tier.hot, tier.cold, tier.hot_map, tier.cold_map = {}, {}, object(), object()
+        workspace = torch.empty(2, 3, dtype=torch.bfloat16)
+
+        def call(kernel, tensors, mapping, x, weights, ids):
+            workspace.fill_(2 if kernel == "hot" else 5)
+            return workspace
+
+        tier.call = call
+        output = tier.split(None, None, None)
+        self.assertTrue(torch.equal(output, torch.full_like(output, 7)))
+
+    def test_numerical_guard_rejects_wrong_or_nonfinite_outputs(self):
+        good = torch.ones(2, 3, dtype=torch.bfloat16)
+        self.assertTrue(
+            rt.compare_outputs(good, good.clone(), "layer", "test")["finite"]
+        )
+        with self.assertRaises(AssertionError):
+            rt.compare_outputs(good * 2, good, "layer", "bad")
+        with self.assertRaises(AssertionError):
+            rt.compare_outputs(good * float("nan"), good, "layer", "nan")
+
+    def make_coordinator(self, num_layers=2, settings=None):
+        layers = [
+            SimpleNamespace(
+                index=i,
+                num_experts=4,
+                hot_slots=2,
+                hot_map_host=(0, 1, -1, -1),
+                cold_map_host=(-1, -1, 0, 1),
+            )
+            for i in range(num_layers)
+        ]
+        coordinator = rt.TierCoordinator(
+            layers, settings or rt.Settings(32 * 2**30), {}
+        )
+        return coordinator
+
+    def test_static_partition_collects_heat_and_route_counts_without_migrations(self):
+        coordinator = self.make_coordinator(
+            settings=rt.Settings(32 * 2**30, sync_tokens=0)
+        )
+        coordinator.enable_heat()
+        # Only expert 2 has positive weight; expert 0 and the padded row do not count.
+        record = torch.tensor([[0, 2, 0, 1, 1], [-1, -1, 1, 1, 0]], dtype=torch.int32)
+        for _ in range(51):
+            coordinator.pending = [record.clone() for _ in coordinator.layers]
+            coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(coordinator.policy.tokens_total, 51)
+        self.assertGreater(coordinator.policy.heat[0][2], 0)
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (0, 102)
+        )
+        self.assertEqual(
+            (coordinator.stats["swaps"], coordinator.stats["resyncs"]), (0, 0)
+        )
+        self.assertEqual(coordinator.policy.expert_to_hot[0], (0, 1, -1, -1))
+
+    def test_migration_counts_prior_hot_placement_and_separates_completed_transfer_time(
+        self,
+    ):
+        settings = rt.Settings(
+            32 * 2**30,
+            sync_tokens=1,
+            swaps_per_token=2,
+            decay=1,
+            hysteresis=1,
+            max_swaps_per_resync=1,
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        coordinator.enable_heat()
+        events: list[str | tuple[int, int, int]] = []
+        coordinator.stream = SimpleNamespace(
+            synchronize=lambda: events.append("synchronized")
+        )
+        for layer in coordinator.layers:
+            layer.row_bytes = 12
+
+            def swap(old, new, hot_slot, cold_slot, temporary, layer=layer):
+                # Accounting must reflect where the just-completed forward ran.
+                self.assertEqual(coordinator.stats["route_hot"], 0)
+                self.assertEqual(coordinator.stats["route_total"], 4)
+                layer.hot_map_host, layer.cold_map_host = rt.maps_after_swap(
+                    layer.hot_map_host,
+                    layer.cold_map_host,
+                    old,
+                    new,
+                    hot_slot,
+                    cold_slot,
+                )
+                events.append((layer.index, old, new))
+
+            layer.swap = swap
+        record = torch.tensor([[2, 2, 1, 1, 1]], dtype=torch.int32)
+        coordinator.pending = [record.clone() for _ in coordinator.layers]
+        with patch.object(
+            rt.time, "perf_counter", side_effect=[10, 11, 20, 22, 30, 35, 40, 43]
+        ):
+            coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(events, [(0, 0, 2), "synchronized"])
+        self.assertEqual(coordinator.per_layer_swaps, [1, 0])
+        self.assertEqual(
+            (
+                coordinator.stats["swaps"],
+                coordinator.stats["h2d_bytes"],
+                coordinator.stats["d2h_bytes"],
+                coordinator.stats["host_copy_bytes"],
+            ),
+            (1, 12, 12, 12),
+        )
+        self.assertEqual(coordinator.stats["policy_observe_seconds"], 1)
+        self.assertEqual(coordinator.stats["policy_plan_seconds"], 2)
+        self.assertEqual(coordinator.stats["policy_commit_seconds"], 3)
+        self.assertEqual(coordinator.stats["migration_wall_seconds"], 5)
+        self.assertEqual(
+            (coordinator.policy.tokens_total, coordinator.policy.version), (1, 1)
+        )
+        with patch.object(rt.LOGGER, "warning") as logger:
+            coordinator.report()
+        snapshot = json.loads(logger.call_args.args[1])
+        self.assertEqual(snapshot["policy_cpu_seconds"], 6)
+        self.assertEqual(snapshot["per_layer_swaps"], [1, 0])
+
+    def test_model_boundary_updates_heat_once_and_padding_never_ages(self):
+        coordinator = self.make_coordinator(48)
+        coordinator.enable_heat()
+        record = torch.tensor([[0, 2, 1, 0, 1], [-1, -1, 0, 0, 0]], dtype=torch.int32)
+        coordinator.pending = [record.clone() for _ in range(48)]
+        coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        self.assertEqual(coordinator.policy.heat[0], (1, 0, 0, 0))
+        coordinator.pending = [torch.tensor([[-1, -1, 0, 0, 0]]) for _ in range(48)]
+        coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        self.assertEqual(coordinator.stats["ignored_synthetic_forwards"], 1)
+
+    def test_builtin_warmup_real_mask_cannot_pollute_heat_or_swap_budget(self):
+        coordinator = self.make_coordinator(48)
+        # Positive IDs, active weights, real-looking mask: exactly why the
+        # MRv2 builtin warmup cannot be identified from ForwardContext alone.
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        for _ in range(50):
+            coordinator.pending = [record.clone() for _ in range(48)]
+            coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(coordinator.policy.tokens_total, 0)
+        self.assertEqual(coordinator.policy.swaps_total, 0)
+        self.assertTrue(
+            all(all(value == 0 for value in row) for row in coordinator.policy.heat)
+        )
+        self.assertEqual(coordinator.pending, [])
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 50)
+        coordinator.enable_heat()
+        coordinator.pending = [record.clone() for _ in range(48)]
+        coordinator.end_layer(coordinator.layers[-1])
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        self.assertEqual(coordinator.policy.heat[0], (0, 0, 1, 1))
+
+    def test_device_guard_accepts_padding_rejects_real_negative(self):
+        coordinator = self.make_coordinator(1)
+        tier = coordinator.layers[0]
+        tier.device = torch.device("cpu")
+        tier.method = SimpleNamespace(moe=SimpleNamespace(experts_per_token=2))
+        x = torch.ones(2, 3, dtype=torch.bfloat16)
+        weights = torch.ones(2, 2)
+        mask = torch.tensor([False, True])
+        module = SimpleNamespace(
+            get_forward_context=lambda: SimpleNamespace(is_padding=mask)
+        )
+        with (
+            patch.dict(sys.modules, {"vllm.forward_context": module}),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=1),
+            ),
+        ):
+            coordinator.begin_layer(tier, x, weights, torch.tensor([[0, 2], [-1, -1]]))
+            self.assertEqual(len(coordinator.pending), 1)
+            coordinator.pending.clear()
+            with self.assertRaises(RuntimeError):
+                coordinator.begin_layer(
+                    tier, x, weights, torch.tensor([[-1, 2], [-1, -1]])
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

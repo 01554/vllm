@@ -1072,6 +1072,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        cache = getattr(self, "_lab_expert_tier", None)
+        if cache is not None:
+            return cache.apply(
+                layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+            )
         assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

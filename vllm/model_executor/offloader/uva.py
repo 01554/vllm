@@ -117,6 +117,9 @@ class UVAOffloader(BaseOffloader):
             else:
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
+                from vllm._lab_expert_tier.runtime import capture_cpu_source
+
+                capture_cpu_source(p, cpu_data)
 
             self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True

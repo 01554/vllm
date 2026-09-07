@@ -1,0 +1,7 @@
+# Python-only development on the exact wheel used for the lab measurements.
+# C++/CUDA changes require a native rebuild; this image retains the wheel's .so files.
+FROM vllm/vllm-openai@sha256:41d42cfabd3289f40fdca71b4a0fe290474880d20e9534a90c698eb78e3eecee
+ARG LAB_REVISION=unknown
+LABEL lab.vllm.base_commit="1970f3ed4be7fa8620e4ddc4a12c36a8384cfc27"
+LABEL lab.vllm.source_revision="${LAB_REVISION}"
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/

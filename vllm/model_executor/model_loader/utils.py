@@ -160,6 +160,12 @@ def process_weights_after_loading(
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
 
+    from vllm._lab_expert_tier.runtime import (
+        initialize_model as initialize_lab_expert_tier,
+    )
+
+    initialize_lab_expert_tier(model, model_config)
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":
@@ -210,6 +216,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                 ).copy_(p.data)
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
+                from vllm._lab_expert_tier.runtime import capture_cpu_source
+
+                capture_cpu_source(p, cpu_data)
 
 
 _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
