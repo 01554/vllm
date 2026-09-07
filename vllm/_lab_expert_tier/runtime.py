@@ -196,35 +196,6 @@ def validate_mapping(mapping, required, slots):
             raise AssertionError(f"Required expert {expert} has no GPU cache slot")
 
 
-def routing_requirements(ids, num_experts, top_k, padding=None):
-    """Accept only upstream's -1 sentinel on independently validated padding.
-
-    Positive IDs on padding rows remain required: never invent a dropped
-    selection or alter the IDs passed to the stock kernel. This host-only
-    validation runs after the routing IDs' existing device-to-host copy.
-    """
-    if top_k < 1 or not ids or len(ids) % top_k:
-        raise ValueError("Unsupported empty or nonrectangular expert routing")
-    rows = len(ids) // top_k
-    if padding is not None and (
-        len(padding) != rows or any(type(value) is not bool for value in padding)
-    ):
-        raise ValueError("Padding must contain one boolean per routing row")
-    required: dict[int, None] = {}
-    for index, expert in enumerate(ids):
-        if 0 <= expert < num_experts:
-            required.setdefault(expert, None)
-        elif expert == -1 and padding is not None and padding[index // top_k]:
-            continue
-        else:
-            raise ValueError(
-                f"Invalid expert ID {expert} on routing row {index // top_k}; "
-                "only validated padding rows may contain -1"
-            )
-    tokens = rows if padding is None else rows - sum(padding)
-    return tuple(required), tokens
-
-
 def uniform_slots(capacity_bytes, rows, num_experts):
     if not rows or len(set(rows)) != 1 or rows[0] <= 0:
         raise ValueError("Only uniform positive expert row sizes are supported")
