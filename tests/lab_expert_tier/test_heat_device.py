@@ -69,8 +69,7 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(accumulator.error, False)
         self.assertEqual(
             tuple(
-                tuple(value.hex() for value in row)
-                for row in accumulator.heat.tolist()
+                tuple(value.hex() for value in row) for row in accumulator.heat.tolist()
             ),
             tuple(tuple(value.hex() for value in row) for row in policy.heat),
         )
@@ -99,6 +98,84 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(accumulator.last_step_tokens, 0)
         self.assertEqual(accumulator.heat.tolist(), policy._heat.tolist())
         self.assertFalse(accumulator.resync_due)
+
+    def test_disabled_positive_dummy_count_does_not_poison_first_enabled_step(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=2,
+            enabled=False,
+            session_id="disabled-positive-dummy",
+        )
+        dummy_ids = torch.tensor([[-1], [-1]], dtype=torch.int64)
+        dummy_active = torch.zeros((2, 1), dtype=torch.bool)
+        dummy_valid = torch.zeros((2,), dtype=torch.bool)
+        accumulator.record_layer(0, dummy_ids, dummy_active, dummy_valid, 2)
+        # The host knows two padded rows, while the all-false device mask has
+        # zero valid tokens.  Startup remains unverified only if it records a
+        # structural or routing error; this metadata mismatch is expected.
+        accumulator.finish_step(2)
+        self.assertFalse(accumulator.error)
+
+        accumulator.on_heat_enabled()
+        ids = torch.tensor([[0]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+        accumulator.record_layer(0, ids, active, valid, 1)
+        accumulator.finish_step(1)
+        snapshot = accumulator.flush()
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.verified)
+        self.assertFalse(snapshot.error)
+        self.assertEqual(snapshot.tokens, 1)
+
+    def test_disabled_structural_and_id_errors_remain_sticky_after_enable(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=1,
+            enabled=False,
+            session_id="disabled-errors",
+        )
+        invalid_ids = torch.tensor([[99]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+        accumulator.record_layer(0, invalid_ids, active, valid, 1)
+        accumulator.finish_step(1)
+        self.assertTrue(accumulator.error)
+
+        accumulator.on_heat_enabled()
+        accumulator.record_layer(0, torch.tensor([[0]]), active, valid, 1)
+        accumulator.finish_step(1)
+        snapshot = accumulator.flush()
+        self.assertIsNotNone(snapshot)
+        self.assertFalse(snapshot.verified)
+        self.assertTrue(snapshot.error)
+
+        structural = DeviceHeatAccumulator(
+            2,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=1,
+            enabled=False,
+            session_id="disabled-structural",
+        )
+        structural.record_layer(1, torch.tensor([[0]]), active, valid, 1)
+        structural.finish_step(1)
+        self.assertTrue(structural.error)
+        structural.on_heat_enabled()
+        structural.record_layer(0, torch.tensor([[0]]), active, valid, 1)
+        structural.record_layer(1, torch.tensor([[0]]), active, valid, 1)
+        structural.finish_step(1)
+        structural_snapshot = structural.flush()
+        self.assertIsNotNone(structural_snapshot)
+        self.assertFalse(structural_snapshot.verified)
+        self.assertTrue(structural_snapshot.error)
 
     def test_prefill_boundary_is_retained_until_first_decode_snapshot(self):
         kwargs = dict(
@@ -460,6 +537,83 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertIsNotNone(missing)
         self.assertEqual(missing.route_hot, 0)
         self.assertFalse(missing.route_hot_available)
+
+    def test_hot_map_availability_replays_without_python_record_layer(self):
+        accumulator = DeviceHeatAccumulator(
+            2,
+            3,
+            sync_period=50,
+            top_k=1,
+            max_rows=1,
+            session_id="hot-map-replay",
+        )
+        ids = torch.tensor([[0]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+        maps = [
+            torch.tensor([0, -1, -1], dtype=torch.int32),
+            torch.tensor([-1, 0, -1], dtype=torch.int32),
+        ]
+        for layer, hot_map in enumerate(maps):
+            accumulator.record_layer(layer, ids, active, valid, 1, hot_map)
+        accumulator.finish_step(1)
+        first = accumulator.flush()
+        self.assertIsNotNone(first)
+        self.assertTrue(first.route_hot_available)
+        accumulator.acknowledge_snapshot(first)
+
+        # CUDA graph replay runs the captured device bookkeeping, while Python
+        # does not call record_layer again.  Re-run only those device ops and
+        # the captured counters to model that replay on CPU.
+        for layer, hot_map in enumerate(maps):
+            accumulator._record_hot_map_state(layer, hot_map)
+        accumulator._step_route_total.fill_(2)
+        accumulator._step_route_hot.fill_(2)
+        accumulator._step_valid_tokens.fill_(1)
+        accumulator._expected_layer.fill_(2)
+        accumulator.finish_step(1)
+        second = accumulator.flush()
+        self.assertIsNotNone(second)
+        self.assertTrue(second.route_hot_available)
+        self.assertEqual(second.route_hot, 3)
+
+    def test_hot_map_startup_reset_and_enabled_missing_map_invalidation(self):
+        accumulator = DeviceHeatAccumulator(
+            2,
+            2,
+            sync_period=50,
+            top_k=1,
+            max_rows=1,
+            enabled=False,
+            session_id="hot-map-startup",
+        )
+        ids = torch.tensor([[0]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+
+        # A disabled startup/capture forward with no map must not poison the
+        # first enabled observation.
+        for layer in range(2):
+            accumulator.record_layer(layer, ids, active, valid, 1)
+        accumulator.finish_step(1)
+        accumulator.on_heat_enabled()
+        hot_map = torch.tensor([0, -1], dtype=torch.int32)
+        for layer in range(2):
+            accumulator.record_layer(layer, ids, active, valid, 1, hot_map)
+        accumulator.finish_step(1)
+        good = accumulator.flush()
+        self.assertIsNotNone(good)
+        self.assertTrue(good.route_hot_available)
+        accumulator.acknowledge_snapshot(good)
+
+        # Once an enabled boundary omits a layer map, its cumulative hit
+        # counter can no longer claim complete coverage.
+        accumulator.record_layer(0, ids, active, valid, 1, hot_map)
+        accumulator.record_layer(1, ids, active, valid, 1)
+        accumulator.finish_step(1)
+        bad = accumulator.flush()
+        self.assertIsNotNone(bad)
+        self.assertFalse(bad.route_hot_available)
 
     def test_observer_passes_hot_map_to_device_accumulator(self):
         observer = DeviceObserver(

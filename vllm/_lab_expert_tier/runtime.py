@@ -936,7 +936,17 @@ class RecordObserver:
             shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
         )
 
-    def record_layer(self, layer_index, rows, ids, active, valid):
+    # This observer reads routing back and counts hot hits on the host.
+    reports_route_hot = True
+
+    def record_layer(self, layer_index, rows, ids, active, valid, hot_map=None):
+        """Record one layer; `hot_map` is the layer's current device map.
+
+        Device observers count hot hits from it (`hot_map[id] >= 0` over
+        valid, active, in-range lanes, duplicates counted per selection);
+        it is updated in place after exchanges, so it reflects the placement
+        this forward ran on. Unused here: the host readback has the maps.
+        """
         import torch
 
         packed = torch.cat(
@@ -1021,6 +1031,8 @@ class TierCoordinator:
         # Cumulative totals of the last consumed device snapshot, per session.
         self.snapshot_totals: dict[str, int] = {}
         self.snapshot_session: Any = None
+        # Whether the last device snapshot counted hot hits from real maps.
+        self.route_hot_measured = False
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
@@ -1137,7 +1149,14 @@ class TierCoordinator:
             "Invalid routing: -1 requires padding; "
             "real weights must be finite/nonnegative",
         )
-        self.observer.record_layer(tier.index, rows, ids, weights != 0, valid)
+        self.observer.record_layer(
+            tier.index,
+            rows,
+            ids,
+            weights != 0,
+            valid,
+            hot_map=getattr(tier, "hot_map", None),
+        )
         self.recorded += 1
 
     def end_layer(self, tier):
@@ -1264,6 +1283,9 @@ class TierCoordinator:
                 self.stats[stat] += delta
             self.stats["model_tokens"] += self.policy.tokens_total - tokens_before
             self.stats["device_snapshots"] += 1
+            self.route_hot_measured = bool(
+                getattr(result, "route_hot_available", False)
+            )
             if plan:
                 self._plan_and_migrate()
             # The device restarts from the policy state that now holds,
@@ -1418,6 +1440,16 @@ class TierCoordinator:
         )
         snapshot: dict[str, Any] = {key: self.stats[key] for key in fields}
         snapshot.update(self.stats)
+        # Hit rate is measured by the host readback observer, or by a device
+        # snapshot that says it counted from real maps; never present an
+        # unmeasured zero as 0%.
+        route_hot_available = (
+            bool(getattr(self.observer, "reports_route_hot", False))
+            or self.route_hot_measured
+        )
+        if not route_hot_available:
+            snapshot["route_hot"] = None
+        snapshot["route_hot_available"] = route_hot_available
         snapshot.update(
             {
                 "timestamp_ns": time.time_ns(),
