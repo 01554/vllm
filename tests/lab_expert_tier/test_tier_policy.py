@@ -11,6 +11,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "vllm" / "_lab_expert_tier")
 )
@@ -82,6 +84,90 @@ class TierPolicyTests(unittest.TestCase):
         self.assertEqual(policy.heat, ((5.0, 0.0, 0.0), (5.0, 0.0, 0.0)))
         self.assertEqual(policy.tokens_total, 3)
         self.assertIsNone(policy.plan_resync())  # Prefill migration freeze.
+
+    def test_vectorized_heat_update_matches_scalar_float_results(self):
+        layers, experts = 48, 37
+        initial = [
+            [(layer + 1) * 0.1 + expert * 1e-12 for expert in range(experts)]
+            for layer in range(layers)
+        ]
+        policy = TierPolicy(layers, experts, 10, decay=0.999, initial_scores=initial)
+        expected = [row[:] for row in initial]
+        for rows, tokens in ((5, 3), (1, 1), (4, 2)):
+            routes, weights = [], []
+            mask = [row < tokens for row in range(rows)]
+            for layer in range(layers):
+                layer_routes, layer_weights = [], []
+                for row in range(rows):
+                    layer_routes.append(
+                        [(layer + row) % experts, -1, experts, (row + 3) % experts]
+                    )
+                    layer_weights.append([1.0, 1.0, 1.0, 0.0 if row % 2 else 2.0])
+                routes.append(layer_routes)
+                weights.append(layer_weights)
+
+            policy.observe_step(routes, tokens, weights, mask)
+            for layer, layer_routes in enumerate(routes):
+                counts: dict[int, int] = {}
+                for row, ids in enumerate(layer_routes):
+                    if not mask[row]:
+                        continue
+                    for expert, weight in zip(ids, weights[layer][row]):
+                        if 0 <= expert < experts and weight > 0:
+                            counts[expert] = counts.get(expert, 0) + 1
+                expected[layer] = [value * policy.decay for value in expected[layer]]
+                for expert, count in counts.items():
+                    expected[layer][expert] += count
+
+        self.assertEqual(
+            tuple(tuple(value.hex() for value in row) for row in policy.heat),
+            tuple(tuple(value.hex() for value in row) for row in expected),
+        )
+        self.assertIs(type(policy.heat[0][0]), float)
+
+    def test_subnormal_decay_ignores_numpy_error_mode_and_restores_it(self):
+        minimum_subnormal = float.fromhex("0x0.0000000000001p-1022")
+        policy = TierPolicy(
+            1,
+            2,
+            1,
+            decay=0.5,
+            sync_period=1,
+            initial_scores=[[minimum_subnormal, 0.0]],
+        )
+        previous = np.seterr(all="raise")
+        try:
+            policy.observe_step([[[1]]], 1)
+            self.assertEqual(policy.heat, ((0.0, 1.0),))
+            self.assertIs(type(policy.heat[0][0]), float)
+            self.assertEqual(np.geterr()["under"], "raise")
+        finally:
+            np.seterr(**previous)
+        self.assertEqual(np.geterr(), previous)
+
+    def test_hysteresis_overflow_ignores_numpy_error_mode_and_restores_it(self):
+        maximum = float.fromhex("0x1.fffffffffffffp+1023")
+        policy = TierPolicy(
+            1,
+            2,
+            1,
+            decay=1.0,
+            sync_period=1,
+            hysteresis=maximum,
+            initial_scores=[[2.0, 1.0]],
+        )
+        previous = np.seterr(all="raise")
+        try:
+            policy.observe_step([[[1, 1]]], 1)
+            plan = policy.plan_resync()
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.swaps, ())
+            self.assertEqual(policy.heat, ((2.0, 3.0),))
+            self.assertIs(type(policy.heat[0][0]), float)
+            self.assertEqual(np.geterr()["over"], "raise")
+        finally:
+            np.seterr(**previous)
+        self.assertEqual(np.geterr(), previous)
 
     def test_model_global_cap_is_not_multiplied_by_48_layers(self):
         policy = TierPolicy(48, 3, 1, sync_period=1, hysteresis=0)
