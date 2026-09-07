@@ -94,6 +94,10 @@ class Settings:
     # two-partition path in its first measurement; launch volume and the
     # lower resident hit rate are both candidate causes, not yet separated.
     staging: bool = False
+    # "uniform", or one explicit hot slot count per layer (48 integers).
+    # Static for the process: bank sizes fix the addresses captured graphs
+    # read. A global, demand-driven pool like FreeToken's is separate work.
+    layer_slots: str = "uniform"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -124,6 +128,7 @@ class Settings:
             "OBSERVER",
             "STAGING",
             "ASYNC_MIGRATION",
+            "LAYER_SLOTS",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -151,6 +156,15 @@ class Settings:
         observer = os.environ.get(PREFIX + "OBSERVER", "records")
         if not observer.isidentifier():
             raise ValueError("OBSERVER must be an observer registry name")
+        layer_slots = os.environ.get(PREFIX + "LAYER_SLOTS", "uniform").strip()
+        if layer_slots != "uniform":
+            try:
+                counts = [int(item) for item in layer_slots.split(",")]
+            except ValueError as error:
+                raise ValueError("LAYER_SLOTS must be 'uniform' or integers") from error
+            if not counts or any(count < 1 for count in counts):
+                raise ValueError("LAYER_SLOTS entries must be positive integers")
+            layer_slots = ",".join(str(count) for count in counts)
         integers = {
             key: int(os.environ.get(PREFIX + key, default))
             for key, default in (
@@ -195,6 +209,7 @@ class Settings:
             observer,
             asynchronous == "1",
             staging == "1",
+            layer_slots,
         )
 
 
@@ -265,6 +280,41 @@ def uniform_slots(capacity_bytes, rows, num_experts, reserve=0):
     if slots < 1:
         raise ValueError("Capacity cannot hold one expert in every layer")
     return slots, (slots + reserve) * sum(rows)
+
+
+def allocate_slots(capacity_bytes, rows, num_experts, reserve=0, layer_slots=None):
+    """Hot slots for every layer under one exact byte budget.
+
+    `layer_slots` is None for the uniform split, or one explicit slot count
+    per layer. Explicit counts must each leave a hot and a cold partition
+    and together fit the budget (each layer also carries `reserve` rows);
+    nothing is rescaled silently. Returns (slots per layer, GPU bytes).
+    """
+    if layer_slots is None:
+        slots, size = uniform_slots(capacity_bytes, rows, num_experts, reserve)
+        return [slots] * len(rows), size
+    if len(layer_slots) != len(rows):
+        raise ValueError("LAYER_SLOTS must list one hot slot count per layer")
+    if any(not 0 < slots < num_experts for slots in layer_slots):
+        raise ValueError("Every layer needs a nonempty hot and cold partition")
+    size = sum((slots + reserve) * row for slots, row in zip(layer_slots, rows))
+    if size > capacity_bytes:
+        raise ValueError("LAYER_SLOTS exceeds the capacity budget")
+    return list(layer_slots), size
+
+
+def check_verify_capacity(slots_per_layer, num_experts, top_k):
+    """Init verification routes top-k rows into each partition of every layer.
+
+    Reject an allocation that cannot host that before any GPU bank exists,
+    naming the layer; verification is never skipped silently.
+    """
+    for index, slots in enumerate(slots_per_layer):
+        if min(slots, num_experts - slots) < top_k:
+            raise ValueError(
+                f"Layer {index}: {slots} hot slots leave a partition smaller "
+                f"than top-k {top_k}; init verification cannot run"
+            )
 
 
 def _check_kernel_scales(kernel, tensors):
@@ -1124,10 +1174,14 @@ def _is_deferred(result):
 class TierCoordinator:
     def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
+        hot_slots = tuple(layer.hot_slots for layer in layers)
         self.policy = TierPolicy(
             len(layers),
             layers[0].num_experts,
-            layers[0].hot_slots,
+            # The policy takes one count while every layer agrees; a
+            # per-layer tuple is the policy-side extension for explicit
+            # allocations.
+            cast(Any, hot_slots[0] if len(set(hot_slots)) == 1 else hot_slots),
             **settings.policy_kwargs(),
         )
         self.lock = threading.Lock()
@@ -1942,11 +1996,24 @@ def initialize_model(model, model_config):
         )
     staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
     spare_rows = settings.temp_slots if settings.async_migration else 0
-    slots, expected_bytes = uniform_slots(
-        settings.capacity_bytes, row_sizes, 512, reserve=staging_rows + spare_rows
+    explicit = (
+        None
+        if settings.layer_slots == "uniform"
+        else [int(item) for item in settings.layer_slots.split(",")]
     )
-    if not 0 < slots < 512:
+    slots_per_layer, expected_bytes = allocate_slots(
+        settings.capacity_bytes,
+        row_sizes,
+        512,
+        reserve=staging_rows + spare_rows,
+        layer_slots=explicit,
+    )
+    if any(not 0 < slots < 512 for slots in slots_per_layer):
         raise ValueError("Expert tier requires both a hot and cold partition")
+    if settings.verify_init:
+        check_verify_capacity(
+            slots_per_layer, 512, candidates[0][2].moe.experts_per_token
+        )
     first = candidates[0][1]
     temporary = {
         name: torch.empty(
@@ -1960,7 +2027,13 @@ def initialize_model(model, model_config):
     tiers = []
     for index, (name, layer, method) in enumerate(candidates):
         tier, raw_refs = _compact_one(
-            index, name, layer, method, slots, settings, temporary_row(temporary, 0)
+            index,
+            name,
+            layer,
+            method,
+            slots_per_layer[index],
+            settings,
+            temporary_row(temporary, 0),
         )
         gc.collect()
         if any(ref() is not None for ref in raw_refs):
@@ -2014,8 +2087,17 @@ def initialize_model(model, model_config):
             {
                 "layers": len(tiers),
                 "experts_per_layer": 512,
-                "hot_slots_per_layer": slots,
-                "cold_slots_per_layer": 512 - slots,
+                "hot_slots_per_layer": (
+                    slots_per_layer[0]
+                    if len(set(slots_per_layer)) == 1
+                    else list(slots_per_layer)
+                ),
+                "cold_slots_per_layer": (
+                    512 - slots_per_layer[0]
+                    if len(set(slots_per_layer)) == 1
+                    else [512 - slots for slots in slots_per_layer]
+                ),
+                "layer_slots": settings.layer_slots,
                 "capacity_bytes": settings.capacity_bytes,
                 "gpu_weight_bytes": actual_bytes,
                 "staging_slots_per_layer": staging_rows,

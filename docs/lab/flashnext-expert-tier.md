@@ -189,6 +189,17 @@ boundaries:
   mathematical weights, but bit-level equivalence is not claimed.
   `async_plans`, `async_commits`, `async_wait_seconds`, and
   `async_pending_boundaries` are reported.
+- **Per-layer hot capacity** (`VLLM_LAB_EXPERT_TIER_LAYER_SLOTS`, default
+  `uniform`). Either the uniform split or 48 comma-separated hot slot counts,
+  one per layer. Load-time checks: every layer keeps a hot and a cold
+  partition, both at least `top_k` rows when init verification is on, and
+  the exact per-layer byte sum (hot + staging + spare rows) fits the
+  capacity; nothing is rescaled silently. Bank sizes are fixed at load, so
+  captured graph addresses are unaffected. The policy takes the per-layer
+  tuple (`hot_slots_per_layer`); `LAB_EXPERT_TIER_READY` lists per-layer
+  counts when they differ. This makes capacity configurable per layer; it
+  is not an automatic allocation and not FreeToken's shared demand-driven
+  pool.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
