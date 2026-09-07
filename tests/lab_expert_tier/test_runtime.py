@@ -1119,6 +1119,233 @@ class TensorTests(unittest.TestCase):
         snapshot = json.loads(log.call_args.args[1])
         self.assertTrue(snapshot["route_hot_available"])
 
+    def make_async_layer(self, index=0, hot=2, cold=3, spare=2, width=3):
+        from lab_expert_tier.async_migration import SpareRing
+
+        layer = object.__new__(rt.TierLayer)
+        layer.index, layer.device = index, torch.device("cpu")
+        layer.num_experts, layer.hot_slots, layer.cold_slots = hot + cold, hot, cold
+        layer.staging_slots, layer.spare_slots = 0, spare
+        layer.bank_rows, layer.cold_rows_total = hot + spare, cold + spare
+        layer.row_bytes = 6
+        layer.bank = {
+            name: (torch.arange(hot * width) + 1000 * i)
+            .reshape(hot, width)
+            .to(torch.int32)
+            for i, name in enumerate(rt.TENSORS)
+        }
+        layer.cold_cpu = {
+            name: (torch.arange(cold * width) + 1000 * i + 500)
+            .reshape(cold, width)
+            .to(torch.int32)
+            for i, name in enumerate(rt.TENSORS)
+        }
+        for name in rt.TENSORS:
+            layer.bank[name] = torch.cat(
+                (layer.bank[name], torch.full((spare, width), -1, dtype=torch.int32))
+            )
+            layer.cold_cpu[name] = torch.cat(
+                (
+                    layer.cold_cpu[name],
+                    torch.full((spare, width), -1, dtype=torch.int32),
+                )
+            )
+        layer.cold = layer.cold_cpu
+        layer.hot = {name: t[:hot] for name, t in layer.bank.items()}
+        layer.hot_rows, layer.cold_rows = list(range(hot)), list(range(cold))
+        layer.vram_spares = SpareRing(range(hot, hot + spare))
+        layer.ram_spares = SpareRing(range(cold, cold + spare))
+        layer.hot_map_host = tuple(range(hot)) + (-1,) * cold
+        layer.cold_map_host = (-1,) * hot + tuple(range(cold))
+        layer.hot_map = layer.cold_map = None
+        layer.publish_maps()
+        return layer
+
+    def test_async_enqueue_copies_into_spares_and_flip_retires_old_rows(self):
+        from lab_expert_tier import async_migration as am
+        from lab_expert_tier.tier_policy import Swap
+
+        layer = self.make_async_layer()
+        source_bank = {name: t.clone() for name, t in layer.bank.items()}
+        source_cold = {name: t.clone() for name, t in layer.cold_cpu.items()}
+        stream = am._migration_stream(layer.device)
+        swap = Swap(0, 1, 2, 1, 4)  # hot slot 1 (expert 1) <-> cold slot 2 (expert 4)
+        vram_spare, ram_spare = layer.enqueue_swap(swap, stream)
+        self.assertEqual((vram_spare.row, ram_spare.row), (2, 3))
+        for name in rt.TENSORS:
+            # Promoted expert 4 (cold row 2) landed in VRAM row 2; evicted
+            # expert 1 (hot row 1) landed in RAM row 3; nothing else moved.
+            self.assertTrue(torch.equal(layer.bank[name][2], source_cold[name][2]))
+            self.assertTrue(torch.equal(layer.cold_cpu[name][3], source_bank[name][1]))
+            self.assertTrue(torch.equal(layer.bank[name][:2], source_bank[name][:2]))
+            self.assertTrue(
+                torch.equal(layer.cold_cpu[name][:3], source_cold[name][:3])
+            )
+        # Maps are untouched until the flip: the old placement stays in force.
+        self.assertEqual(layer.hot_map.tolist(), [0, 1, -1, -1, -1])
+        self.assertEqual(layer.hot_map_host, (0, 1, -1, -1, -1))
+        layer.flip_swap(swap, vram_spare, ram_spare, "retire-fence")
+        layer.publish_maps()
+        self.assertEqual(layer.hot_rows, [0, 2])
+        self.assertEqual(layer.cold_rows, [0, 1, 3])
+        self.assertEqual(layer.hot_map_host, (0, -1, -1, -1, 1))
+        self.assertEqual(layer.cold_map_host, (-1, 2, 0, 1, -1))
+        # Device maps resolve logical slots to the physical rows.
+        self.assertEqual(layer.hot_map.tolist(), [0, -1, -1, -1, 2])
+        self.assertEqual(layer.cold_map.tolist(), [-1, 3, 0, 1, -1])
+        retired_vram, retired_ram = layer.vram_spares.pop(), layer.ram_spares.pop()
+        self.assertEqual((retired_vram.row, retired_vram.fence), (3, None))
+        self.assertEqual((retired_ram.row, retired_ram.fence), (4, None))
+        retired_vram, retired_ram = layer.vram_spares.pop(), layer.ram_spares.pop()
+        self.assertEqual((retired_vram.row, retired_vram.fence), (1, "retire-fence"))
+        self.assertEqual((retired_ram.row, retired_ram.fence), (2, "retire-fence"))
+        # The synchronous path resolves the same physical rows.
+        self.assertEqual((layer.resolve_hot_row(1), layer.resolve_cold_row(2)), (2, 3))
+
+    def test_async_plan_commits_at_next_boundary_before_observation(self):
+        from lab_expert_tier import async_migration as am
+
+        settings = rt.Settings(
+            32 * 2**30,
+            sync_tokens=1,
+            swaps_per_token=2,
+            decay=1,
+            hysteresis=1,
+            temp_slots=2,
+            async_migration=True,
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        for i, spec in enumerate(coordinator.layers):
+            layer = self.make_async_layer(index=i, hot=2, cold=2, spare=2)
+            layer.publish_maps = Mock(wraps=layer.publish_maps)
+            coordinator.layers[i] = layer
+        events: list[Any] = []
+
+        class PendingEvent:
+            def query(self):
+                return False
+
+            def synchronize(self):
+                events.append("sync-wait")
+
+        pending_event = PendingEvent()
+        order: list[str] = []
+
+        def record_event(stream):
+            order.append("record")
+            return pending_event
+
+        def wait_event(stream, event):
+            order.append("wait")
+
+        original_finish = coordinator.observer.finish
+
+        def finish(*args, **kwargs):
+            order.append("observe")
+            return original_finish(*args, **kwargs)
+
+        coordinator.observer.finish = finish
+        coordinator.observer.rebase = lambda **state: order.append("rebase")
+        coordinator.enable_heat()
+        record = torch.tensor([[2, 2, 1, 1, 1]], dtype=torch.int32)
+        with (
+            patch.object(am, "_record_event", record_event),
+            patch.object(am, "_stream_wait_event", wait_event),
+        ):
+            # Boundary N: the plan is enqueued, not committed.
+            self.replay(coordinator, record)
+            self.assertIsNotNone(coordinator.pending)
+            self.assertEqual(coordinator.stats["async_plans"], 1)
+            self.assertEqual(coordinator.stats["swaps"], 0)
+            self.assertEqual(coordinator.policy.version, 0)
+            self.assertEqual(coordinator.layers[0].hot_map_host, (0, 1, -1, -1))
+            for layer in coordinator.layers:
+                layer.publish_maps.assert_not_called()
+            # Boundary N+1: the transfer is still running, so the coordinator
+            # waits, flips, commits, rebases, and only then observes. This
+            # forward selects only hot experts, so no new plan follows.
+            order.clear()
+            hot_only = torch.tensor([[2, 1, 1, 1, 1]], dtype=torch.int32)
+            self.replay(coordinator, hot_only)
+        self.assertEqual(events, ["sync-wait"])
+        self.assertEqual(order[:4], ["wait", "record", "rebase", "observe"])
+        self.assertIsNone(coordinator.pending)
+        self.assertEqual(coordinator.stats["async_commits"], 1)
+        self.assertEqual(coordinator.stats["swaps"], 2)
+        self.assertEqual(coordinator.policy.version, 1)
+        for layer in coordinator.layers:
+            self.assertEqual(layer.hot_map_host[2], 0)
+            layer.publish_maps.assert_called_once_with()
+        self.assertEqual(coordinator.stats["async_wait_seconds"] >= 0, True)
+
+    def test_async_ineligible_plans_fall_back_to_the_synchronous_path(self):
+        settings = rt.Settings(
+            32 * 2**30,
+            sync_tokens=1,
+            swaps_per_token=4,
+            decay=1,
+            hysteresis=1,
+            temp_slots=1,
+            async_migration=True,
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        for i in range(len(coordinator.layers)):
+            coordinator.layers[i] = self.make_async_layer(
+                index=i, hot=2, cold=2, spare=1
+            )
+        coordinator.temporary = {
+            name: torch.zeros(1, 3, dtype=torch.int32) for name in rt.TENSORS
+        }
+        coordinator.enable_heat()
+        # Both cold experts become hot: two swaps per layer exceed one spare.
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        self.replay(coordinator, record)
+        self.assertIsNone(coordinator.pending)
+        self.assertEqual(coordinator.stats["sync_fallbacks"], 1)
+        self.assertEqual(coordinator.stats["fallback_over_budget"], 1)
+        self.assertEqual(coordinator.stats["swaps"], 4)
+        self.assertEqual(coordinator.policy.version, 1)
+        self.assertEqual(coordinator.layers[0].hot_map_host, (-1, -1, 0, 1))
+        self.assertEqual(coordinator.layers[0].hot_map.tolist(), [-1, -1, 0, 1])
+
+    def test_flush_settles_a_pending_transaction_before_importing(self):
+        from lab_expert_tier import async_migration as am
+
+        settings = rt.Settings(
+            32 * 2**30,
+            sync_tokens=1,
+            swaps_per_token=2,
+            decay=1,
+            hysteresis=1,
+            temp_slots=2,
+            async_migration=True,
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        for i in range(len(coordinator.layers)):
+            coordinator.layers[i] = self.make_async_layer(
+                index=i, hot=2, cold=2, spare=2
+            )
+        coordinator.enable_heat()
+        record = torch.tensor([[2, 2, 1, 1, 1]], dtype=torch.int32)
+        self.replay(coordinator, record)
+        self.assertIsNotNone(coordinator.pending)
+        coordinator.flush()
+        self.assertIsNone(coordinator.pending)
+        self.assertEqual(coordinator.stats["async_commits"], 1)
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.report()
+        self.assertIn('"async_pending": false', log.call_args.args[1])
+        with patch.dict(
+            os.environ,
+            {rt.PREFIX + "GIB": "32", rt.PREFIX + "ASYNC_MIGRATION": "1"},
+            clear=True,
+        ):
+            self.assertTrue(rt.Settings.from_env().async_migration)
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "ASYNC_MIGRATION": "2"}
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+        del am
+
     def test_observer_registry_builds_default_and_rejects_unknown(self):
         observer = rt.make_observer(
             "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1

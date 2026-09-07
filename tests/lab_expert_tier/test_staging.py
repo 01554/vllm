@@ -179,3 +179,48 @@ class StagingGatherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from lab_expert_tier import async_migration as am  # noqa: E402
+from lab_expert_tier.tier_policy import Swap  # noqa: E402
+
+
+class AsyncMigrationUnitTests(unittest.TestCase):
+    def test_preflight_takes_whole_plan_or_nothing(self):
+        plan = (Swap(0, 0, 0, 5, 9), Swap(1, 2, 1, 6, 8), Swap(0, 1, 3, 4, 7))
+        verdict = am.preflight(plan, {0: 2, 1: 1})
+        self.assertTrue(verdict.eligible)
+        self.assertEqual(sorted(verdict.per_layer), [0, 1])
+        self.assertEqual(verdict.per_layer[0], (plan[0], plan[2]))
+        # One layer over its budget: nothing is truncated, all goes sync.
+        verdict = am.preflight(plan, {0: 1, 1: 1})
+        self.assertEqual((verdict.eligible, verdict.reason), (False, "over_budget"))
+        # Reusing a hot slot within a layer would read an unpublished result.
+        reuse = (Swap(0, 0, 0, 5, 9), Swap(0, 0, 1, 9, 8))
+        verdict = am.preflight(reuse, {0: 8})
+        self.assertEqual((verdict.eligible, verdict.reason), (False, "slot_reuse"))
+        reuse = (Swap(0, 0, 0, 5, 9), Swap(0, 1, 0, 6, 8))
+        self.assertEqual(am.preflight(reuse, {0: 8}).reason, "slot_reuse")
+        self.assertEqual(am.preflight((), {0: 8}).reason, "empty")
+        self.assertEqual(am.preflight(plan, {}).reason, "over_budget")
+
+    def test_spare_ring_is_fifo_and_keeps_fences(self):
+        ring = am.SpareRing([10, 11])
+        self.assertEqual(ring.free, 2)
+        first = ring.pop()
+        self.assertEqual((first.row, first.fence), (10, None))
+        ring.push(3, "fence-a")
+        second, third = ring.pop(), ring.pop()
+        self.assertEqual((second.row, third.row, third.fence), (11, 3, "fence-a"))
+        with self.assertRaises(RuntimeError):
+            ring.pop()
+
+    def test_cpu_stream_helpers_are_complete_no_ops(self):
+        device = torch.device("cpu")
+        stream = am._migration_stream(device)
+        event = am._record_event(stream)
+        self.assertTrue(event.query())
+        event.synchronize()
+        am._stream_wait_event(stream, event)
+        with am._on_stream(stream):
+            pass
