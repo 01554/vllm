@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-wide heat policy for compact, exclusive CPU/GPU expert banks.
 
+Heat storage uses NumPy float64 arrays; NumPy is a direct vLLM common dependency.
+
 Adapted from 01554/llama.cpp, expert-tier commit
 7e6be0190af284b576690545c7cf38f3c9f2f453 (MIT; LICENSE.llama-cpp):
   https://github.com/01554/llama.cpp/blob/7e6be0190af284b576690545c7cf38f3c9f2f453/src/llama-expert-heatmap.cpp
@@ -46,6 +48,8 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -130,16 +134,18 @@ class TierPolicy:
             "max_swaps_per_resync", max_swaps_per_resync, 0
         )
         if initial_scores is None:
-            self._heat = [[0.0] * self.num_experts for _ in range(self.num_layers)]
+            self._heat = np.zeros((self.num_layers, self.num_experts), dtype=np.float64)
         else:
             if len(initial_scores) != self.num_layers:
                 raise ValueError("initial_scores must have num_layers rows")
-            self._heat = []
+            heat = []
             for row in initial_scores:
                 if len(row) != self.num_experts:
                     raise ValueError("initial_scores must have num_experts columns")
-                self._heat.append([_finite("initial score", score) for score in row])
+                heat.append([_finite("initial score", score) for score in row])
+            self._heat = np.asarray(heat, dtype=np.float64)
 
+        self._expert_ids = np.arange(self.num_experts, dtype=np.intp)
         self._hot = tuple(tuple(self._top(layer)) for layer in range(self.num_layers))
         self._cold = tuple(
             tuple(e for e in range(self.num_experts) if e not in set(hot))
@@ -177,16 +183,25 @@ class TierPolicy:
 
     @property
     def heat(self) -> tuple[tuple[float, ...], ...]:
-        return tuple(tuple(row) for row in self._heat)
+        return tuple(tuple(row) for row in self._heat.tolist())
 
     @property
     def dwell_counts(self) -> tuple[tuple[int, ...], ...]:
         return self._dwell
 
     def _top(self, layer: int) -> list[int]:
-        return sorted(
-            range(self.num_experts), key=lambda e: (-self._heat[layer][e], e)
-        )[: self.hot_slots]
+        if not self.hot_slots:
+            return []
+        heat = self._heat[layer]
+        if np.isnan(heat).any():
+            # Validated updates should never create NaN, but retain this
+            # defensive path because NumPy and Python order NaN differently;
+            # the scalar sort preserves the historical Python ordering.
+            values = heat.tolist()
+            return sorted(range(self.num_experts), key=lambda e: (-values[e], e))[
+                : self.hot_slots
+            ]
+        return np.lexsort((self._expert_ids, -heat))[: self.hot_slots].tolist()
 
     def _inverse_maps(self, hot, cold):
         all_hot, all_cold = [], []
@@ -279,12 +294,15 @@ class TierPolicy:
                         layer_counts[expert] = layer_counts.get(expert, 0) + 1
             counts.append(layer_counts)
         if num_tokens:
-            for layer, layer_counts in enumerate(counts):
-                heat = self._heat[layer]
-                for expert in range(self.num_experts):
-                    heat[expert] *= self.decay
-                for expert, count in layer_counts.items():
-                    heat[expert] += count
+            # NumPy's float64 multiply has the same IEEE-754 result as Python's
+            # float multiply, while avoiding one Python loop over every expert.
+            # Counts are still added below in their original layer/dict order.
+            with np.errstate(all="ignore"):
+                self._heat *= self.decay
+                for layer, layer_counts in enumerate(counts):
+                    heat = self._heat[layer]
+                    for expert, count in layer_counts.items():
+                        heat[expert] += count
             self.tokens_total += num_tokens  # once for the model, never per layer.
         self._last_step_tokens = num_tokens
 
@@ -335,15 +353,16 @@ class TierPolicy:
                     if self.hysteresis <= 0
                     or (
                         dwell[layer][slot] >= self.dwell_tokens
-                        and self._heat[layer][new_expert]
-                        >= self.hysteresis * self._heat[layer][old]
+                        and float(self._heat[layer][new_expert])
+                        >= self.hysteresis * float(self._heat[layer][old])
                     )
                 ]
                 if not eligible:
                     break
                 # C++ retains the first hot slot on equal incumbent heat.
                 hot_slot = min(
-                    eligible, key=lambda slot: self._heat[layer][hot[layer][slot]]
+                    eligible,
+                    key=lambda slot: float(self._heat[layer][hot[layer][slot]]),
                 )
                 cold_slot = cold_slot_of.get(new_expert)
                 if cold_slot is None:

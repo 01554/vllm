@@ -196,35 +196,6 @@ def validate_mapping(mapping, required, slots):
             raise AssertionError(f"Required expert {expert} has no GPU cache slot")
 
 
-def routing_requirements(ids, num_experts, top_k, padding=None):
-    """Accept only upstream's -1 sentinel on independently validated padding.
-
-    Positive IDs on padding rows remain required: never invent a dropped
-    selection or alter the IDs passed to the stock kernel. This host-only
-    validation runs after the routing IDs' existing device-to-host copy.
-    """
-    if top_k < 1 or not ids or len(ids) % top_k:
-        raise ValueError("Unsupported empty or nonrectangular expert routing")
-    rows = len(ids) // top_k
-    if padding is not None and (
-        len(padding) != rows or any(type(value) is not bool for value in padding)
-    ):
-        raise ValueError("Padding must contain one boolean per routing row")
-    required: dict[int, None] = {}
-    for index, expert in enumerate(ids):
-        if 0 <= expert < num_experts:
-            required.setdefault(expert, None)
-        elif expert == -1 and padding is not None and padding[index // top_k]:
-            continue
-        else:
-            raise ValueError(
-                f"Invalid expert ID {expert} on routing row {index // top_k}; "
-                "only validated padding rows may contain -1"
-            )
-    tokens = rows if padding is None else rows - sum(padding)
-    return tuple(required), tokens
-
-
 def uniform_slots(capacity_bytes, rows, num_experts):
     if not rows or len(set(rows)) != 1 or rows[0] <= 0:
         raise ValueError("Only uniform positive expert row sizes are supported")
@@ -848,11 +819,20 @@ def unpack_routes(packed, num_experts):
             raise ValueError("Invalid model routing valid-mask value")
         if [bool(row[-1]) for row in layer] != mask:
             raise ValueError("Layer padding masks differ within model forward")
-        ids = [row[:k] for row in layer]
-        weights = [row[k : 2 * k] for row in layer]
-        routing_requirements(
-            [e for row in ids for e in row], num_experts, k, [not v for v in mask]
-        )
+        ids, weights = [], []
+        for row_index, row in enumerate(layer):
+            row_ids = row[:k]
+            for expert in row_ids:
+                if 0 <= expert < num_experts:
+                    continue
+                if expert == -1 and not mask[row_index]:
+                    continue
+                raise ValueError(
+                    f"Invalid expert ID {expert} on routing row {row_index}; "
+                    "only validated padding rows may contain -1"
+                )
+            ids.append(row_ids)
+            weights.append(row[k : 2 * k])
         if any(value not in (0, 1) for row in weights for value in row):
             raise ValueError("Invalid routing activity flag")
         routes.append(ids)
