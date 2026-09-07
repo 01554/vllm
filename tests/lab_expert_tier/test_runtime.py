@@ -1021,6 +1021,38 @@ class TensorTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
 
+    def test_record_layer_receives_hot_map_and_report_marks_unmeasured_hits(self):
+        coordinator = self.make_coordinator()
+        received: list[Any] = []
+        original = coordinator.observer.record_layer
+
+        def record_layer(*args, **kwargs):
+            received.append(kwargs.get("hot_map"))
+            return original(*args, **kwargs)
+
+        coordinator.observer.record_layer = record_layer
+        tier = coordinator.layers[0]
+        tier.hot_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        with self.forward_context(coordinator, torch.tensor([False])):
+            coordinator.begin_layer(tier, x, torch.ones(1, 2), torch.tensor([[0, 2]]))
+        self.assertIs(received[0], tier.hot_map)
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.report()
+        snapshot = json.loads(log.call_args.args[1])
+        self.assertEqual(
+            (snapshot["route_hot"], snapshot["route_hot_available"]), (0, True)
+        )
+        coordinator.observer = SimpleNamespace(
+            capacity=4, records=None, records_host=None
+        )
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.report()
+        snapshot = json.loads(log.call_args.args[1])
+        self.assertEqual(
+            (snapshot["route_hot"], snapshot["route_hot_available"]), (None, False)
+        )
+
     def test_observer_registry_builds_default_and_rejects_unknown(self):
         observer = rt.make_observer(
             "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1

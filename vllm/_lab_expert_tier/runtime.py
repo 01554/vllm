@@ -935,7 +935,17 @@ class RecordObserver:
             shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
         )
 
-    def record_layer(self, layer_index, rows, ids, active, valid):
+    # This observer reads routing back and counts hot hits on the host.
+    reports_route_hot = True
+
+    def record_layer(self, layer_index, rows, ids, active, valid, hot_map=None):
+        """Record one layer; `hot_map` is the layer's current device map.
+
+        Device observers count hot hits from it (`hot_map[id] >= 0` over
+        valid, active, in-range lanes, duplicates counted per selection);
+        it is updated in place after exchanges, so it reflects the placement
+        this forward ran on. Unused here: the host readback has the maps.
+        """
         import torch
 
         packed = torch.cat(
@@ -1136,7 +1146,14 @@ class TierCoordinator:
             "Invalid routing: -1 requires padding; "
             "real weights must be finite/nonnegative",
         )
-        self.observer.record_layer(tier.index, rows, ids, weights != 0, valid)
+        self.observer.record_layer(
+            tier.index,
+            rows,
+            ids,
+            weights != 0,
+            valid,
+            hot_map=getattr(tier, "hot_map", None),
+        )
         self.recorded += 1
 
     def end_layer(self, tier):
@@ -1417,6 +1434,12 @@ class TierCoordinator:
         )
         snapshot: dict[str, Any] = {key: self.stats[key] for key in fields}
         snapshot.update(self.stats)
+        # An observer without hot-map accounting has not measured hit rate;
+        # never present its zero as a measured 0%.
+        route_hot_available = bool(getattr(self.observer, "reports_route_hot", False))
+        if not route_hot_available:
+            snapshot["route_hot"] = None
+        snapshot["route_hot_available"] = route_hot_available
         snapshot.update(
             {
                 "timestamp_ns": time.time_ns(),
