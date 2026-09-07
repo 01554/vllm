@@ -90,6 +90,13 @@ class InvariantTests(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
                 rt.Settings.from_env()
 
+    def test_init_verification_capacity_names_the_offending_layer(self):
+        rt.check_verify_capacity([240, 10, 502], 512, 10)
+        with self.assertRaisesRegex(ValueError, "Layer 1: 9 hot slots"):
+            rt.check_verify_capacity([240, 9, 240], 512, 10)
+        with self.assertRaisesRegex(ValueError, "Layer 2: 503 hot slots"):
+            rt.check_verify_capacity([240, 10, 503], 512, 10)
+
     def test_coordinator_hands_the_policy_one_count_or_a_per_layer_tuple(self):
         layers = [SimpleNamespace(num_experts=4, hot_slots=2) for _ in range(2)]
         coordinator = rt.TierCoordinator(layers, rt.Settings(32 * 2**30), {})

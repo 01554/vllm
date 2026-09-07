@@ -303,6 +303,20 @@ def allocate_slots(capacity_bytes, rows, num_experts, reserve=0, layer_slots=Non
     return list(layer_slots), size
 
 
+def check_verify_capacity(slots_per_layer, num_experts, top_k):
+    """Init verification routes top-k rows into each partition of every layer.
+
+    Reject an allocation that cannot host that before any GPU bank exists,
+    naming the layer; verification is never skipped silently.
+    """
+    for index, slots in enumerate(slots_per_layer):
+        if min(slots, num_experts - slots) < top_k:
+            raise ValueError(
+                f"Layer {index}: {slots} hot slots leave a partition smaller "
+                f"than top-k {top_k}; init verification cannot run"
+            )
+
+
 def _check_kernel_scales(kernel, tensors):
     # Quant config holds tensor references. A config built before swapping to
     # cache tensors would silently continue reading full-source scales.
@@ -1996,6 +2010,10 @@ def initialize_model(model, model_config):
     )
     if any(not 0 < slots < 512 for slots in slots_per_layer):
         raise ValueError("Expert tier requires both a hot and cold partition")
+    if settings.verify_init:
+        check_verify_capacity(
+            slots_per_layer, 512, candidates[0][2].moe.experts_per_token
+        )
     first = candidates[0][1]
     temporary = {
         name: torch.empty(
