@@ -5,6 +5,7 @@
 import gc
 import importlib.util
 import json
+import math
 import os
 import sys
 import unittest
@@ -105,6 +106,8 @@ class InvariantTests(unittest.TestCase):
             ("GIB", "-1"),
             ("VERIFY_INIT", "2"),
             ("STATS_EVERY", "0"),
+            ("TEMP_SLOTS", "0"),
+            ("SPLIT", "single"),
         ):
             env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
@@ -120,6 +123,8 @@ class InvariantTests(unittest.TestCase):
             "DWELL_TOKENS": "12",
             "MAX_SWAPS_PER_RESYNC": "3",
             "STATS_EVERY": "1",
+            "TEMP_SLOTS": "4",
+            "SPLIT": "modular",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -128,7 +133,10 @@ class InvariantTests(unittest.TestCase):
         coordinator = rt.TierCoordinator(
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
-        self.assertEqual(settings.stats_every, 1)
+        self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
+        self.assertEqual(settings.split, "modular")
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().split, "fused")
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,
@@ -240,14 +248,14 @@ class InvariantTests(unittest.TestCase):
         coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
         first = SimpleNamespace(cuda_stream=11, synchronize=Mock())
         second = SimpleNamespace(cuda_stream=22, synchronize=Mock())
-        coordinator.adopt_stream(first, 0)
-        coordinator.adopt_stream(first, 0)
+        coordinator.adopt_stream(first, True)
+        coordinator.adopt_stream(first, True)
         first.synchronize.assert_not_called()
-        coordinator.adopt_stream(second, 0)
+        coordinator.adopt_stream(second, True)
         first.synchronize.assert_called_once_with()
         self.assertIs(coordinator.stream, second)
         self.assertEqual(coordinator.stream_id, 22)
-        coordinator.adopt_stream(second, 0)
+        coordinator.adopt_stream(second, True)
         second.synchronize.assert_not_called()
 
     def test_stream_handoff_rejects_midforward_and_keeps_previous_on_wait_failure(self):
@@ -255,20 +263,20 @@ class InvariantTests(unittest.TestCase):
         coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
         first = SimpleNamespace(cuda_stream=11, synchronize=Mock())
         second = SimpleNamespace(cuda_stream=22, synchronize=Mock())
-        coordinator.adopt_stream(first, 0)
-        coordinator.pending.append(object())
+        coordinator.adopt_stream(first, True)
+        coordinator.recorded = 1
         with self.assertRaises(NotImplementedError):
-            coordinator.adopt_stream(second, 1)
+            coordinator.adopt_stream(second, False)
         with self.assertRaises(NotImplementedError):
-            coordinator.adopt_stream(second, 0)
-        coordinator.adopt_stream(first, 1)
+            coordinator.adopt_stream(second, True)
+        coordinator.adopt_stream(first, False)
         first.synchronize.assert_not_called()
-        coordinator.pending.clear()
+        coordinator.recorded = 0
         with self.assertRaises(NotImplementedError):
-            coordinator.adopt_stream(second, 1)
+            coordinator.adopt_stream(second, False)
         first.synchronize.side_effect = RuntimeError("failed previous stream")
         with self.assertRaises(RuntimeError):
-            coordinator.adopt_stream(second, 0)
+            coordinator.adopt_stream(second, True)
         self.assertIs(coordinator.stream, first)
         self.assertEqual(coordinator.stream_id, 11)
 
@@ -277,11 +285,13 @@ class InvariantTests(unittest.TestCase):
         coordinator = rt.TierCoordinator([layer], rt.Settings(32 * 2**30), {})
         self.assertFalse(coordinator.heat_enabled)
         stream = SimpleNamespace(cuda_stream=11, synchronize=Mock())
-        coordinator.adopt_stream(stream, 0)
-        coordinator.pending.append(object())
+        coordinator.adopt_stream(stream, True)
+        coordinator.recorded = 1
         with self.assertRaises(RuntimeError):
             coordinator.enable_heat()
-        coordinator.pending.clear()
+        coordinator.recorded = 0
+        # The last direct warmup/capture forward is startup work, not an error.
+        coordinator.forward_rows = 3
         coordinator.poisoned = True
         with self.assertRaises(RuntimeError):
             coordinator.enable_heat()
@@ -298,6 +308,8 @@ class InvariantTests(unittest.TestCase):
         stream.synchronize.assert_called_once_with()
         self.assertTrue(coordinator.heat_enabled)
         self.assertEqual(dict(coordinator.stats), {})
+        self.assertIsNone(coordinator.forward_rows)
+        self.assertIn('"dropped_startup_records": 1', log.call_args.args[1])
         self.assertEqual(
             (coordinator.policy.tokens_total, coordinator.policy.swaps_total), (0, 0)
         )
@@ -394,6 +406,7 @@ class TensorTests(unittest.TestCase):
 
     def test_split_preserves_hot_output_across_workspace_reuse(self):
         tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30, split="modular")
         tier.hot_kernel, tier.cold_kernel = "hot", "cold"
         tier.hot, tier.cold, tier.hot_map, tier.cold_map = {}, {}, object(), object()
         workspace = torch.empty(2, 3, dtype=torch.bfloat16)
@@ -430,7 +443,15 @@ class TensorTests(unittest.TestCase):
         coordinator = rt.TierCoordinator(
             layers, settings or rt.Settings(32 * 2**30), {}
         )
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
         return coordinator
+
+    @staticmethod
+    def replay(coordinator, record):
+        """A CUDA Graph replay: the static records change, no layer Python runs."""
+        rows = record.shape[0]
+        coordinator.records[:rows] = record[:, None, :]
+        coordinator.finish_forward(rows)
 
     def test_static_partition_collects_heat_and_route_counts_without_migrations(self):
         coordinator = self.make_coordinator(
@@ -440,9 +461,9 @@ class TensorTests(unittest.TestCase):
         # Only expert 2 has positive weight; expert 0 and the padded row do not count.
         record = torch.tensor([[0, 2, 0, 1, 1], [-1, -1, 1, 1, 0]], dtype=torch.int32)
         for _ in range(51):
-            coordinator.pending = [record.clone() for _ in coordinator.layers]
-            coordinator.end_layer(coordinator.layers[-1])
+            self.replay(coordinator, record)
         self.assertEqual(coordinator.policy.tokens_total, 51)
+        self.assertEqual(coordinator.stats["replayed_forwards"], 51)
         self.assertGreater(coordinator.policy.heat[0][2], 0)
         self.assertEqual(
             (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (0, 102)
@@ -465,14 +486,16 @@ class TensorTests(unittest.TestCase):
         )
         coordinator = self.make_coordinator(settings=settings)
         coordinator.enable_heat()
-        events: list[str | tuple[int, int, int]] = []
-        coordinator.stream = SimpleNamespace(
-            synchronize=lambda: events.append("synchronized")
+        events: list[Any] = []
+        stream = SimpleNamespace(
+            cuda_stream=7, synchronize=lambda: events.append("synchronized")
         )
         for layer in coordinator.layers:
             layer.row_bytes = 12
+            layer.hot, layer.cold_cpu = {"h": layer.index}, {"c": layer.index}
+            layer.publish_maps = Mock(side_effect=lambda: events.append("published"))
 
-            def swap(old, new, hot_slot, cold_slot, temporary, layer=layer):
+            def stage_swap(old, new, hot_slot, cold_slot, layer=layer):
                 # Accounting must reflect where the just-completed forward ran.
                 self.assertEqual(coordinator.stats["route_hot"], 0)
                 self.assertEqual(coordinator.stats["route_total"], 4)
@@ -486,14 +509,40 @@ class TensorTests(unittest.TestCase):
                 )
                 events.append((layer.index, old, new))
 
-            layer.swap = swap
+            layer.stage_swap = stage_swap
+
+        def wave(items, synchronize):
+            events.append(
+                ("wave", [(h["h"], c["c"], hs, cs) for h, c, _, hs, cs in items])
+            )
+            synchronize()
+
         record = torch.tensor([[2, 2, 1, 1, 1]], dtype=torch.int32)
-        coordinator.pending = [record.clone() for _ in coordinator.layers]
-        with patch.object(
-            rt.time, "perf_counter", side_effect=[10, 11, 20, 22, 30, 35, 40, 43]
+        with (
+            patch.object(rt, "_current_stream", return_value=stream),
+            patch.object(rt, "swap_tensor_rows_wave", wave),
+            patch.object(
+                rt.time, "perf_counter", side_effect=[10, 11, 20, 22, 30, 35, 40, 43]
+            ),
         ):
-            coordinator.end_layer(coordinator.layers[-1])
-        self.assertEqual(events, [(0, 0, 2), "synchronized"])
+            self.replay(coordinator, record)
+        # Boundary D2H wait, staged maps, the wave's wait, publication, then
+        # the completed-migration wait.
+        self.assertEqual(
+            events,
+            [
+                "synchronized",
+                (0, 0, 2),
+                ("wave", [(0, 0, 0, 0)]),
+                "synchronized",
+                "published",
+                "synchronized",
+            ],
+        )
+        self.assertEqual(
+            (coordinator.stats["migration_waves"], coordinator.stats["max_wave_swaps"]),
+            (1, 1),
+        )
         self.assertEqual(coordinator.per_layer_swaps, [1, 0])
         self.assertEqual(
             (
@@ -521,12 +570,10 @@ class TensorTests(unittest.TestCase):
         coordinator = self.make_coordinator(48)
         coordinator.enable_heat()
         record = torch.tensor([[0, 2, 1, 0, 1], [-1, -1, 0, 0, 0]], dtype=torch.int32)
-        coordinator.pending = [record.clone() for _ in range(48)]
-        coordinator.end_layer(coordinator.layers[-1])
+        self.replay(coordinator, record)
         self.assertEqual(coordinator.policy.tokens_total, 1)
         self.assertEqual(coordinator.policy.heat[0], (1, 0, 0, 0))
-        coordinator.pending = [torch.tensor([[-1, -1, 0, 0, 0]]) for _ in range(48)]
-        coordinator.end_layer(coordinator.layers[-1])
+        self.replay(coordinator, torch.tensor([[-1, -1, 0, 0, 0]], dtype=torch.int32))
         self.assertEqual(coordinator.policy.tokens_total, 1)
         self.assertEqual(coordinator.stats["ignored_synthetic_forwards"], 1)
 
@@ -536,18 +583,16 @@ class TensorTests(unittest.TestCase):
         # MRv2 builtin warmup cannot be identified from ForwardContext alone.
         record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
         for _ in range(50):
-            coordinator.pending = [record.clone() for _ in range(48)]
-            coordinator.end_layer(coordinator.layers[-1])
+            self.replay(coordinator, record)
         self.assertEqual(coordinator.policy.tokens_total, 0)
         self.assertEqual(coordinator.policy.swaps_total, 0)
         self.assertTrue(
             all(all(value == 0 for value in row) for row in coordinator.policy.heat)
         )
-        self.assertEqual(coordinator.pending, [])
+        self.assertEqual(coordinator.recorded, 0)
         self.assertEqual(coordinator.stats["ignored_startup_forwards"], 50)
         coordinator.enable_heat()
-        coordinator.pending = [record.clone() for _ in range(48)]
-        coordinator.end_layer(coordinator.layers[-1])
+        self.replay(coordinator, record)
         self.assertEqual(coordinator.policy.tokens_total, 1)
         self.assertEqual(coordinator.policy.heat[0], (0, 0, 1, 1))
 
@@ -571,12 +616,406 @@ class TensorTests(unittest.TestCase):
             ),
         ):
             coordinator.begin_layer(tier, x, weights, torch.tensor([[0, 2], [-1, -1]]))
-            self.assertEqual(len(coordinator.pending), 1)
-            coordinator.pending.clear()
+            self.assertEqual((coordinator.recorded, coordinator.forward_rows), (1, 2))
+            self.assertEqual(
+                coordinator.records[:2, 0].tolist(),
+                [[0, 2, 1, 1, 1], [-1, -1, 1, 1, 0]],
+            )
+            coordinator.recorded = 0
             with self.assertRaises(RuntimeError):
                 coordinator.begin_layer(
                     tier, x, weights, torch.tensor([[-1, 2], [-1, -1]])
                 )
+            # Heat was off, so the unfinished first forward was startup work.
+            self.assertEqual(coordinator.stats["dropped_startup_records"], 1)
+
+    def forward_context(self, coordinator, mask):
+        tier = coordinator.layers[0]
+        tier.device = torch.device("cpu")
+        tier.method = SimpleNamespace(moe=SimpleNamespace(experts_per_token=2))
+        for layer in coordinator.layers[1:]:
+            layer.device, layer.method = tier.device, tier.method
+        module = SimpleNamespace(
+            get_forward_context=lambda: SimpleNamespace(is_padding=mask)
+        )
+        return patch.dict(sys.modules, {"vllm.forward_context": module})
+
+    def test_map_publication_keeps_device_addresses_for_captured_graphs(self):
+        tier = object.__new__(rt.TierLayer)
+        tier.device = torch.device("cpu")
+        tier.hot_slots, tier.cold_slots = 2, 2
+        tier.hot_map_host, tier.cold_map_host = (0, 1, -1, -1), (-1, -1, 0, 1)
+        tier.hot_map = tier.cold_map = None
+        tier.publish_maps()
+        hot_ptr, cold_ptr = tier.hot_map.data_ptr(), tier.cold_map.data_ptr()
+        tier.hot_map_host, tier.cold_map_host = rt.maps_after_swap(
+            tier.hot_map_host, tier.cold_map_host, 0, 2, 0, 0
+        )
+        tier.publish_maps()
+        self.assertEqual(
+            (tier.hot_map.data_ptr(), tier.cold_map.data_ptr()), (hot_ptr, cold_ptr)
+        )
+        self.assertEqual(tier.hot_map.tolist(), [-1, 1, 0, -1])
+        self.assertEqual(tier.cold_map.tolist(), [0, -1, -1, 1])
+        tier.hot_map_host = (0, 0, -1, -1)
+        with self.assertRaises(AssertionError):
+            tier.publish_maps()
+
+    def test_eager_forward_records_static_buffer_and_runner_finishes_it(self):
+        coordinator = self.make_coordinator()
+        coordinator.enable_heat()
+        x = torch.ones(2, 3, dtype=torch.bfloat16)
+        weights = torch.tensor([[0.5, 0.5], [0.0, 0.0]])
+        ids = torch.tensor([[2, 3], [-1, -1]])
+        with self.forward_context(coordinator, torch.tensor([False, True])):
+            for tier in coordinator.layers:
+                coordinator.begin_layer(tier, x, weights, ids)
+                coordinator.end_layer(tier)
+            self.assertEqual((coordinator.recorded, coordinator.forward_rows), (0, 2))
+            with self.assertRaises(ValueError):
+                coordinator.finish_forward(3)
+            self.assertTrue(coordinator.poisoned)
+            coordinator.poisoned = False
+            coordinator.forward_rows = 2
+            coordinator.finish_forward(2)
+        self.assertIsNone(coordinator.forward_rows)
+        self.assertEqual(coordinator.stats["recorded_forwards"], 1)
+        self.assertEqual(coordinator.stats["model_tokens"], 1)
+        self.assertEqual(coordinator.policy.heat[0], (0, 0, 1, 1))
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (0, 4)
+        )
+
+    def test_unfinished_forward_is_startup_work_before_heat_and_error_after(self):
+        coordinator = self.make_coordinator()
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights, ids = torch.ones(1, 2), torch.tensor([[0, 1]])
+        with self.forward_context(coordinator, torch.tensor([False])):
+            for _ in range(2):
+                for tier in coordinator.layers:
+                    coordinator.begin_layer(tier, x, weights, ids)
+                    coordinator.end_layer(tier)
+            self.assertEqual(coordinator.stats["dropped_startup_records"], 1)
+            coordinator.forward_rows = None
+            coordinator.enable_heat()
+            for tier in coordinator.layers:
+                coordinator.begin_layer(tier, x, weights, ids)
+                coordinator.end_layer(tier)
+            # TierLayer.apply poisons the coordinator on this error.
+            with self.assertRaises(RuntimeError):
+                coordinator.begin_layer(coordinator.layers[0], x, weights, ids)
+
+    def test_capture_time_forward_is_never_finished(self):
+        coordinator = self.make_coordinator()
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        with (
+            self.forward_context(coordinator, torch.tensor([True])),
+            patch.object(rt, "_is_capturing", return_value=True),
+        ):
+            # Capture must not wait on a previous stream: adopt it beforehand.
+            coordinator.stream = SimpleNamespace(cuda_stream=3, synchronize=Mock())
+            coordinator.stream_id = 3
+            with self.assertRaises(RuntimeError):
+                coordinator.begin_layer(
+                    coordinator.layers[0], x, weights, torch.tensor([[-1, -1]])
+                )
+            coordinator.stream.synchronize.assert_not_called()
+            coordinator.stream = coordinator.stream_id = None
+            for tier in coordinator.layers:
+                coordinator.begin_layer(tier, x, weights, torch.tensor([[-1, -1]]))
+                coordinator.end_layer(tier)
+            self.assertIsNone(coordinator.forward_rows)
+            self.assertEqual(coordinator.stats["captured_forwards"], 1)
+            with self.assertRaises(RuntimeError):
+                coordinator.finish_forward(1)
+        self.assertTrue(coordinator.poisoned)
+
+    def test_finish_rejects_incomplete_sequence_shape_drift_and_overflow(self):
+        coordinator = self.make_coordinator()
+        coordinator.recorded = 1
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1)
+        coordinator.poisoned, coordinator.recorded = False, 0
+        for rows in (0, 5):
+            with self.assertRaises(ValueError):
+                coordinator.finish_forward(rows)
+            coordinator.poisoned = False
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights, ids = torch.ones(1, 2), torch.tensor([[0, 1]])
+        with self.forward_context(coordinator, torch.tensor([False])):
+            coordinator.begin_layer(coordinator.layers[0], x, weights, ids)
+            with self.assertRaises(ValueError):
+                coordinator.begin_layer(
+                    coordinator.layers[1],
+                    x.expand(2, -1),
+                    weights.expand(2, -1),
+                    ids.expand(2, -1),
+                )
+            coordinator.recorded = 0
+            with self.assertRaises(ValueError):
+                coordinator.begin_layer(
+                    coordinator.layers[0],
+                    torch.ones(5, 3, dtype=torch.bfloat16),
+                    torch.ones(5, 2),
+                    torch.zeros(5, 2, dtype=torch.int64),
+                )
+            unallocated = rt.TierCoordinator(
+                coordinator.layers, coordinator.settings, {}
+            )
+            with self.assertRaises(RuntimeError):
+                unallocated.begin_layer(coordinator.layers[0], x, weights, ids)
+
+    def test_waves_split_on_slot_reuse_and_temp_budget_only(self):
+        from lab_expert_tier.tier_policy import Swap
+
+        reuse = (Swap(0, 0, 0, 2, 0), Swap(0, 0, 1, 0, 1))
+        self.assertEqual(rt.plan_waves(reuse, 8), [[reuse[0]], [reuse[1]]])
+        spread = (Swap(0, 0, 0, 2, 0), Swap(1, 0, 0, 2, 0), Swap(0, 1, 1, 3, 1))
+        self.assertEqual(rt.plan_waves(spread, 8), [list(spread)])
+        self.assertEqual(rt.plan_waves(spread, 2), [list(spread[:2]), [spread[2]]])
+        cold_reuse = (Swap(0, 0, 0, 2, 0), Swap(0, 1, 0, 3, 2))
+        self.assertEqual(
+            rt.plan_waves(cold_reuse, 8), [[cold_reuse[0]], [cold_reuse[1]]]
+        )
+        self.assertEqual(rt.plan_waves((), 8), [])
+        with self.assertRaises(ValueError):
+            rt.plan_waves(spread, 0)
+
+    def test_wave_phases_wait_between_all_d2h_all_h2d_and_host_writes(self):
+        events: list[Any] = []
+
+        class Row:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def copy_(self, other, non_blocking=False):
+                events.append((self.tag, other.tag))
+
+        def bank(tag, rows):
+            return {
+                name: [Row(f"{tag}{i}") for i in range(rows)] for name in rt.TENSORS
+            }
+
+        temporary = {name: [Row("t0"), Row("t1")] for name in rt.TENSORS}
+        items = [
+            (bank("h", 2), bank("c", 2), rt.temporary_row(temporary, 0), 0, 1),
+            (bank("H", 2), bank("C", 2), rt.temporary_row(temporary, 1), 1, 0),
+        ]
+        rt.swap_tensor_rows_wave(items, lambda: events.append("wait"))
+        per_phase = len(rt.TENSORS)
+        self.assertEqual(events[:per_phase], [("t0", "h0")] * per_phase)
+        self.assertEqual(events[per_phase : 2 * per_phase], [("t1", "H1")] * per_phase)
+        self.assertEqual(events[2 * per_phase], "wait")
+        h2d = events[2 * per_phase + 1 : 4 * per_phase + 1]
+        self.assertEqual(h2d, [("h0", "c1")] * per_phase + [("H1", "C0")] * per_phase)
+        self.assertEqual(events[4 * per_phase + 1], "wait")
+        host = events[4 * per_phase + 2 :]
+        self.assertEqual(host, [("c1", "t0")] * per_phase + [("C0", "t1")] * per_phase)
+
+    def test_wave_migration_matches_sequential_swaps_byte_for_byte(self):
+        from lab_expert_tier.tier_policy import Swap
+
+        def make_layer(index, seed):
+            layer = object.__new__(rt.TierLayer)
+            layer.index, layer.device = index, torch.device("cpu")
+            layer.num_experts, layer.hot_slots, layer.cold_slots = 5, 2, 3
+            layer.row_bytes = 6
+            layer.hot = {
+                name: (torch.arange(2 * 3) + 100 * seed + 10 * i)
+                .reshape(2, 3)
+                .to(torch.int32)
+                for i, name in enumerate(rt.TENSORS)
+            }
+            layer.cold_cpu = {
+                name: (torch.arange(3 * 3) + 100 * seed + 10 * i + 50)
+                .reshape(3, 3)
+                .to(torch.int32)
+                for i, name in enumerate(rt.TENSORS)
+            }
+            layer.hot_map_host = (0, 1, -1, -1, -1)
+            layer.cold_map_host = (-1, -1, 0, 1, 2)
+            layer.hot_map = layer.cold_map = None
+            layer.publish_maps()
+            return layer
+
+        # Plan order matters: the third swap reuses hot slot 0 of layer 0 and
+        # must follow the first physically, so it opens a second wave; the
+        # fourth reuses cold slot 0 from the first wave only and joins the
+        # second. Layer 1's independent swap shares the first wave.
+        plan = (
+            Swap(0, 0, 0, 0, 2),
+            Swap(1, 1, 2, 1, 4),
+            Swap(0, 0, 1, 2, 3),
+            Swap(0, 1, 0, 1, 0),
+        )
+        sequential = [make_layer(i, i + 1) for i in range(2)]
+        temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
+        for swap in plan:
+            sequential[swap.layer].swap(
+                swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot, temp
+            )
+        waved = [make_layer(i, i + 1) for i in range(2)]
+        pool = {name: torch.zeros(8, 3, dtype=torch.int32) for name in rt.TENSORS}
+        coordinator = rt.TierCoordinator(waved, rt.Settings(32 * 2**30), pool)
+        coordinator.device = torch.device("cpu")
+        coordinator.migrate(plan)
+        self.assertEqual(coordinator.stats["migration_waves"], 2)
+        self.assertEqual(coordinator.stats["max_wave_swaps"], 2)
+        self.assertEqual(coordinator.stats["swaps"], 4)
+        self.assertEqual(coordinator.per_layer_swaps, [3, 1])
+        for a, b in zip(sequential, waved):
+            self.assertEqual(
+                (a.hot_map_host, a.cold_map_host), (b.hot_map_host, b.cold_map_host)
+            )
+            self.assertEqual(a.hot_map.tolist(), b.hot_map.tolist())
+            self.assertEqual(a.cold_map.tolist(), b.cold_map.tolist())
+            for name in rt.TENSORS:
+                self.assertTrue(torch.equal(a.hot[name], b.hot[name]), name)
+                self.assertTrue(torch.equal(a.cold_cpu[name], b.cold_cpu[name]), name)
+        self.assertEqual(waved[0].hot_map_host, (1, -1, -1, 0, -1))
+        with self.assertRaises(AssertionError):
+            coordinator.migrate((Swap(0, 0, 0, 0, 2),))
+
+    def test_marlin_block_size_matches_stock_selection(self):
+        def stock(tokens, top_k, local, global_, input_dtype):
+            m = math.ceil(tokens * local / global_)
+            for block in (8, 16, 32, 48, 64):
+                if m * top_k / local / block < 0.9:
+                    break
+            if input_dtype is not None and input_dtype.itemsize == 1:
+                block = max(block, 16)
+            return block
+
+        for tokens in (1, 2, 7, 64, 512):
+            for top_k in (1, 4, 10):
+                for local in (1, 3, 258, 254):
+                    for dtype in (None, torch.int8, torch.float8_e4m3fn):
+                        self.assertEqual(
+                            rt.marlin_block_size(tokens, top_k, local, 512, dtype),
+                            stock(tokens, top_k, local, 512, dtype),
+                        )
+
+    def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
+        tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30)
+        tier.device = torch.device("cpu")
+        tier.num_experts, tier.hot_slots, tier.cold_slots = 4, 2, 2
+        tier.hot_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+        tier.cold_map = torch.tensor([-1, -1, 0, 1], dtype=torch.int32)
+        tier.layer = SimpleNamespace(activation="silu")
+        tier.marlin_workspace = torch.zeros(4, dtype=torch.int32)
+        hidden, inner = 3, 5
+        tier.hot = {"w13_weight": "hot13", "w2_weight": "hot2"}
+        tier.cold = {"w13_weight": "cold13", "w2_weight": "cold2"}
+
+        def experts(tag):
+            return SimpleNamespace(
+                w1_bias=None,
+                w2_bias=None,
+                w1_scale=f"{tag}-s1",
+                w2_scale=f"{tag}-s2",
+                quant_type_id=7,
+                activation=f"{tag}-act",
+                a1_gscale=None,
+                a2_gscale=None,
+                g1_alphas=f"{tag}-g1",
+                g2_alphas=f"{tag}-g2",
+                w13_g_idx=None,
+                w2_g_idx=None,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                w1_zp=None,
+                w2_zp=None,
+                input_dtype=None,
+                is_k_full=True,
+                activation_config="cfg",
+            )
+
+        tier.hot_kernel = SimpleNamespace(fused_experts=experts("hot"))
+        tier.cold_kernel = SimpleNamespace(fused_experts=experts("cold"))
+        x = torch.ones(3, hidden, dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 2], [3, 1], [-1, -1]], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [0.0, 0.0]])
+        calls = []
+        handed = []
+
+        def get_simultaneous(*specs):
+            # Garbage-filled workspace: only an explicit zero fill may be relied on.
+            buffers = [torch.full(shape, 7, dtype=dtype) for shape, dtype in specs]
+            handed.append(buffers)
+            return buffers
+
+        def align(topk_ids, block, num_experts, expert_map, ignore_invalid_experts):
+            self.assertIs(topk_ids, ids)
+            self.assertTrue(ignore_invalid_experts)
+            self.assertEqual(num_experts, 4)
+            return ("sorted", expert_map), "experts", "post"
+
+        def fused(**kw):
+            calls.append(kw)
+            expert_map = kw["expert_map"]
+            self.assertEqual(kw["sorted_token_ids"], ("sorted", expert_map))
+            self.assertIs(kw["workspace"], tier.marlin_workspace)
+            self.assertIs(kw["intermediate_cache13"], handed[-1][0])
+            self.assertIs(kw["intermediate_cache2"], handed[-1][1])
+            self.assertIs(kw["output"], handed[-1][2])
+            self.assertFalse(kw["apply_router_weight_on_input"])
+            for t in range(ids.shape[0]):
+                for k in range(ids.shape[1]):
+                    expert = int(ids[t, k])
+                    if expert >= 0 and int(expert_map[expert]) >= 0:
+                        kw["output"][t * 2 + k].fill_(
+                            (expert + 1) * float(weights[t, k])
+                        )
+            return kw["output"]
+
+        fused_moe = "vllm.model_executor.layers.fused_moe"
+        modules = {
+            fused_moe + ".experts.marlin_moe": SimpleNamespace(
+                _fused_marlin_moe=fused,
+                marlin_moe_intermediate_size=lambda w1, w2: inner,
+            ),
+            fused_moe + ".moe_align_block_size": SimpleNamespace(
+                moe_align_block_size=align
+            ),
+            "vllm.scalar_type": SimpleNamespace(
+                ScalarType=SimpleNamespace(from_id=lambda i: ("scalar", i))
+            ),
+            "vllm.v1.worker.workspace": SimpleNamespace(
+                current_workspace_manager=lambda: SimpleNamespace(
+                    get_simultaneous=get_simultaneous
+                )
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            out = tier.split(x, weights, ids)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["w1"], "hot13")
+        self.assertEqual(calls[1]["w1"], "cold13")
+        self.assertIs(calls[0]["expert_map"], tier.hot_map)
+        self.assertIs(calls[1]["expert_map"], tier.cold_map)
+        self.assertEqual(calls[0]["w1_scale"], "hot-s1")
+        self.assertEqual(calls[1]["global_scale2"], "cold-g2")
+        self.assertEqual(calls[0]["quant_type"], ("scalar", 7))
+        self.assertEqual(calls[0]["activation_func"], "hot-act")
+        self.assertEqual(handed[-1][2].shape, (6, hidden))
+        self.assertEqual(handed[-1][0].shape, (6 * max(2 * inner, hidden),))
+        # Token 0: expert 0 (hot) * .25 + expert 2 (cold) * .75; token 1:
+        # expert 3 (cold) * .5 + expert 1 (hot) * .5; token 2 is padding.
+        expected = torch.tensor([[1 * 0.25 + 3 * 0.75], [4 * 0.5 + 2 * 0.5], [0.0]])
+        torch.testing.assert_close(
+            out.float(), expected.expand(3, hidden).float(), rtol=1e-2, atol=1e-2
+        )
+        self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
+
+    def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
+        rt.finish_model_forward(SimpleNamespace(), 8)
+        coordinator = SimpleNamespace(finish_forward=Mock())
+        rt.finish_model_forward(
+            SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8
+        )
+        coordinator.finish_forward.assert_called_once_with(8)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exclusive GPU-hot / pinned-CPU-cold NVFP4 Marlin tier adapter.
 
-Pinned to vLLM 1970f3ed4; eager, unsharded FlashNext only. Policy is the
-existing expert-tier heat/periodic migration policy, not demand caching.
+Pinned to vLLM 1970f3ed4; unsharded FlashNext only, without torch.compile.
+Policy is the existing expert-tier heat/periodic migration policy, not demand
+caching.
+
+CUDA Graph contract (FULL decode graphs, eager prefill):
+
+- Everything a captured graph reads or writes lives at a fixed address: hot
+  weights, pinned cold banks (through UVA), the two expert maps, and the
+  per-layer routing record buffer. All of these are updated in place.
+- The forward only records routing into that buffer; no host copy, policy
+  decision, or migration happens inside a layer. A replay executes none of
+  this Python, so the runner's post-forward hook (`finish_model_forward`)
+  performs the single D2H copy, heat update, RAM TEMP swaps, and map
+  publication after every forward, replayed or eager.
+- Migration runs on the runner's stream and waits for completion before the
+  next forward is issued, so weights and maps never change under a replay.
 """
 
 from __future__ import annotations
@@ -42,6 +56,7 @@ SCALE_PROPERTIES = {
     "g2_alphas": "w2_weight_scale_2",
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
+SPLIT_MODES = ("fused", "modular")
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -58,6 +73,13 @@ class Settings:
     hysteresis: float = 1.3
     dwell_tokens: int = 0
     max_swaps_per_resync: int = 0
+    # Pinned RAM TEMP rows: the largest wave of slot-independent swaps that
+    # one resync moves with two stream waits instead of two per swap.
+    temp_slots: int = 8
+    # "fused": both partitions' Marlin GEMM chains write disjoint rows of one
+    # per-slot buffer that is reduced once. "modular": two stock modular
+    # kernel calls, clone, and add (the original path, kept for fallback).
+    split: str = "fused"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -83,6 +105,8 @@ class Settings:
             "HYSTERESIS",
             "DWELL_TOKENS",
             "MAX_SWAPS_PER_RESYNC",
+            "TEMP_SLOTS",
+            "SPLIT",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -98,16 +122,20 @@ class Settings:
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
         if stats < 1 or verify not in ("0", "1"):
             raise ValueError("STATS_EVERY must be positive; VERIFY_INIT must be 0 or 1")
+        split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
+        if split not in SPLIT_MODES:
+            raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
         integers = {
             key: int(os.environ.get(PREFIX + key, default))
             for key, default in (
                 ("SYNC_TOKENS", "50"),
                 ("DWELL_TOKENS", "0"),
                 ("MAX_SWAPS_PER_RESYNC", "0"),
+                ("TEMP_SLOTS", "8"),
             )
         }
         for key, integer in integers.items():
-            if integer < 0:
+            if integer < 0 or (key == "TEMP_SLOTS" and integer < 1):
                 raise ValueError(f"{key} must be a nonnegative integer")
         numbers = {
             key: float(os.environ.get(PREFIX + key, default))
@@ -136,6 +164,8 @@ class Settings:
             numbers["HYSTERESIS"],
             integers["DWELL_TOKENS"],
             integers["MAX_SWAPS_PER_RESYNC"],
+            integers["TEMP_SLOTS"],
+            split,
         )
 
 
@@ -245,20 +275,75 @@ def maps_after_swap(hot_map, cold_map, old_expert, new_expert, hot_slot, cold_sl
     return tuple(hot), tuple(cold)
 
 
-def swap_tensor_rows(hot, cold, temporary, hot_slot, cold_slot, synchronize):
-    """Original RAM TEMP order; caller poisons on any partial-copy failure.
+def swap_tensor_rows_wave(items, synchronize):
+    """Original RAM TEMP order for a wave of slot-independent swaps.
 
-    D2H hot->TEMP completes before H2D cold->hot; the H2D must complete
-    before cold's CPU storage is overwritten with TEMP. All six tensors move.
+    Each item is (hot, cold, temporary_row, hot_slot, cold_slot) and every
+    item must own a distinct TEMP row and distinct slots. All D2H hot->TEMP
+    copies complete before any H2D cold->hot; all H2D complete before any
+    cold CPU storage is overwritten with TEMP. All six tensors move. The
+    caller poisons on any partial-copy failure.
     """
-    for name in TENSORS:
-        temporary[name].copy_(hot[name][hot_slot], non_blocking=True)
+    for hot, _, temporary, hot_slot, _ in items:
+        for name in TENSORS:
+            temporary[name].copy_(hot[name][hot_slot], non_blocking=True)
     synchronize()
-    for name in TENSORS:
-        hot[name][hot_slot].copy_(cold[name][cold_slot], non_blocking=True)
+    for hot, cold, _, hot_slot, cold_slot in items:
+        for name in TENSORS:
+            hot[name][hot_slot].copy_(cold[name][cold_slot], non_blocking=True)
     synchronize()
-    for name in TENSORS:
-        cold[name][cold_slot].copy_(temporary[name])
+    for _, cold, temporary, _, cold_slot in items:
+        for name in TENSORS:
+            cold[name][cold_slot].copy_(temporary[name])
+
+
+def swap_tensor_rows(hot, cold, temporary, hot_slot, cold_slot, synchronize):
+    swap_tensor_rows_wave(((hot, cold, temporary, hot_slot, cold_slot),), synchronize)
+
+
+def plan_waves(swaps, temp_slots):
+    """Split an ordered plan into waves that may move concurrently.
+
+    The policy may reuse a hot or cold slot later in the same plan; such a
+    swap depends on the previous physical result and starts a new wave.
+    Within a wave no (layer, slot) repeats, so the sequential and the wave
+    execution leave identical weights and maps. Waves never exceed the TEMP
+    row budget.
+    """
+    if temp_slots < 1:
+        raise ValueError("Swap waves need at least one TEMP row")
+    waves: list[list[Any]] = []
+    wave: list[Any] = []
+    used: set[tuple[int, str, int]] = set()
+    for swap in swaps:
+        keys = (
+            (swap.layer, "hot", swap.hot_slot),
+            (swap.layer, "cold", swap.cold_slot),
+        )
+        if wave and (len(wave) >= temp_slots or any(key in used for key in keys)):
+            waves.append(wave)
+            wave, used = [], set()
+        wave.append(swap)
+        used.update(keys)
+    if wave:
+        waves.append(wave)
+    return waves
+
+
+def temporary_row(temporary, index):
+    return {name: tensor[index] for name, tensor in temporary.items()}
+
+
+def marlin_block_size(tokens, top_k, local_experts, global_experts, input_dtype):
+    """The stock fused_marlin_moe M-block choice for one expert partition."""
+    estimated = math.ceil(tokens * local_experts / global_experts)
+    block = 8
+    for block in (8, 16, 32, 48, 64):
+        if estimated * top_k / local_experts / block < 0.9:
+            break
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block = max(block, 16)
+    return block
 
 
 def replace_full_source_references(layer, method, hot, hot_kernel, hot_quant):
@@ -311,9 +396,19 @@ class TierLayer:
         }
         self.hot_map_host = tuple(range(slots)) + (-1,) * self.cold_slots
         self.cold_map_host = (-1,) * slots + tuple(range(self.cold_slots))
+        self.hot_map = self.cold_map = None
         self.publish_maps()
         self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
+        self.marlin_workspace = None
+        if settings.split == "fused":
+            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                marlin_make_workspace_new,
+            )
+
+            # One lock workspace per layer for the whole process, like the
+            # dense Marlin linear path; captured graphs keep its address.
+            self.marlin_workspace = marlin_make_workspace_new(self.device, 4)
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
         self.cold_bytes = sum(
@@ -358,13 +453,17 @@ class TierLayer:
         validate_partition(
             self.hot_map_host, self.cold_map_host, self.hot_slots, self.cold_slots
         )
-        # Fresh staging storage: no pinned map can be overwritten during DMA.
-        self.hot_map = torch.tensor(
-            self.hot_map_host, dtype=torch.int32, device=self.device
-        )
-        self.cold_map = torch.tensor(
-            self.cold_map_host, dtype=torch.int32, device=self.device
-        )
+        # Pageable staging: the runtime finishes reading it before returning,
+        # so no pinned host buffer can be overwritten during DMA.
+        hot = torch.tensor(self.hot_map_host, dtype=torch.int32)
+        cold = torch.tensor(self.cold_map_host, dtype=torch.int32)
+        if self.hot_map is None or self.cold_map is None:
+            self.hot_map, self.cold_map = hot.to(self.device), cold.to(self.device)
+            return
+        # Captured graphs read these addresses: update them in place, on the
+        # current stream, after the caller completed every previous use.
+        self.hot_map.copy_(hot)
+        self.cold_map.copy_(cold)
 
     def call(self, kernel, tensors, expert_map, x, weights, ids):
         return kernel.apply(
@@ -383,6 +482,8 @@ class TierLayer:
         )
 
     def split(self, x, weights, ids):
+        if self.settings.split == "fused":
+            return self.split_fused(x, weights, ids)
         # Marlin uses shared workspaces. Preserve the hot result before cold
         # runs, and keep the two calls on one stream. Neither prepare mutates x
         # on this verified BF16 NoDPEP path (router-on-input is rejected).
@@ -392,10 +493,107 @@ class TierLayer:
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
 
-    def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
+    def split_fused(self, x, weights, ids):
+        """Both partitions into one per-slot row buffer, reduced once.
+
+        Every (token, k) slot belongs to exactly one partition, so the hot and
+        cold Marlin chains write disjoint rows of the same [tokens*k, hidden]
+        buffer; padding slots belong to neither and stay at the zero fill.
+        Compared with two modular kernel calls this removes both output
+        allocations, both masked reductions, the hot clone, the add, and the
+        prepare/finalize wrappers, while keeping one block alignment and two
+        GEMMs per partition. Numerics are checked against the source kernel
+        by init verification.
+        """
         import torch
 
-        maps = maps_after_swap(
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            _fused_marlin_moe,
+            marlin_moe_intermediate_size,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        from vllm.scalar_type import ScalarType
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        tokens, hidden = x.shape
+        top_k = ids.shape[1]
+        rows_count = tokens * top_k
+        inner = marlin_moe_intermediate_size(
+            self.hot["w13_weight"], self.hot["w2_weight"]
+        )
+        # Same manager as the stock kernels: stable addresses once locked.
+        cache13, cache2, rows = current_workspace_manager().get_simultaneous(
+            ((rows_count * max(2 * inner, hidden),), x.dtype),
+            ((rows_count, inner), x.dtype),
+            ((rows_count, hidden), x.dtype),
+        )
+        rows.zero_()
+        partitions = (
+            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
+            (
+                self.cold_kernel.fused_experts,
+                self.cold,
+                self.cold_map,
+                self.cold_slots,
+            ),
+        )
+        for experts, tensors, expert_map, slots in partitions:
+            block = marlin_block_size(
+                tokens, top_k, slots, self.num_experts, experts.input_dtype
+            )
+            sorted_ids, expert_ids, post_padded = moe_align_block_size(
+                ids, block, self.num_experts, expert_map, ignore_invalid_experts=True
+            )
+            _fused_marlin_moe(
+                hidden_states=x,
+                w1=tensors["w13_weight"],
+                w2=tensors["w2_weight"],
+                bias1=experts.w1_bias,
+                bias2=experts.w2_bias,
+                w1_scale=experts.w1_scale,
+                w2_scale=experts.w2_scale,
+                topk_weights=weights,
+                num_topk=top_k,
+                quant_type=ScalarType.from_id(experts.quant_type_id),
+                apply_router_weight_on_input=False,
+                expert_map=expert_map,
+                block_size_m=block,
+                sorted_token_ids=sorted_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=post_padded,
+                activation=self.layer.activation,
+                activation_func=experts.activation,
+                topk_ids=ids,
+                input_global_scale1=experts.a1_gscale,
+                input_global_scale2=experts.a2_gscale,
+                global_scale1=experts.g1_alphas,
+                global_scale2=experts.g2_alphas,
+                g_idx1=experts.w13_g_idx,
+                g_idx2=experts.w2_g_idx,
+                sort_indices1=experts.w13_g_idx_sort_indices,
+                sort_indices2=experts.w2_g_idx_sort_indices,
+                w1_zeros=experts.w1_zp,
+                w2_zeros=experts.w2_zp,
+                workspace=self.marlin_workspace,
+                intermediate_cache13=cache13,
+                intermediate_cache2=cache2,
+                output=rows,
+                input_dtype=experts.input_dtype,
+                is_k_full=experts.is_k_full,
+                activation_config=experts.activation_config,
+            )
+        # Rows already carry the router weights (second GEMM multiplies them).
+        return torch.sum(rows.view(tokens, top_k, hidden), dim=1)
+
+    def stage_swap(self, old_expert, new_expert, hot_slot, cold_slot):
+        """Validate against the current placement and advance the host maps.
+
+        Physical rows move afterwards (`swap_tensor_rows_wave`) and the device
+        maps are republished by the caller once the copies completed.
+        """
+        self.hot_map_host, self.cold_map_host = maps_after_swap(
             self.hot_map_host,
             self.cold_map_host,
             old_expert,
@@ -403,15 +601,18 @@ class TierLayer:
             hot_slot,
             cold_slot,
         )
+
+    def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
+        """One sequential swap with its own waits; used by init verification."""
+        self.stage_swap(old_expert, new_expert, hot_slot, cold_slot)
         swap_tensor_rows(
             self.hot,
             self.cold_cpu,
             temporary,
             hot_slot,
             cold_slot,
-            torch.cuda.current_stream(self.device).synchronize,
+            _current_stream(self.device).synchronize,
         )
-        self.hot_map_host, self.cold_map_host = maps
         self.publish_maps()
 
     def verify_initial(self, original_kernel, original, temporary):
@@ -547,6 +748,20 @@ def compare_outputs(actual, reference, name, stage):
     return metrics
 
 
+def _current_stream(device):
+    import torch
+
+    if device.type != "cuda":
+        return SimpleNamespace(cuda_stream=0, synchronize=lambda: None)
+    return torch.cuda.current_stream(device)
+
+
+def _is_capturing(device):
+    import torch
+
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
 class TierCoordinator:
     def __init__(self, layers, settings, temporary):
         self.layers, self.settings, self.temporary = layers, settings, temporary
@@ -559,27 +774,60 @@ class TierCoordinator:
         self.lock = threading.Lock()
         self.poisoned, self.stream_id = False, None
         self.stream: Any = None
-        self.pending = []
+        # Static routing records: one [tokens, layers, 2k+1] int32 device
+        # buffer written inside the (possibly captured) forward, and a pinned
+        # host mirror read once after it. Replays rewrite the same addresses.
+        # Token-major so a forward's rows are one contiguous prefix.
+        self.records: Any = None
+        self.records_host: Any = None
+        self.device: Any = None
+        self.recorded = 0  # layers recorded by the forward in progress
+        self.forward_rows: int | None = None  # recorded, not yet finished
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
         # Only the successful compile_or_warm_up_model tail enables heat.
         self.heat_enabled = False
 
-    def adopt_stream(self, stream, layer_index):
+    def allocate_records(self, device, top_k, max_tokens):
+        import torch
+
+        if self.records is not None:
+            raise RuntimeError("Tier routing records are already allocated")
+        if top_k < 1 or max_tokens < 1:
+            raise ValueError("Routing records need positive top-k and token capacity")
+        shape = (max_tokens, len(self.layers), 2 * top_k + 1)
+        self.device = device
+        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
+        self.records_host = torch.zeros(
+            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
+        )
+
+    def adopt_stream(self, stream, boundary):
         if self.stream_id == stream.cuda_stream:
             return  # The common path adds no event, wait, or synchronization.
         if self.stream_id is not None:
-            if layer_index != 0 or self.pending:
+            if not boundary or self.recorded:
                 raise NotImplementedError(
                     "Tier cannot change CUDA stream within a model forward"
                 )
-            # Model warmup and real execution can use different streams. At a
-            # complete-model boundary, finish previous workspace/weight/map
-            # uses before handing ownership to the new stream. Keep the old
-            # stream alive and do not publish the new one if this wait fails.
+            # Warmup, graph capture, and real execution use different
+            # streams. At a complete-model boundary, finish previous
+            # workspace/weight/map uses before handing ownership to the new
+            # stream. Keep the old stream alive and do not publish the new
+            # one if this wait fails.
             self.stream.synchronize()
         self.stream, self.stream_id = stream, stream.cuda_stream
+
+    def discard_unconsumed(self, reason):
+        # Startup warmup and graph capture call the model directly, so they
+        # legitimately leave a recorded forward that no runner hook finishes.
+        # After heat is enabled every forward must be finished, or heat and
+        # migration would silently skip real tokens.
+        if self.heat_enabled:
+            raise RuntimeError(f"Recorded tier forward was never finished: {reason}")
+        self.stats["dropped_startup_records"] += 1
+        self.forward_rows = None
 
     def begin_layer(self, tier, x, weights, ids):
         import torch
@@ -588,10 +836,30 @@ class TierCoordinator:
 
         if self.poisoned:
             raise RuntimeError("Expert tier is poisoned by a previous failure")
-        if tier.index != len(self.pending):
+        if self.records is None:
+            raise RuntimeError("Tier routing records are not allocated")
+        if tier.index != self.recorded:
             raise RuntimeError("Tier requires one sequential full-model forward")
-        stream = torch.cuda.current_stream(tier.device)
-        self.adopt_stream(stream, tier.index)
+        rows = x.shape[0]
+        stream = _current_stream(tier.device)
+        if tier.index == 0:
+            if self.forward_rows is not None:
+                self.discard_unconsumed("next forward started")
+            if not 0 < rows <= self.records.shape[0]:
+                raise ValueError("Forward exceeds the tier routing record capacity")
+            if (
+                self.stream_id is not None
+                and self.stream_id != stream.cuda_stream
+                and _is_capturing(tier.device)
+            ):
+                # Adopting waits on the previous stream, which is illegal
+                # inside a capture. vLLM warms up on the capture stream
+                # first, so this only guards a changed capture protocol.
+                raise RuntimeError("Tier cannot adopt a stream during graph capture")
+            self.forward_rows = rows
+        elif rows != self.forward_rows:
+            raise ValueError("Token count changed within a model forward")
+        self.adopt_stream(stream, tier.index == 0)
         if (
             x.ndim != 2
             or ids.ndim != 2
@@ -635,17 +903,62 @@ class TierCoordinator:
             ),
             dim=1,
         )
-        self.pending.append(packed)
+        if packed.shape[1] != self.records.shape[2]:
+            raise ValueError("Routing record width does not match the allocation")
+        # Graph-safe: a fixed destination written on the forward's stream.
+        self.records[:rows, tier.index].copy_(packed)
+        self.recorded += 1
 
     def end_layer(self, tier):
-        import torch
-
         if tier.index + 1 != len(self.layers):
             return
+        self.recorded = 0
+        if _is_capturing(tier.device):
+            # Capture-time rows are dummy padding and nobody finishes them.
+            self.stats["captured_forwards"] += 1
+            self.forward_rows = None
+
+    def finish_forward(self, rows):
+        """Runner-side model boundary: the one host copy per forward.
+
+        Called after eager forwards and CUDA Graph replays alike. A replay
+        executes no Python in the layers, so the runner supplies the padded
+        row count and the static records carry this forward's routing/mask.
+        """
+        with self.lock:
+            if self.poisoned:
+                raise RuntimeError("Expert tier is poisoned by a previous failure")
+            try:
+                self._finish_forward(rows)
+            except Exception:
+                self.poisoned = True
+                raise
+
+    def _finish_forward(self, rows):
+        if self.records is None:
+            raise RuntimeError("Tier routing records are not allocated")
+        if self.recorded:
+            raise RuntimeError("Model forward finished with incomplete tier layers")
+        if _is_capturing(self.device):
+            raise RuntimeError("Tier forward cannot be finished during graph capture")
+        if not 0 < rows <= self.records.shape[0]:
+            raise ValueError("Finished forward exceeds the routing record capacity")
+        if self.forward_rows is None:
+            self.stats["replayed_forwards"] += 1
+        else:
+            if self.forward_rows != rows:
+                raise ValueError(
+                    "Runner token count disagrees with the recorded forward"
+                )
+            self.forward_rows = None
+            self.stats["recorded_forwards"] += 1
+        stream = _current_stream(self.device)
+        self.adopt_stream(stream, True)
         # One batched D2H at the model boundary, matching update_from_graph.
         # This also completes all hot/cold uses before any RAM TEMP migration.
-        packed = torch.stack(self.pending).to(device="cpu").tolist()
-        self.pending.clear()
+        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
+        stream.synchronize()
+        packed = self.records_host[:rows].transpose(0, 1).tolist()
         routes, activity, mask, tokens = unpack_routes(
             packed, self.layers[0].num_experts
         )
@@ -677,24 +990,13 @@ class TierCoordinator:
             self.stats["policy_plan_seconds"] += time.perf_counter() - started
             if plan is not None:
                 migration_started = time.perf_counter() if plan.swaps else None
-                for swap in plan.swaps:
-                    layer = self.layers[swap.layer]
-                    layer.swap(
-                        swap.old_expert,
-                        swap.new_expert,
-                        swap.hot_slot,
-                        swap.cold_slot,
-                        self.temporary,
-                    )
-                    self.stats["swaps"] += 1
-                    self.per_layer_swaps[swap.layer] += 1
-                    self.stats["h2d_bytes"] += layer.row_bytes
-                    self.stats["d2h_bytes"] += layer.row_bytes
-                    self.stats["host_copy_bytes"] += layer.row_bytes
+                self.migrate(plan.swaps)
                 if plan.swaps:
                     # RAM TEMP already waits for its two DMA phases. Include
-                    # the final map publication too: this is completed wall
-                    # time, not the time needed merely to enqueue CUDA work.
+                    # the final in-place map publication too: this is
+                    # completed wall time, not merely enqueue time, and it
+                    # guarantees the next forward (or replay) sees the new
+                    # weights and maps.
                     if self.stream is None:
                         raise RuntimeError(
                             "Migration requires an adopted execution stream"
@@ -719,6 +1021,46 @@ class TierCoordinator:
         if self.stats["model_forwards"] % self.settings.stats_every == 0:
             self.report()
 
+    def migrate(self, swaps):
+        """Move a plan's rows in slot-independent waves, in plan order.
+
+        Each wave takes two stream waits instead of two per swap; the host
+        maps advance per swap in plan order, and each touched layer's device
+        maps are republished once after its last wave completed.
+        """
+        synchronize = _current_stream(self.device).synchronize
+        touched = []
+        for wave in plan_waves(swaps, self.settings.temp_slots):
+            items = []
+            for index, swap in enumerate(wave):
+                layer = self.layers[swap.layer]
+                layer.stage_swap(
+                    swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot
+                )
+                items.append(
+                    (
+                        layer.hot,
+                        layer.cold_cpu,
+                        temporary_row(self.temporary, index),
+                        swap.hot_slot,
+                        swap.cold_slot,
+                    )
+                )
+                if layer not in touched:
+                    touched.append(layer)
+            swap_tensor_rows_wave(items, synchronize)
+            for swap in wave:
+                layer = self.layers[swap.layer]
+                self.stats["swaps"] += 1
+                self.per_layer_swaps[swap.layer] += 1
+                self.stats["h2d_bytes"] += layer.row_bytes
+                self.stats["d2h_bytes"] += layer.row_bytes
+                self.stats["host_copy_bytes"] += layer.row_bytes
+            self.stats["migration_waves"] += 1
+            self.stats["max_wave_swaps"] = max(self.stats["max_wave_swaps"], len(wave))
+        for layer in touched:
+            layer.publish_maps()
+
     def report(self):
         # Defaults make snapshots/deltas stable even before the first swap.
         fields = (
@@ -731,6 +1073,12 @@ class TierCoordinator:
             "d2h_bytes",
             "host_copy_bytes",
             "resyncs",
+            "migration_waves",
+            "max_wave_swaps",
+            "recorded_forwards",
+            "replayed_forwards",
+            "captured_forwards",
+            "dropped_startup_records",
             "policy_observe_seconds",
             "policy_plan_seconds",
             "policy_commit_seconds",
@@ -744,7 +1092,8 @@ class TierCoordinator:
                 "tokens_total": self.policy.tokens_total,
                 "version": self.policy.version,
                 "heat_enabled": self.heat_enabled,
-                "pending_layers": len(self.pending),
+                "pending_layers": self.recorded,
+                "unfinished_forward_rows": self.forward_rows,
                 "per_layer_swaps": list(self.per_layer_swaps),
                 "policy_cpu_seconds": sum(
                     self.stats[key]
@@ -763,7 +1112,7 @@ class TierCoordinator:
 
     def enable_heat(self):
         with self.lock:
-            if self.poisoned or self.pending:
+            if self.poisoned or self.recorded:
                 raise RuntimeError(
                     "Cannot enable tier heat with failed or incomplete startup work"
                 )
@@ -771,6 +1120,9 @@ class TierCoordinator:
                 raise RuntimeError("Tier heat cannot be enabled twice")
             if self.policy.tokens_total or self.policy.swaps_total:
                 raise AssertionError("Startup polluted tier heat/migration accounting")
+            if self.forward_rows is not None:
+                # The last direct warmup/capture forward is startup work.
+                self.discard_unconsumed("heat enabled")
             if self.stream is not None:
                 self.stream.synchronize()
             startup = dict(self.stats)
@@ -784,7 +1136,7 @@ class TierCoordinator:
                         "heat_enabled": True,
                         "tokens_total": self.policy.tokens_total,
                         "swaps_total": self.policy.swaps_total,
-                        "pending_layers": len(self.pending),
+                        "pending_layers": self.recorded,
                         "startup_stats": startup,
                     },
                     sort_keys=True,
@@ -800,6 +1152,16 @@ def enable_model_heat(model):
     if coordinator is None:
         raise RuntimeError("Enabled tier model has no coordinator after startup")
     coordinator.enable_heat()
+
+
+def finish_model_forward(model, rows):
+    """Runner hook after every model forward: eager, dummy, or graph replay.
+
+    Cheap when the tier is disabled; never reads the environment.
+    """
+    coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
+    if coordinator is not None:
+        coordinator.finish_forward(rows)
 
 
 def unpack_routes(packed, num_experts):
@@ -897,7 +1259,7 @@ def initialize_model(model, model_config):
     import torch
 
     from vllm import envs
-    from vllm.config import get_current_vllm_config
+    from vllm.config import CompilationMode, get_current_vllm_config
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
     from vllm.v1.worker.workspace import (
@@ -912,8 +1274,24 @@ def initialize_model(model, model_config):
         )
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
         raise NotImplementedError("Tier requires VLLM_USE_V2_MODEL_RUNNER=1")
-    if not model_config.enforce_eager:
-        raise NotImplementedError("Expert tier requires --enforce-eager")
+    compilation = config.compilation_config
+    graph_mode = compilation.cudagraph_mode
+    if compilation.mode != CompilationMode.NONE:
+        raise NotImplementedError(
+            "Expert tier requires compilation mode NONE (no torch.compile); use "
+            "--enforce-eager, or -cc.mode=none with cudagraph_mode=FULL_DECODE_ONLY"
+        )
+    if envs.VLLM_USE_BREAKABLE_CUDAGRAPH or (
+        graph_mode is not None and graph_mode.has_piecewise_cudagraphs()
+    ):
+        raise NotImplementedError(
+            "Expert tier supports only NONE, FULL_DECODE_ONLY, or FULL CUDA graphs"
+        )
+    # Graph padding never exceeds the capture size; eager prefill never
+    # exceeds the scheduler budget. Size the static routing records for both.
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    if compilation.max_cudagraph_capture_size:
+        max_tokens = max(max_tokens, compilation.max_cudagraph_capture_size)
     if settings.verify_init and (
         not is_workspace_manager_initialized()
         or current_workspace_manager().is_locked()
@@ -967,7 +1345,7 @@ def initialize_model(model, model_config):
     first = candidates[0][1]
     temporary = {
         name: torch.empty(
-            tuple(getattr(first, name).shape[1:]),
+            (settings.temp_slots, *getattr(first, name).shape[1:]),
             dtype=getattr(first, name).dtype,
             device="cpu",
             pin_memory=True,
@@ -977,7 +1355,7 @@ def initialize_model(model, model_config):
     tiers = []
     for index, (name, layer, method) in enumerate(candidates):
         tier, raw_refs = _compact_one(
-            index, name, layer, method, slots, settings, temporary
+            index, name, layer, method, slots, settings, temporary_row(temporary, 0)
         )
         gc.collect()
         if any(ref() is not None for ref in raw_refs):
@@ -1000,6 +1378,9 @@ def initialize_model(model, model_config):
             ),
         )
     coordinator = TierCoordinator(tiers, settings, temporary)
+    coordinator.allocate_records(
+        tiers[0].device, candidates[0][2].moe.experts_per_token, max_tokens
+    )
     for tier in tiers:
         tier.coordinator = coordinator
         tier.method._lab_expert_tier = tier
@@ -1023,11 +1404,17 @@ def initialize_model(model, model_config):
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
+                "temporary_rows": settings.temp_slots,
+                "split": settings.split,
                 "host_source_bytes": sum(row_sizes) * 512,
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,
                 "policy": "expert_tier_heat_periodic_ram_temp",
-                "cuda_graphs": False,
+                "cuda_graphs": None if graph_mode is None else graph_mode.name,
+                "compilation_mode": CompilationMode(compilation.mode).name,
+                "routing_record_tokens": max_tokens,
+                "routing_record_bytes": coordinator.records.numel() * 4,
+                "static_maps_and_records": True,
                 "settings": asdict(settings),
                 "policy_config": settings.policy_kwargs(),
                 "static_partition": settings.sync_tokens == 0,

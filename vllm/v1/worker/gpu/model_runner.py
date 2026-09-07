@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm._lab_expert_tier.runtime import finish_model_forward
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -1856,6 +1857,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        # Lab expert tier: the host-side routing/migration boundary must run
+        # after replays too, which execute no Python inside the model.
+        finish_model_forward(self.model, input_batch.num_tokens_after_padding)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
