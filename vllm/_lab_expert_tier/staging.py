@@ -93,9 +93,12 @@ def plan_staging(ids, cold_map, hot_map, hot_slots, staging_slots):
         torch.where(distinct, slot, torch.full_like(slot, staging_slots)),
         sorted_cold_slot,
     )
-    expert_map = torch.empty(num_experts + 1, dtype=torch.int32, device=ids.device)
-    expert_map[:num_experts] = hot_map
-    expert_map[num_experts] = -1
+    # Device fills only: a Python scalar store is a host-to-device copy,
+    # which CUDA Graph capture rejects.
+    expert_map = torch.full(
+        (num_experts + 1,), -1, dtype=torch.int32, device=ids.device
+    )
+    expert_map[:num_experts].copy_(hot_map)
     expert_map.scatter_(
         0,
         torch.where(distinct, sorted_key, torch.full_like(sorted_key, num_experts)),
