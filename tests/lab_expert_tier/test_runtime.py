@@ -1520,7 +1520,9 @@ class TensorTests(unittest.TestCase):
             range(staging_end, layer.bank_rows),
             range(layer.cold_slots, layer.cold_rows_total),
         )
-        layer.promote_buffers = pm.allocate_step_buffers(layer.device, experts, staging)
+        layer.promote_buffers = pm.allocate_step_buffers(
+            layer.device, experts, staging, layer.staging_rows
+        )
         layer.promote_gate = False
         layer.hot_rows, layer.cold_rows = list(range(hot)), list(range(experts - hot))
         layer.hot_map_host = tuple(range(hot)) + (-1,) * (experts - hot)

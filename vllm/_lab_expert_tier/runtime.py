@@ -536,7 +536,10 @@ class TierLayer:
                 range(self.cold_slots, self.cold_rows_total),
             )
             self.promote_buffers = allocate_step_buffers(
-                self.device, self.num_experts, max(self.staging_slots, 1)
+                self.device,
+                self.num_experts,
+                max(self.staging_slots, 1),
+                self.staging_rows,
             )
             if settings.planner == "device" and self.device.type == "cuda":
                 from . import device_lru

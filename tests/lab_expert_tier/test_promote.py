@@ -161,6 +161,22 @@ class PromoteReferenceTests(unittest.TestCase):
         self.assertEqual(int(tables.clock[0]), 1)  # startup: recency untouched
         pm.check_tables(tables, 1, 5)
 
+    def test_flip_rejects_a_plan_beyond_the_pool_capacity(self):
+        tables, bank, ram, staging_rows = self.setup(hot=3, vram_free=3, ram_free=1)
+        plan = pm.reference_plan(torch.tensor([[3, 4]]), tables, 2)
+        oversized = pm.StepPlan(
+            promote_expert=torch.tensor([3, 4]),
+            promote_cold_slot=torch.tensor([0, 1]),
+            victim_expert=torch.tensor([0, 1]),
+            victim_hot_slot=torch.tensor([0, 1]),
+            count=torch.tensor([2], dtype=torch.int32),
+            staged_only_expert=plan.staged_only_expert,
+            staged_only_cold_slot=plan.staged_only_cold_slot,
+            staged_only_count=torch.tensor([0], dtype=torch.int32),
+        )
+        with self.assertRaises(RuntimeError):
+            pm.apply_step_reference(tables, oversized, staging_rows)
+
     def test_invalid_and_duplicate_ids_never_plan_or_index(self):
         tables, bank, ram, staging_rows = self.setup()
         plan, gathers, staged, evicts, step_map = self.run_step(

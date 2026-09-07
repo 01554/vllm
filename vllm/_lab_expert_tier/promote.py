@@ -219,8 +219,10 @@ def apply_step_reference(tables, plan, staging_rows):
     shadow = tables.ram_shadow.tolist()
     gathers: list[tuple[int, int]] = []  # (ram row, vram row)
     evicts: list[tuple[int, int]] = []  # (vram row, ram row)
-    if count > len(vram_free):
-        raise RuntimeError("Promotion exceeds the free VRAM ring")
+    if count > len(vram_free) or count > len(ram_free):
+        # The device flip assumes count <= min(F, R); a larger plan would
+        # loop forever looking for a free pool position.
+        raise RuntimeError("Promotion exceeds the free VRAM ring or RAM pool")
     # Pass 1: victims whose shadow is intact reclaim their pool position
     # first, so a later victim's write never invalidates a reclaimable one.
     positions = [-1] * count
@@ -368,14 +370,17 @@ class StepBuffers:
     evict_count: Any  # [1] int32
     evict_pos: Any  # [S] int32 flip scratch: reclaimed pool position or -1
     step_map: Any  # [E] int32 physical expert map for this step
+    staging_rows: Any  # [S] int32 the layer's staging rows (constant)
 
 
-def allocate_step_buffers(device, num_experts, width):
+def allocate_step_buffers(device, num_experts, width, staging_rows=()):
+    """Allocate once per layer, before any capture: fixed addresses only."""
     import torch
 
     def ints(n):
         return torch.zeros(n, dtype=torch.int32, device=device)
 
+    rows = list(staging_rows) + [0] * (width - len(staging_rows))
     return StepBuffers(
         gather_src=ints(2 * width),
         gather_dst=ints(2 * width),
@@ -385,6 +390,7 @@ def allocate_step_buffers(device, num_experts, width):
         evict_count=ints(1),
         evict_pos=ints(width),
         step_map=torch.full((num_experts,), -1, dtype=torch.int32, device=device),
+        staging_rows=torch.tensor(rows[:width], dtype=torch.int32, device=device),
     )
 
 
@@ -394,8 +400,6 @@ def flip_step(tables, plan, buffers, staging_rows):
     Fills `buffers` with the copy lists and the step map. On CUDA this is a
     single Triton program; nothing touches the host.
     """
-    import torch
-
     device = tables.hot_map.device
     if device.type != "cuda":
         gathers, staged, evicts, step_map = apply_step_reference(
@@ -410,7 +414,8 @@ def flip_step(tables, plan, buffers, staging_rows):
             buffers.evict_src[i], buffers.evict_dst[i] = src, dst
         buffers.step_map.copy_(step_map)
         return
-    staging = torch.as_tensor(list(staging_rows), dtype=torch.int32, device=device)
+    # No host-to-device creation here: capture-safe, fixed addresses only.
+    staging = buffers.staging_rows
     _flip_kernel()[(1,)](
         plan.promote_expert,
         plan.promote_cold_slot,
