@@ -80,6 +80,9 @@ class Settings:
     # per-slot buffer that is reduced once. "modular": two stock modular
     # kernel calls, clone, and add (the original path, kept for fallback).
     split: str = "fused"
+    # "records": static routing records read back once per forward. Other
+    # names resolve through OBSERVERS (device-side observers register there).
+    observer: str = "records"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -107,6 +110,7 @@ class Settings:
             "MAX_SWAPS_PER_RESYNC",
             "TEMP_SLOTS",
             "SPLIT",
+            "OBSERVER",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -125,6 +129,9 @@ class Settings:
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
             raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
+        observer = os.environ.get(PREFIX + "OBSERVER", "records")
+        if not observer.isidentifier():
+            raise ValueError("OBSERVER must be an observer registry name")
         integers = {
             key: int(os.environ.get(PREFIX + key, default))
             for key, default in (
@@ -166,6 +173,7 @@ class Settings:
             integers["MAX_SWAPS_PER_RESYNC"],
             integers["TEMP_SLOTS"],
             split,
+            observer,
         )
 
 
@@ -867,6 +875,22 @@ class RecordObserver:
         return None
 
 
+# name -> class or "module:Class"; device observers register here.
+OBSERVERS: dict[str, Any] = {"records": RecordObserver}
+
+
+def make_observer(name):
+    import importlib
+
+    target = OBSERVERS.get(name)
+    if target is None:
+        raise ValueError(f"Unknown expert tier observer {name!r}")
+    if isinstance(target, str):
+        module_name, _, class_name = target.partition(":")
+        target = getattr(importlib.import_module(module_name), class_name)
+    return target()
+
+
 class TierCoordinator:
     def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
@@ -1026,18 +1050,25 @@ class TierCoordinator:
                 self.poisoned = True
                 raise
 
-    def flush(self):
-        """Deliver a deferred device observation (stats, forced resync, exit)."""
+    def flush(self, plan=False):
+        """Collect a deferred device observation outside a forward boundary.
+
+        Observation only by default (stats and shutdown); `plan=True` is the
+        forced-resync entry and may migrate.
+        """
         with self.lock:
             if self.poisoned:
                 raise RuntimeError("Expert tier is poisoned by a previous failure")
             try:
-                result = self.observer.flush()
-                if result is not None:
-                    self._consume(result)
+                self._flush_locked(plan)
             except Exception:
                 self.poisoned = True
                 raise
+
+    def _flush_locked(self, plan):
+        result = self.observer.flush()
+        if result is not None:
+            self._consume(result, plan)
 
     def _finish_forward(self, rows, valid_rows=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
@@ -1064,21 +1095,27 @@ class TierCoordinator:
         result = self.observer.finish(
             rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
         )
-        self._consume(result)
+        # One real forward, counted exactly once whatever the observer returns.
+        self.stats["model_forwards"] += 1
+        if not self.heat_enabled:
+            self.stats["ignored_startup_forwards"] += 1
+        self._consume(result, plan=True)
+        if self.stats["model_forwards"] % self.settings.stats_every == 0:
+            self.report()
 
-    def _consume(self, result):
+    def _consume(self, result, plan):
+        """Apply one observer result. Forward counters are not touched here.
+
+        `plan` allows planning and migration; a flush at exit or before a
+        report collects the observation only, so no GPU work starts outside
+        a forward boundary.
+        """
         if isinstance(result, Deferred):
-            # Lifecycle continues; the observation arrives with a later
-            # snapshot. Nothing may be planned against stale heat.
-            self.stats["model_forwards"] += result.forwards
+            # The observation arrives with a later snapshot; nothing may be
+            # planned against stale heat.
             self.stats["deferred_forwards"] += result.forwards
-            if not self.heat_enabled:
-                self.stats["ignored_startup_forwards"] += result.forwards
-            if self.stats["model_forwards"] % self.settings.stats_every == 0:
-                self.report()
             return
         if isinstance(result, DeviceSnapshot):
-            self.stats["model_forwards"] += result.forwards
             if not self.heat_enabled:
                 raise RuntimeError(
                     "Device observers must not advance heat before it is enabled"
@@ -1094,10 +1131,10 @@ class TierCoordinator:
             self.stats["route_hot"] += result.route_hot
             self.stats["route_total"] += result.route_total
             self.stats["model_tokens"] += result.tokens
+            self.stats["snapshot_forwards"] += result.forwards
             self.stats["device_snapshots"] += 1
-            self._plan_and_migrate()
-            if self.stats["model_forwards"] % self.settings.stats_every == 0:
-                self.report()
+            if plan:
+                self._plan_and_migrate()
             return
         if not isinstance(result, LegacyRoutes):
             raise TypeError("Observer returned an unknown result type")
@@ -1107,10 +1144,9 @@ class TierCoordinator:
             result.mask,
             result.tokens,
         )
-        self.stats["model_forwards"] += 1
         if not self.heat_enabled:
-            self.stats["ignored_startup_forwards"] += 1
-        elif tokens:
+            return
+        if tokens:
             # Measure the routing placement used by this forward, before heat
             # observation or migration changes it. CPU records already exist.
             for layer, route_rows, active_rows in zip(self.layers, routes, activity):
@@ -1130,11 +1166,10 @@ class TierCoordinator:
             )
             self.stats["policy_observe_seconds"] += time.perf_counter() - started
             self.stats["model_tokens"] += tokens
-            self._plan_and_migrate()
+            if plan:
+                self._plan_and_migrate()
         else:
             self.stats["ignored_synthetic_forwards"] += 1
-        if self.stats["model_forwards"] % self.settings.stats_every == 0:
-            self.report()
 
     def _plan_and_migrate(self):
         if True:
@@ -1229,6 +1264,7 @@ class TierCoordinator:
             "captured_forwards",
             "dropped_startup_records",
             "deferred_forwards",
+            "snapshot_forwards",
             "device_snapshots",
             "policy_observe_seconds",
             "policy_plan_seconds",
@@ -1531,7 +1567,9 @@ def initialize_model(model, model_config):
                 sort_keys=True,
             ),
         )
-    coordinator = TierCoordinator(tiers, settings, temporary)
+    coordinator = TierCoordinator(
+        tiers, settings, temporary, make_observer(settings.observer)
+    )
     coordinator.allocate_records(
         tiers[0].device, candidates[0][2].moe.experts_per_token, max_tokens
     )
@@ -1561,6 +1599,7 @@ def initialize_model(model, model_config):
                 ),
                 "temporary_rows": settings.temp_slots,
                 "split": settings.split,
+                "observer": settings.observer,
                 "host_source_bytes": sum(row_sizes) * 512,
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,

@@ -1009,6 +1009,22 @@ class TensorTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
 
+    def test_observer_registry_builds_default_and_rejects_unknown(self):
+        self.assertIsInstance(rt.make_observer("records"), rt.RecordObserver)
+        with self.assertRaises(ValueError):
+            rt.make_observer("missing")
+        with (
+            patch.dict(
+                os.environ,
+                {rt.PREFIX + "GIB": "32", rt.PREFIX + "OBSERVER": "x y"},
+                clear=True,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            rt.Settings.from_env()
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().observer, "records")
+
     def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
         rt.finish_model_forward(SimpleNamespace(), 8)
         coordinator = SimpleNamespace(finish_forward=Mock())
@@ -1059,7 +1075,8 @@ class TensorTests(unittest.TestCase):
         coordinator.poisoned = False
         observer.results = [rt.Deferred()]
         coordinator.finish_forward(1, 1)
-        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 1)
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 2)
+        self.assertEqual(coordinator.stats["model_forwards"], 2)
         coordinator.enable_heat()
         self.assertEqual(observer.gate_opened, 1)
         # Legacy readback still observes and plans exactly as before.
@@ -1090,10 +1107,21 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(
             (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (1, 8)
         )
-        # flush delivers a pending snapshot through the same path.
+        # Forwards are counted once per finish; a snapshot window covering
+        # two forwards is recorded separately and never re-added.
+        self.assertEqual(coordinator.stats["model_forwards"], 5)
+        self.assertEqual(coordinator.stats["snapshot_forwards"], 2)
+        # flush collects a pending snapshot without counting a forward and,
+        # by default, without planning.
         observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
-        coordinator.flush()
-        self.assertEqual(len(imported), 2)
+        with patch.object(coordinator, "_plan_and_migrate") as planner:
+            coordinator.flush()
+            planner.assert_not_called()
+            observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+            coordinator.flush(plan=True)
+            planner.assert_called_once_with()
+        self.assertEqual(len(imported), 3)
+        self.assertEqual(coordinator.stats["model_forwards"], 5)
         observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2, False)]
         with self.assertRaises(RuntimeError):
             coordinator.finish_forward(1, 1)
