@@ -167,6 +167,28 @@ boundaries:
   cadence, or `Deferred` for forwards with no readback. The coordinator
   counts forwards once per finish, plans only on a snapshot, and `flush`
   collects deferred observations without planning unless asked.
+- **Asynchronous exchanges** (`VLLM_LAB_EXPERT_TIER_ASYNC_MIGRATION`, default
+  0; opt-in). Each layer gains `TEMP_SLOTS` spare VRAM rows after the staging
+  rows and `TEMP_SLOTS` spare pinned RAM rows after the cold rows, both
+  charged to the budgets (32 GiB, staging on: 258 hot slots become 240).
+  The policy's logical slots are unchanged; each layer maps them to physical
+  rows, and the device maps publish physical rows. A resync plan runs
+  asynchronously only when every layer's swaps fit its free spare rows and
+  no hot or cold slot repeats within a layer; otherwise the whole plan takes
+  the synchronous path in its original order (`sync_fallbacks`,
+  `fallback_over_budget`, `fallback_slot_reuse`). An eligible plan is
+  queued on a migration stream after the compute stream: promoted cold rows
+  go to spare VRAM rows and evicted hot rows to spare RAM rows while the
+  next forward still reads the old placement. At the next boundary, before
+  any observation or plan, the coordinator waits for the transfer if it is
+  not done, makes the compute stream wait on it, records a retire fence,
+  flips the row tables, republishes the maps, commits the policy, and
+  rebases the observer; retired rows return to their rings behind that
+  fence. So the first version overlaps at most one forward and then waits;
+  placement takes effect one forward after the plan. Outputs use the same
+  mathematical weights, but bit-level equivalence is not claimed.
+  `async_plans`, `async_commits`, `async_wait_seconds`, and
+  `async_pending_boundaries` are reported.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
