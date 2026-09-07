@@ -143,15 +143,19 @@ To enable decode graphs, replace `--enforce-eager` in the lab launcher with:
 ```
 
 `--enforce-eager` still works and reproduces the eager path through the same
-hook. vLLM may downgrade FULL_DECODE_ONLY to NONE if the attention backend
-lacks full-graph support; the `LAB_EXPERT_TIER_READY` line reports the
-resolved `cuda_graphs` mode and the routing record size.
+hook. The `cuda_graphs` value in `LAB_EXPERT_TIER_READY` is the configured
+mode at weight-loading time; MRv2 resolves the final mode later (it may
+downgrade FULL_DECODE_ONLY to NONE if the attention backend lacks full-graph
+support). Judge graph use from the capture log, `captured_forwards` in the
+heat-enable `startup_stats`, and a growing `replayed_forwards` during decode,
+not from the READY line.
 
 GPU validation that remains to be done, in order:
 
-1. Startup with the flag above: capture succeeds, `LAB_EXPERT_TIER_READY` shows
-   `cuda_graphs: FULL_DECODE_ONLY`, init verification passes, and the 48 GiB
-   capacity audit holds with the graph pool allocated.
+1. Startup with the flag above: the capture log shows FULL graphs captured,
+   `startup_stats.captured_forwards` is nonzero when heat is enabled, init
+   verification passes, and the 48 GiB capacity audit holds with the graph
+   pool allocated.
 2. A→B with heat enabled: `replayed_forwards` grows with decode, `swaps` and
    `resyncs` are nonzero, and no poisoned-tier error appears. Compare the B
    output with the eager run of the same source revision; the graph path
