@@ -58,6 +58,11 @@ SCALE_PROPERTIES = {
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
 SPLIT_MODES = ("fused", "modular")
+# moe_align_block_size histograms by *mapped* id in a buffer sized by its
+# num_experts argument, which must stay below 1024 after warp padding, so a
+# bank with this many physical rows or more is aligned by logical id and
+# its blocks are mapped to rows afterwards.
+ALIGN_ROW_LIMIT = 992
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -457,6 +462,31 @@ def temporary_row(temporary, index):
 
 def _next_power_of_two(value):
     return 1 << max(int(value) - 1, 0).bit_length()
+
+
+def mask_routes(ids, expert_map):
+    """Routes whose expert is absent from `expert_map` become padding (-1)."""
+    import torch
+
+    present = (ids >= 0) & (expert_map[ids.clamp(min=0).long()] >= 0)
+    return torch.where(present, ids, torch.full_like(ids, -1))
+
+
+def physical_block_experts(logical_ids, post_padded, block, expert_map, num_experts):
+    """Map per-block logical expert ids to physical rows on the device.
+
+    Blocks at or beyond `post_padded` tokens are unused by the GEMM and may
+    hold uninitialized ids; they become -1 without indexing anything.
+    """
+    import torch
+
+    blocks = torch.arange(
+        logical_ids.numel(), device=logical_ids.device, dtype=torch.int32
+    )
+    valid = (blocks * block) < post_padded.reshape(1)
+    safe = torch.where(valid, logical_ids, torch.zeros_like(logical_ids))
+    safe = safe.clamp(0, num_experts - 1)
+    return torch.where(valid, expert_map[safe.long()], torch.full_like(logical_ids, -1))
 
 
 def marlin_block_size(tokens, top_k, local_experts, global_experts, input_dtype):
@@ -1033,9 +1063,25 @@ class TierLayer:
             block = marlin_block_size(
                 tokens, top_k, slots, self.num_experts, experts.input_dtype
             )
-            sorted_ids, expert_ids, post_padded = moe_align_block_size(
-                ids, block, self.num_experts, expert_map, ignore_invalid_experts=True
-            )
+            routed = ids
+            if slots >= ALIGN_ROW_LIMIT:
+                # Align by logical id (absent experts already padding), then
+                # map the blocks to rows; the align op never sees a row id.
+                routed = mask_routes(ids, expert_map)
+                sorted_ids, logical_ids, post_padded = moe_align_block_size(
+                    routed, block, self.num_experts, None, ignore_invalid_experts=True
+                )
+                expert_ids = physical_block_experts(
+                    logical_ids, post_padded, block, expert_map, self.num_experts
+                )
+            else:
+                sorted_ids, expert_ids, post_padded = moe_align_block_size(
+                    ids,
+                    block,
+                    self.num_experts,
+                    expert_map,
+                    ignore_invalid_experts=True,
+                )
             _fused_marlin_moe(
                 hidden_states=x,
                 w1=tensors["w13_weight"],
@@ -1055,7 +1101,7 @@ class TierLayer:
                 num_tokens_post_padded=post_padded,
                 activation=self.layer.activation,
                 activation_func=experts.activation,
-                topk_ids=ids,
+                topk_ids=routed,
                 input_global_scale1=experts.a1_gscale,
                 input_global_scale2=experts.a2_gscale,
                 global_scale1=experts.g1_alphas,
