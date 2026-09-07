@@ -162,6 +162,14 @@ class TierPolicy:
         self.version = 0  # LUT version, incremented only by a nonempty committed plan.
         self._last_step_tokens = 0
         self._pending: _PlannedState | None = None
+        # Device snapshots carry absolute heat and token totals.  These guards
+        # belong to the import protocol, while version, cadence, maps, and
+        # dwell remain policy-owned state.
+        self._device_session: str | int | None = None
+        self._device_session_set = False
+        self._device_sequence = -1
+        self._device_forwards = 0
+        self._device_due = False
 
     @property
     def hot_to_expert(self) -> tuple[tuple[int, ...], ...]:
@@ -306,6 +314,164 @@ class TierPolicy:
             self.tokens_total += num_tokens  # once for the model, never per layer.
         self._last_step_tokens = num_tokens
 
+    @staticmethod
+    def _snapshot_value(snapshot, *names, default=None):
+        for name in names:
+            if hasattr(snapshot, name):
+                return getattr(snapshot, name)
+        return default
+
+    def import_device_snapshot(self, snapshot) -> None:
+        """Import absolute device heat exactly once for a snapshot sequence.
+
+        The device has already applied every decay and integer count update in
+        the snapshot.  Import therefore replaces ``_heat`` and token totals;
+        it never calls :meth:`observe_step`, advances dwell, publishes maps,
+        or changes policy version/cadence state.  A device observer should
+        provide the base/session/sequence metadata so stale and duplicate
+        snapshots fail before any policy state changes.
+
+        ``last_step_tokens`` is part of the metadata because a multi-token
+        prefill can cross a cadence boundary without being eligible to plan.
+        The following single-token step must retain that opportunity even when
+        it arrives in a later snapshot.
+        """
+        if self._pending is not None:
+            raise RuntimeError(
+                "commit or discard the outstanding plan before importing"
+            )
+
+        verified = self._snapshot_value(snapshot, "verified", default=True)
+        error = self._snapshot_value(snapshot, "error", default=False)
+        if verified is not True or error is True:
+            raise RuntimeError(
+                "device snapshot validation failed; delayed validation is not "
+                "the legacy fail-closed path"
+            )
+
+        heat_value = self._snapshot_value(snapshot, "heat")
+        if heat_value is None:
+            raise ValueError("device snapshot must contain heat")
+        try:
+            heat = np.array(heat_value, dtype=np.float64, copy=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("device snapshot heat is not a numeric matrix") from exc
+        if heat.shape != (self.num_layers, self.num_experts):
+            raise ValueError("device snapshot heat shape does not match the policy")
+        if not np.isfinite(heat).all() or (heat < 0).any():
+            raise ValueError("device snapshot heat must be finite and nonnegative")
+
+        tokens_value = self._snapshot_value(
+            snapshot, "tokens_total", "tokens", default=None
+        )
+        if tokens_value is None:
+            raise ValueError("device snapshot must contain an absolute token total")
+        tokens_total = _integer("snapshot tokens_total", tokens_value, 0)
+
+        last_step_value = self._snapshot_value(
+            snapshot, "last_step_tokens", default=None
+        )
+        if last_step_value is None:
+            # Compatibility with the first observer seam.  Full device
+            # snapshots must carry this field to distinguish prefill and a
+            # one-token boundary; a legacy snapshot is treated as one step.
+            last_step_tokens = 1 if tokens_total > self.tokens_total else 0
+        else:
+            last_step_tokens = _integer(
+                "snapshot last_step_tokens", last_step_value, 0
+            )
+        if last_step_tokens > tokens_total:
+            raise ValueError(
+                "device snapshot last_step_tokens exceeds its token total"
+            )
+
+        base_names = (
+            "base_tokens_total",
+            "base_version",
+            "base_last_sync_tokens",
+        )
+        base_values = [
+            self._snapshot_value(snapshot, name, default=None) for name in base_names
+        ]
+        has_base = any(value is not None for value in base_values)
+        if has_base and any(value is None for value in base_values):
+            raise ValueError("device snapshot base metadata must be complete")
+        if has_base:
+            base_tokens, base_version, base_last_sync = (
+                _integer(name, value, 0)
+                for name, value in zip(base_names, base_values)
+            )
+            if (base_tokens, base_version, base_last_sync) != (
+                self.tokens_total,
+                self.version,
+                self.last_sync_tokens,
+            ):
+                raise RuntimeError("device snapshot base is stale")
+            if base_tokens > tokens_total or base_last_sync > tokens_total:
+                raise ValueError("device snapshot base exceeds its token total")
+
+        session = self._snapshot_value(snapshot, "session_id", default=None)
+        sequence_value = self._snapshot_value(snapshot, "sequence", default=None)
+        has_sequence = session is not None or sequence_value is not None
+        if has_sequence and (session is None or sequence_value is None):
+            raise ValueError("device snapshot session and sequence must be complete")
+        if has_sequence:
+            if not isinstance(session, (str, int)) or isinstance(session, bool):
+                raise ValueError(
+                    "device snapshot session_id must be a string or integer"
+                )
+            sequence = _integer("snapshot sequence", sequence_value, 0)
+            if self._device_session_set and session != self._device_session:
+                raise RuntimeError("device snapshot belongs to a stale session")
+            if self._device_sequence >= 0 and sequence <= self._device_sequence:
+                raise RuntimeError("device snapshot is duplicate or out of order")
+        else:
+            sequence = None
+
+        forwards_value = self._snapshot_value(
+            snapshot, "forwards_total", "forwards", default=None
+        )
+        if forwards_value is not None:
+            forwards = _integer("snapshot forwards", forwards_value, 0)
+        else:
+            forwards = None
+        if has_sequence and forwards is not None and forwards <= self._device_forwards:
+            raise RuntimeError("device snapshot forwards are duplicate or out of order")
+
+        if tokens_total < self.tokens_total:
+            raise RuntimeError("device snapshot token total is stale")
+        if (
+            tokens_total == self.tokens_total
+            and (
+                not has_sequence
+                or forwards is None
+                or forwards <= self._device_forwards
+            )
+        ):
+            raise RuntimeError("device snapshot contains no new observation")
+
+        due_value = self._snapshot_value(snapshot, "resync_due", default=None)
+        if due_value is not None and type(due_value) is not bool:
+            raise ValueError("device snapshot resync_due must be a bool")
+        due = bool(due_value) if due_value is not None else False
+
+        # All validation above is complete before replacing any state.  The
+        # copy is intentional: the policy must not alias a snapshot's storage.
+        self._heat = heat
+        self.tokens_total = tokens_total
+        self._last_step_tokens = last_step_tokens
+        if has_sequence:
+            self._device_session = session
+            self._device_session_set = True
+            self._device_sequence = sequence
+            if forwards is not None:
+                self._device_forwards = forwards
+        self._device_due = self._device_due or due
+
+    def import_snapshot(self, snapshot) -> None:
+        """Compatibility alias used by the runtime observer seam."""
+        self.import_device_snapshot(snapshot)
+
     def plan_resync(self) -> SwapPlan | None:
         """Return a cadence-gated transaction; published maps stay unchanged.
 
@@ -322,6 +488,7 @@ class TierPolicy:
         if (
             self.tokens_total // self.sync_period
             <= self.last_sync_tokens // self.sync_period
+            and not self._device_due
         ):
             return None
 
@@ -403,6 +570,7 @@ class TierPolicy:
         self.last_sync_tokens = plan.tokens_total
         if plan.swaps:
             self.version += 1
+        self._device_due = False
         self._pending = None
 
     def discard(self, plan: SwapPlan) -> None:
