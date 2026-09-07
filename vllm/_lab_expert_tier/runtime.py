@@ -614,7 +614,10 @@ class TierLayer:
         self.staging_bytes = self.row_bytes * self.staging_slots
         self.spare_bytes = self.row_bytes * self.spare_slots
         self.cold_bytes = self.row_bytes * self.cold_slots
-        self.cold_spare_bytes = self.row_bytes * self.spare_slots
+        # No physical RAM spare rows under backing: nothing is written.
+        self.cold_spare_bytes = (
+            0 if self.ram_backing else self.row_bytes * self.spare_slots
+        )
         # Host bytes actually resident for this layer's RAM bank.
         self.host_bytes = self.row_bytes * self.cold_rows_total
         if self.hot_bytes + self.cold_bytes != self.row_bytes * self.num_experts:
@@ -2291,6 +2294,7 @@ def initialize_model(model, model_config):
                     "layer": name,
                     "index": index,
                     "raw_host_owners_released": not settings.ram_backing,
+                    "source_bank_retained": settings.ram_backing,
                     "hot_bytes": tier.hot_bytes,
                     "cold_bytes": tier.cold_bytes,
                     "host_bytes": tier.host_bytes,
@@ -2373,7 +2377,7 @@ def initialize_model(model, model_config):
                 "settings": asdict(settings),
                 "policy_config": settings.policy_kwargs(),
                 "static_partition": settings.sync_tokens == 0,
-                "source_bank_retained": False,
+                "source_bank_retained": settings.ram_backing,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,
