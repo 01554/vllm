@@ -85,7 +85,9 @@ class Settings:
     observer: str = "records"
     # Decode-time VRAM staging of the selected cold experts: top_k spare rows
     # per layer at the end of the hot bank, charged to the capacity budget.
-    staging: bool = True
+    # Off by default: correct on the GPU but 7.7% slower than the fused
+    # two-partition path in its first measurement (plan launch overhead).
+    staging: bool = False
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -128,7 +130,7 @@ class Settings:
             return None
         stats = int(os.environ.get(PREFIX + "STATS_EVERY", "256"))
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
-        staging = os.environ.get(PREFIX + "STAGING", "1")
+        staging = os.environ.get(PREFIX + "STAGING", "0")
         if stats < 1 or verify not in ("0", "1") or staging not in ("0", "1"):
             raise ValueError(
                 "STATS_EVERY must be positive; VERIFY_INIT and STAGING must be 0 or 1"

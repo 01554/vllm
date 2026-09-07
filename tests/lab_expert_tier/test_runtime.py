@@ -135,7 +135,7 @@ class InvariantTests(unittest.TestCase):
             "STATS_EVERY": "1",
             "TEMP_SLOTS": "4",
             "SPLIT": "modular",
-            "STAGING": "0",
+            "STAGING": "1",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -145,10 +145,10 @@ class InvariantTests(unittest.TestCase):
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
         self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
-        self.assertEqual((settings.split, settings.staging), ("modular", False))
+        self.assertEqual((settings.split, settings.staging), ("modular", True))
         with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
             defaults = rt.Settings.from_env()
-        self.assertEqual((defaults.split, defaults.staging), ("fused", True))
+        self.assertEqual((defaults.split, defaults.staging), ("fused", False))
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,

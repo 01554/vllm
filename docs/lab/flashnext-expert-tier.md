@@ -143,7 +143,10 @@ boundaries:
   two stock modular kernel calls. Init verification compares either path
   against the source kernel.
 - **Staged cold experts for batch-1 decode** (`VLLM_LAB_EXPERT_TIER_STAGING`,
-  default 1). Each layer's hot bank has `top_k` spare rows, charged to the
+  default 0; opt-in). Measured correct on the GPU (staged init checks, FULL
+  replay, 48 GiB audit) but 7.74% slower than the fused two-partition path
+  in its first A→B (B 30.49 vs 33.05 tok/s), so it stays off until the
+  per-layer plan and copy launches are fused. Each layer's hot bank has `top_k` spare rows, charged to the
   capacity budget (32 GiB: 258 hot slots become 248 plus 10 staging rows).
   For a one-token forward, `plan_staging` derives on the device, with fixed
   shapes and no host sync, the distinct selected cold experts, a gather index
