@@ -68,6 +68,7 @@ class PromoteTables:
     last_use: Any  # [E] int64 step of last selection
     clock: Any  # [1] int64
     error: Any  # [1] int32 sticky device error
+    lru_state: Any = None  # planner-owned state (device_lru.allocate_state)
 
 
 @dataclass(frozen=True)
@@ -123,8 +124,8 @@ def allocate_tables(
 
 
 def capacity(tables):
-    """Promotions one step may make: one free VRAM row each; RAM never limits."""
-    return int(tables.vram_free.shape[0])
+    """Promotions one step may make: min(free VRAM ring, RAM pool) by contract."""
+    return int(min(tables.vram_free.shape[0], tables.ram_free.shape[0]))
 
 
 def reference_plan(ids, tables, staging_slots, enabled=True):
@@ -328,3 +329,328 @@ def check_tables(tables, hot_slots, cold_slots):
             raise AssertionError(f"Cold row {row} must shadow its expert {expert}")
     if int(tables.error[0]):
         raise RuntimeError("Promote mode recorded a device error")
+
+
+# ----------------------------------------------------------------------------
+# Device execution: one flip program per layer step, one copy launch per
+# direction. The torch references above define the semantics; CUDA runs these.
+# ----------------------------------------------------------------------------
+
+PLAN_WIDTH = 16
+COPY_BLOCK = 4096
+_KERNELS: dict[str, Any] = {}
+
+
+@dataclass
+class StepBuffers:
+    """Fixed-address per-layer scratch the flip kernel fills every step."""
+
+    gather_src: Any  # [2S] int32 RAM rows (promotions then staged-only)
+    gather_dst: Any  # [2S] int32 VRAM rows
+    gather_count: Any  # [1] int32
+    evict_src: Any  # [S] int32 VRAM rows
+    evict_dst: Any  # [S] int32 RAM rows
+    evict_count: Any  # [1] int32
+    step_map: Any  # [E] int32 physical expert map for this step
+
+
+def allocate_step_buffers(device, num_experts, width):
+    import torch
+
+    def ints(n):
+        return torch.zeros(n, dtype=torch.int32, device=device)
+
+    return StepBuffers(
+        gather_src=ints(2 * width),
+        gather_dst=ints(2 * width),
+        gather_count=ints(1),
+        evict_src=ints(width),
+        evict_dst=ints(width),
+        evict_count=ints(1),
+        step_map=torch.full((num_experts,), -1, dtype=torch.int32, device=device),
+    )
+
+
+def flip_step(tables, plan, buffers, staging_rows):
+    """Apply the flip on the device (CUDA) or through the reference (else).
+
+    Fills `buffers` with the copy lists and the step map. On CUDA this is a
+    single Triton program; nothing touches the host.
+    """
+    import torch
+
+    device = tables.hot_map.device
+    if device.type != "cuda":
+        gathers, staged, evicts, step_map = apply_step_reference(
+            tables, plan, list(staging_rows)
+        )
+        pairs = gathers + staged
+        buffers.gather_count.fill_(len(pairs))
+        buffers.evict_count.fill_(len(evicts))
+        for i, (src, dst) in enumerate(pairs):
+            buffers.gather_src[i], buffers.gather_dst[i] = src, dst
+        for i, (src, dst) in enumerate(evicts):
+            buffers.evict_src[i], buffers.evict_dst[i] = src, dst
+        buffers.step_map.copy_(step_map)
+        return
+    staging = torch.as_tensor(list(staging_rows), dtype=torch.int32, device=device)
+    _flip_kernel()[(1,)](
+        plan.promote_expert,
+        plan.promote_cold_slot,
+        plan.victim_expert,
+        plan.victim_hot_slot,
+        plan.count,
+        plan.staged_only_expert,
+        plan.staged_only_cold_slot,
+        plan.staged_only_count,
+        tables.hot_map,
+        tables.cold_map,
+        tables.hot_rows,
+        tables.cold_rows,
+        tables.hot_phys,
+        tables.cold_phys,
+        tables.vram_free,
+        tables.ram_free,
+        tables.ring_state,
+        tables.ram_shadow,
+        tables.error,
+        staging,
+        buffers.gather_src,
+        buffers.gather_dst,
+        buffers.gather_count,
+        buffers.evict_src,
+        buffers.evict_dst,
+        buffers.evict_count,
+        buffers.step_map,
+        tables.hot_map.shape[0],
+        tables.vram_free.shape[0],
+        tables.ram_free.shape[0],
+        WIDTH=PLAN_WIDTH,
+        MAP_BLOCK=1024,
+    )
+
+
+def copy_rows(source, destination, src_rows, dst_rows, count):
+    """Copy `count` (src, dst) row pairs of every bank tensor; device count."""
+    src_device = source[TENSORS[0]].device
+    if src_device.type != "cuda":
+        n = int(count.reshape(-1)[0].item())
+        pairs = [(int(src_rows[i]), int(dst_rows[i])) for i in range(n)]
+        copy_rows_reference(source, destination, pairs)
+        return
+    srcs = [_byte_rows(source[name]) for name in TENSORS]
+    dsts = [_byte_rows(destination[name]) for name in TENSORS]
+    widest = max(dst.shape[1] for dst in dsts)
+    grid = (src_rows.shape[0], (widest + COPY_BLOCK - 1) // COPY_BLOCK, len(TENSORS))
+    _copy_kernel()[grid](
+        *srcs,
+        *dsts,
+        src_rows,
+        dst_rows,
+        count,
+        *(dst.shape[1] for dst in dsts),
+        *(src.stride(0) for src in srcs),
+        *(dst.stride(0) for dst in dsts),
+        BLOCK=COPY_BLOCK,
+    )
+
+
+def _byte_rows(tensor):
+    import torch
+
+    if not tensor.is_contiguous():
+        raise ValueError("Promote copies require contiguous bank rows")
+    return tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
+
+
+def _flip_kernel():
+    """One program: the flip of `apply_step_reference`, on the device."""
+    if "flip" in _KERNELS:
+        return _KERNELS["flip"]
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def promote_flip(
+        promote_expert_ptr,
+        promote_cold_slot_ptr,
+        victim_expert_ptr,
+        victim_hot_slot_ptr,
+        count_ptr,
+        staged_expert_ptr,
+        staged_cold_slot_ptr,
+        staged_count_ptr,
+        hot_map_ptr,
+        cold_map_ptr,
+        hot_rows_ptr,
+        cold_rows_ptr,
+        hot_phys_ptr,
+        cold_phys_ptr,
+        vram_free_ptr,
+        ram_free_ptr,
+        ring_state_ptr,
+        ram_shadow_ptr,
+        error_ptr,
+        staging_ptr,
+        gather_src_ptr,
+        gather_dst_ptr,
+        gather_count_ptr,
+        evict_src_ptr,
+        evict_dst_ptr,
+        evict_count_ptr,
+        step_map_ptr,
+        num_experts,
+        vram_ring,
+        ram_pool,
+        WIDTH: tl.constexpr,
+        MAP_BLOCK: tl.constexpr,
+    ):
+        count = tl.load(count_ptr)
+        staged_count = tl.load(staged_count_ptr)
+        vram_head = tl.load(ring_state_ptr)
+        ram_head = tl.load(ring_state_ptr + 1)
+        evicts = 0
+        for i in range(0, count):
+            expert = tl.load(promote_expert_ptr + i)
+            victim = tl.load(victim_expert_ptr + i)
+            cold_slot = tl.load(promote_cold_slot_ptr + i)
+            hot_slot = tl.load(victim_hot_slot_ptr + i)
+            src_ram = tl.load(cold_rows_ptr + cold_slot)
+            victim_row = tl.load(hot_rows_ptr + hot_slot)
+            dst_vram = tl.load(vram_free_ptr + vram_head)
+            tl.store(vram_free_ptr + vram_head, victim_row)
+            vram_head = (vram_head + 1) % vram_ring
+            tl.store(gather_src_ptr + i, src_ram)
+            tl.store(gather_dst_ptr + i, dst_vram)
+            # Reclaim the victim's intact shadow from the pool, else write
+            # the round-robin head after invalidating its old shadow.
+            position = -1
+            for j in range(0, ram_pool):
+                row = tl.load(ram_free_ptr + j)
+                owner = tl.load(ram_shadow_ptr + row)
+                if (owner == victim) & (position < 0):
+                    position = j
+            if position < 0:
+                position = ram_head
+                ram_head = (ram_head + 1) % ram_pool
+                dst_ram = tl.load(ram_free_ptr + position)
+                tl.store(ram_shadow_ptr + dst_ram, victim)
+                tl.store(evict_src_ptr + evicts, victim_row)
+                tl.store(evict_dst_ptr + evicts, dst_ram)
+                evicts += 1
+            else:
+                dst_ram = tl.load(ram_free_ptr + position)
+            tl.store(ram_free_ptr + position, src_ram)
+            tl.store(ram_shadow_ptr + src_ram, expert)
+            tl.store(hot_rows_ptr + hot_slot, dst_vram)
+            tl.store(cold_rows_ptr + cold_slot, dst_ram)
+            tl.store(hot_map_ptr + expert, hot_slot)
+            tl.store(hot_map_ptr + victim, -1)
+            tl.store(cold_map_ptr + victim, cold_slot)
+            tl.store(cold_map_ptr + expert, -1)
+            tl.store(hot_phys_ptr + expert, dst_vram)
+            tl.store(hot_phys_ptr + victim, -1)
+            tl.store(cold_phys_ptr + victim, dst_ram)
+            tl.store(cold_phys_ptr + expert, -1)
+        tl.store(ring_state_ptr, vram_head)
+        tl.store(ring_state_ptr + 1, ram_head)
+        tl.store(evict_count_ptr, evicts)
+        tl.debug_barrier()
+        # Step map: the physical hot map with staged-only misses overlaid.
+        for start in range(0, num_experts, MAP_BLOCK):
+            offs = start + tl.arange(0, MAP_BLOCK)
+            in_range = offs < num_experts
+            rows = tl.load(hot_phys_ptr + offs, mask=in_range, other=-1)
+            tl.store(step_map_ptr + offs, rows, mask=in_range)
+        tl.debug_barrier()
+        for i in range(0, staged_count):
+            expert = tl.load(staged_expert_ptr + i)
+            cold_slot = tl.load(staged_cold_slot_ptr + i)
+            row = tl.load(staging_ptr + i)
+            tl.store(gather_src_ptr + count + i, tl.load(cold_rows_ptr + cold_slot))
+            tl.store(gather_dst_ptr + count + i, row)
+            tl.store(step_map_ptr + expert, row)
+        tl.store(gather_count_ptr, count + staged_count)
+
+    _KERNELS["flip"] = promote_flip
+    return promote_flip
+
+
+def _copy_kernel():
+    """One launch for six bank tensors, (src row, dst row) pairs, device count."""
+    if "copy" in _KERNELS:
+        return _KERNELS["copy"]
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def promote_copy(
+        src0,
+        src1,
+        src2,
+        src3,
+        src4,
+        src5,
+        dst0,
+        dst1,
+        dst2,
+        dst3,
+        dst4,
+        dst5,
+        src_rows_ptr,
+        dst_rows_ptr,
+        count_ptr,
+        bytes0,
+        bytes1,
+        bytes2,
+        bytes3,
+        bytes4,
+        bytes5,
+        sstride0,
+        sstride1,
+        sstride2,
+        sstride3,
+        sstride4,
+        sstride5,
+        dstride0,
+        dstride1,
+        dstride2,
+        dstride3,
+        dstride4,
+        dstride5,
+        BLOCK: tl.constexpr,
+    ):
+        lane = tl.program_id(0)
+        chunk = tl.program_id(1)
+        which = tl.program_id(2)
+        count = tl.load(count_ptr)
+        if lane >= count:
+            return
+        src_row = tl.load(src_rows_ptr + lane)
+        dst_row = tl.load(dst_rows_ptr + lane)
+        offsets = chunk * BLOCK + tl.arange(0, BLOCK)
+        if which == 0:
+            mask = offsets < bytes0
+            values = tl.load(src0 + src_row * sstride0 + offsets, mask=mask)
+            tl.store(dst0 + dst_row * dstride0 + offsets, values, mask=mask)
+        elif which == 1:
+            mask = offsets < bytes1
+            values = tl.load(src1 + src_row * sstride1 + offsets, mask=mask)
+            tl.store(dst1 + dst_row * dstride1 + offsets, values, mask=mask)
+        elif which == 2:
+            mask = offsets < bytes2
+            values = tl.load(src2 + src_row * sstride2 + offsets, mask=mask)
+            tl.store(dst2 + dst_row * dstride2 + offsets, values, mask=mask)
+        elif which == 3:
+            mask = offsets < bytes3
+            values = tl.load(src3 + src_row * sstride3 + offsets, mask=mask)
+            tl.store(dst3 + dst_row * dstride3 + offsets, values, mask=mask)
+        elif which == 4:
+            mask = offsets < bytes4
+            values = tl.load(src4 + src_row * sstride4 + offsets, mask=mask)
+            tl.store(dst4 + dst_row * dstride4 + offsets, values, mask=mask)
+        else:
+            mask = offsets < bytes5
+            values = tl.load(src5 + src_row * sstride5 + offsets, mask=mask)
+            tl.store(dst5 + dst_row * dstride5 + offsets, values, mask=mask)
+
+    _KERNELS["copy"] = promote_copy
+    return promote_copy

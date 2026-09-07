@@ -1459,6 +1459,130 @@ class TensorTests(unittest.TestCase):
             rt.Settings.from_env()
         del am
 
+    def test_promote_settings_require_staging_and_no_async(self):
+        base = {rt.PREFIX + "GIB": "32"}
+        env = {**base, rt.PREFIX + "PROMOTE": "1", rt.PREFIX + "STAGING": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = rt.Settings.from_env()
+        self.assertEqual((settings.promote, settings.planner), (True, "device"))
+        for extra in (
+            {rt.PREFIX + "PROMOTE": "1"},
+            {
+                rt.PREFIX + "PROMOTE": "1",
+                rt.PREFIX + "STAGING": "1",
+                rt.PREFIX + "ASYNC_MIGRATION": "1",
+            },
+            {rt.PREFIX + "PLANNER": "lru"},
+            {rt.PREFIX + "PROMOTE": "2"},
+        ):
+            with (
+                patch.dict(os.environ, {**base, **extra}, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                rt.Settings.from_env()
+
+    def make_promote_layer(self, experts=6, hot=2, staging=2, spare=2, width=3):
+        from lab_expert_tier import promote as pm
+
+        layer = object.__new__(rt.TierLayer)
+        layer.settings = rt.Settings(
+            32 * 2**30, staging=True, promote=True, planner="reference"
+        )
+        layer.index, layer.device = 0, torch.device("cpu")
+        layer.num_experts, layer.hot_slots = experts, hot
+        layer.cold_slots = experts - hot
+        layer.staging_slots, layer.spare_slots = staging, spare
+        staging_end = hot + staging
+        layer.bank_rows = staging_end + spare
+        layer.cold_rows_total = layer.cold_slots + spare
+        layer.staging_rows = list(range(hot, staging_end))
+        layer.bank = {
+            name: torch.full((layer.bank_rows, width), -1, dtype=torch.int32)
+            for name in rt.TENSORS
+        }
+        layer.cold_cpu = {
+            name: torch.full((layer.cold_rows_total, width), -1, dtype=torch.int32)
+            for name in rt.TENSORS
+        }
+        for name in rt.TENSORS:
+            for e in range(hot):
+                layer.bank[name][e].fill_(e * 10)
+            for e in range(hot, experts):
+                layer.cold_cpu[name][e - hot].fill_(e * 10)
+        layer.cold = layer.cold_cpu
+        layer.hot = {name: t[:hot] for name, t in layer.bank.items()}
+        layer.hot_map = layer.cold_map = None
+        layer.promote_tables = pm.allocate_tables(
+            layer.device,
+            experts,
+            hot,
+            layer.cold_slots,
+            range(staging_end, layer.bank_rows),
+            range(layer.cold_slots, layer.cold_rows_total),
+        )
+        layer.promote_buffers = pm.allocate_step_buffers(layer.device, experts, staging)
+        layer.promote_gate = False
+        layer.hot_rows, layer.cold_rows = list(range(hot)), list(range(experts - hot))
+        layer.hot_map_host = tuple(range(hot)) + (-1,) * (experts - hot)
+        layer.cold_map_host = (-1,) * hot + tuple(range(experts - hot))
+        layer.publish_maps()
+        layer.bank_kernel = SimpleNamespace(fused_experts="bank")
+        return layer
+
+    def test_promote_split_stages_while_gated_and_promotes_when_open(self):
+        layer = self.make_promote_layer()
+        chains: list[Any] = []
+        layer._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        # Kernel maps alias the device tables.
+        self.assertIs(layer.hot_map, layer.promote_tables.hot_phys)
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        # Gate closed: expert 4 is staged into staging row 2, nothing moves.
+        layer.split(x, weights, torch.tensor([[4, 1]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual((experts, tensors, rows), ("bank", layer.bank, 6))
+        self.assertEqual(step_map.tolist(), [0, 1, -1, -1, 2, -1])
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][2][0]), 40)
+        self.assertEqual(layer.promote_tables.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+        # Gate open: expert 4 is promoted into a free row; expert 0 (LRU,
+        # unselected) is evicted to RAM; the step map points at the new row.
+        layer.set_promote_gate(True)
+        layer.split(x, weights, torch.tensor([[4, 1]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual(step_map.tolist()[4], 4)
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][4][0]), 40)
+        self.assertEqual(layer.promote_tables.hot_map.tolist(), [-1, 1, -1, -1, 0, -1])
+        self.assertEqual(int(layer.cold_cpu[rt.TENSORS[0]][4][0]), 0)  # victim 0
+        # The kernel maps followed the flip through the alias.
+        self.assertEqual(layer.hot_map.tolist()[4], 4)
+        self.assertEqual(layer.cold_map.tolist()[0], 4)
+        layer.promote_snapshot()
+        self.assertEqual(layer.hot_map_host, (-1, 1, -1, -1, 0, -1))
+        self.assertEqual(layer.hot_rows, [4, 1])
+
+    def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
+        settings = rt.Settings(
+            32 * 2**30, sync_tokens=1, staging=True, promote=True, planner="reference"
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        gates: list[Any] = []
+        for layer in coordinator.layers:
+            layer.set_promote_gate = lambda enabled, i=layer.index: gates.append(
+                (i, enabled)
+            )
+            layer.promote_tables = None
+        coordinator.enable_heat()
+        self.assertEqual(gates, [(0, True), (1, True)])
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        with patch.object(coordinator.policy, "plan_resync") as planner:
+            self.replay(coordinator, record)
+        planner.assert_not_called()
+        self.assertEqual(coordinator.stats["promote_steps_observed"], 1)
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.report()
+        self.assertIn('"promote_mode": true', log.call_args.args[1])
+
     def test_observer_registry_builds_default_and_rejects_unknown(self):
         observer = rt.make_observer(
             "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1
