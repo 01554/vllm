@@ -59,6 +59,46 @@ class InvariantTests(unittest.TestCase):
         self.assertEqual((h2[0], c2[0], h2[258], c2[258]), (-1, 0, 0, -1))
         self.assertEqual(rt.maps_after_swap(h2, c2, 258, 0, 0, 0), (h, c))
 
+    def test_explicit_layer_slots_keep_the_exact_byte_budget(self):
+        rows = [2764808] * 48
+        uniform, size = rt.allocate_slots(32 * 2**30, rows, 512, reserve=18)
+        self.assertEqual(uniform, [240] * 48)
+        self.assertEqual(size, (240 + 18) * 2764808 * 48)
+        explicit = [250] * 24 + [230] * 24
+        chosen, size = rt.allocate_slots(
+            32 * 2**30, rows, 512, reserve=18, layer_slots=explicit
+        )
+        self.assertEqual(chosen, explicit)
+        self.assertEqual(size, sum((n + 18) * 2764808 for n in explicit))
+        with self.assertRaises(ValueError):
+            rt.allocate_slots(32 * 2**30, rows, 512, 18, [241] * 48)  # over budget
+        with self.assertRaises(ValueError):
+            rt.allocate_slots(32 * 2**30, rows, 512, 18, [240] * 47)
+        with self.assertRaises(ValueError):
+            rt.allocate_slots(32 * 2**30, rows, 512, 18, [0] + [240] * 47)
+        with self.assertRaises(ValueError):
+            rt.allocate_slots(32 * 2**30, rows, 512, 18, [512] + [1] * 47)
+        base = {rt.PREFIX + "GIB": "32"}
+        with patch.dict(
+            os.environ, {**base, rt.PREFIX + "LAYER_SLOTS": " 1, 2 "}, clear=True
+        ):
+            self.assertEqual(rt.Settings.from_env().layer_slots, "1,2")
+        with patch.dict(os.environ, base, clear=True):
+            self.assertEqual(rt.Settings.from_env().layer_slots, "uniform")
+        for bad in ("1,x", "0,1", ""):
+            env = {**base, rt.PREFIX + "LAYER_SLOTS": bad}
+            with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+                rt.Settings.from_env()
+
+    def test_coordinator_hands_the_policy_one_count_or_a_per_layer_tuple(self):
+        layers = [SimpleNamespace(num_experts=4, hot_slots=2) for _ in range(2)]
+        coordinator = rt.TierCoordinator(layers, rt.Settings(32 * 2**30), {})
+        self.assertEqual(coordinator.policy.hot_slots, 2)
+        layers[1].hot_slots = 1
+        with patch.object(rt, "TierPolicy") as policy:
+            rt.TierCoordinator(layers, rt.Settings(32 * 2**30), {})
+        self.assertEqual(policy.call_args.args[2], (2, 1))
+
     def test_partition_rejects_missing_duplicate_or_double_resident(self):
         for h, c in (
             ((0, -1), (0, -1)),
