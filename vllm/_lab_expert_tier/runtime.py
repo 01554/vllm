@@ -455,6 +455,10 @@ def temporary_row(temporary, index):
     return {name: tensor[index] for name, tensor in temporary.items()}
 
 
+def _next_power_of_two(value):
+    return 1 << max(int(value) - 1, 0).bit_length()
+
+
 def marlin_block_size(tokens, top_k, local_experts, global_experts, input_dtype):
     """The stock fused_marlin_moe M-block choice for one expert partition."""
     estimated = math.ceil(tokens * local_experts / global_experts)
@@ -534,6 +538,10 @@ class TierLayer:
             self.pool_offset = pool.offset(index)
             if self.pool_offset + slots > pool.tables.pool_rows:
                 raise ValueError("Layer rows exceed the pool")
+            for name, source in sources.items():
+                bank = pool.bank[name]
+                if source.shape[1:] != bank.shape[1:] or source.dtype != bank.dtype:
+                    raise ValueError(f"{name}: layer rows differ from the pool rows")
         for name, source in sources.items():
             if pool is not None:
                 self.bank[name] = pool.bank[name]
@@ -589,8 +597,10 @@ class TierLayer:
             from .global_pool import allocate_step_buffers as pool_buffers
 
             self.staging_rows = pool.tables.staging_rows.tolist()
+            # Scratch width is a power of two for the Triton program; the
+            # staging capacity itself stays top_k.
             self.step_buffers = pool_buffers(
-                self.device, self.num_experts, max(self.staging_slots, 1)
+                self.device, self.num_experts, _next_power_of_two(self.staging_slots)
             )
             self.hot_map = pool.tables.layer_slice(pool.tables.hot_phys, index)
             self.cold_map = pool.tables.layer_slice(pool.tables.cold_phys, index)
@@ -2356,14 +2366,21 @@ def initialize_model(model, model_config):
     )
     pool = None
     if settings.global_pool:
-        # Shared staging rows are charged once; every other byte is pool
-        # rows, distributed uniformly (or as LAYER_SLOTS) as the starting
+        # One bank for every layer: identical rows are required. Shared
+        # staging rows are charged once; every other byte is pool rows,
+        # distributed uniformly (or as LAYER_SLOTS) as the starting
         # placement that the LRU then rebalances.
-        pool_capacity = settings.capacity_bytes - staging_rows * sum(row_sizes)
+        if len(set(row_sizes)) != 1:
+            raise NotImplementedError("Global pool requires identical layer rows")
+        staging_bytes = staging_rows * row_sizes[0]
         slots_per_layer, expected_bytes = allocate_slots(
-            pool_capacity, row_sizes, 512, reserve=0, layer_slots=explicit
+            settings.capacity_bytes - staging_bytes,
+            row_sizes,
+            512,
+            reserve=0,
+            layer_slots=explicit,
         )
-        expected_bytes += staging_rows * sum(row_sizes)
+        expected_bytes += staging_bytes
     else:
         slots_per_layer, expected_bytes = allocate_slots(
             settings.capacity_bytes,

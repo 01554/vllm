@@ -1739,7 +1739,9 @@ class TensorTests(unittest.TestCase):
             layer.hot_rows = list(range(start, start + slots[index]))
             layer.cold_rows = list(range(slots[index], experts))
             layer.staging_rows = pool.tables.staging_rows.tolist()
-            layer.step_buffers = gp.allocate_step_buffers(device, experts, staging)
+            layer.step_buffers = gp.allocate_step_buffers(
+                device, experts, rt._next_power_of_two(staging)
+            )
             layer.hot_map = pool.tables.layer_slice(pool.tables.hot_phys, index)
             layer.cold_map = pool.tables.layer_slice(pool.tables.cold_phys, index)
             layer.promote_tables = layer.promote_buffers = None
@@ -1797,6 +1799,18 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(first.hot_map_host, (0, -1, 3, -1, -1, 1))
         for name in rt.TENSORS:
             self.assertTrue(torch.equal(second.cold_cpu[name], ram_before[name]))
+
+    def test_pool_scratch_width_is_a_power_of_two_above_top_k(self):
+        pool, (first, second) = self.make_pool_layers(staging=3)
+        self.assertEqual(first.step_buffers.gather_src.shape[0], 4)
+        self.assertEqual(rt._next_power_of_two(10), 16)
+        self.assertEqual((rt._next_power_of_two(1), rt._next_power_of_two(16)), (1, 16))
+        chains: list[Any] = []
+        first._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        first.set_promote_gate(True)
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        first.split(x, torch.ones(1, 3), torch.tensor([[5, 4, 3]]))
+        self.assertEqual(pool.snapshot(), [3, 1])
 
     def test_pool_host_swap_while_gated_copies_in_and_restores(self):
         pool, (first, second) = self.make_pool_layers()
