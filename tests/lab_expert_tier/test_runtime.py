@@ -1501,8 +1501,14 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = rt.Settings.from_env()
         self.assertEqual((settings.promote, settings.planner), (True, "device"))
+        self.assertFalse(settings.ram_backing)
+        backing = {**env, rt.PREFIX + "RAM_BACKING": "1"}
+        with patch.dict(os.environ, backing, clear=True):
+            self.assertTrue(rt.Settings.from_env().ram_backing)
         for extra in (
             {rt.PREFIX + "PROMOTE": "1"},
+            {rt.PREFIX + "RAM_BACKING": "1"},
+            {rt.PREFIX + "RAM_BACKING": "1", rt.PREFIX + "STAGING": "1"},
             {
                 rt.PREFIX + "PROMOTE": "1",
                 rt.PREFIX + "STAGING": "1",
@@ -1517,20 +1523,27 @@ class TensorTests(unittest.TestCase):
             ):
                 rt.Settings.from_env()
 
-    def make_promote_layer(self, experts=6, hot=2, staging=2, spare=2, width=3):
+    def make_promote_layer(
+        self, experts=6, hot=2, staging=2, spare=2, width=3, backing=False
+    ):
         from lab_expert_tier import promote as pm
 
         layer = object.__new__(rt.TierLayer)
         layer.settings = rt.Settings(
-            32 * 2**30, staging=True, promote=True, planner="reference"
+            32 * 2**30,
+            staging=True,
+            promote=True,
+            planner="reference",
+            ram_backing=backing,
         )
+        layer.ram_backing = backing
         layer.index, layer.device = 0, torch.device("cpu")
         layer.num_experts, layer.hot_slots = experts, hot
         layer.cold_slots = experts - hot
         layer.staging_slots, layer.spare_slots = staging, spare
         staging_end = hot + staging
         layer.bank_rows = staging_end + spare
-        layer.cold_rows_total = layer.cold_slots + spare
+        layer.cold_rows_total = experts if backing else layer.cold_slots + spare
         layer.staging_rows = list(range(hot, staging_end))
         layer.bank = {
             name: torch.full((layer.bank_rows, width), -1, dtype=torch.int32)
@@ -1543,8 +1556,8 @@ class TensorTests(unittest.TestCase):
         for name in rt.TENSORS:
             for e in range(hot):
                 layer.bank[name][e].fill_(e * 10)
-            for e in range(hot, experts):
-                layer.cold_cpu[name][e - hot].fill_(e * 10)
+            for e in range(0 if backing else hot, experts):
+                layer.cold_cpu[name][e if backing else e - hot].fill_(e * 10)
         layer.cold = layer.cold_cpu
         layer.hot = {name: t[:hot] for name, t in layer.bank.items()}
         layer.hot_map = layer.cold_map = None
@@ -1554,13 +1567,15 @@ class TensorTests(unittest.TestCase):
             hot,
             layer.cold_slots,
             range(staging_end, layer.bank_rows),
-            range(layer.cold_slots, layer.cold_rows_total),
+            () if backing else range(layer.cold_slots, layer.cold_rows_total),
+            backing=backing,
         )
         layer.promote_buffers = pm.allocate_step_buffers(
             layer.device, experts, staging, layer.staging_rows
         )
         layer.promote_gate = False
-        layer.hot_rows, layer.cold_rows = list(range(hot)), list(range(experts - hot))
+        layer.hot_rows = list(range(hot))
+        layer.cold_rows = list(range(hot, experts) if backing else range(experts - hot))
         layer.hot_map_host = tuple(range(hot)) + (-1,) * (experts - hot)
         layer.cold_map_host = (-1,) * hot + tuple(range(experts - hot))
         layer.publish_maps()
@@ -1625,6 +1640,54 @@ class TensorTests(unittest.TestCase):
         layer.hot_map_host = (1, 0, -1, -1, -1, -1)
         layer.publish_maps()
         self.assertEqual(tables.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+
+    def test_backing_split_promotes_without_writing_ram(self):
+        from lab_expert_tier import promote as pm
+
+        layer = self.make_promote_layer(backing=True)
+        chains: list[Any] = []
+        layer._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        ram_before = {name: t.clone() for name, t in layer.cold_cpu.items()}
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        layer.set_promote_gate(True)
+        # Expert 4 misses: promoted into free row 4, victim 0 only unmapped.
+        layer.split(x, weights, torch.tensor([[4, 1]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual(step_map.tolist()[4], 4)
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][4][0]), 40)
+        tables = layer.promote_tables
+        self.assertEqual(tables.hot_map.tolist(), [-1, 1, -1, -1, 0, -1])
+        self.assertEqual(tables.cold_phys.tolist(), [0, -1, 2, 3, -1, 5])
+        self.assertEqual(int(layer.promote_buffers.evict_count[0]), 0)
+        pm.check_tables(tables, 2, 4)
+        for name in rt.TENSORS:
+            self.assertTrue(torch.equal(layer.cold_cpu[name], ram_before[name]))
+        # Re-promoting expert 0 reads its untouched row again.
+        layer.split(x, weights, torch.tensor([[0, 4]]))
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][tables.hot_phys[0]][0]), 0)
+        layer.promote_snapshot()
+        self.assertEqual(layer.cold_rows[layer.cold_map_host[1]], 1)
+
+    def test_backing_host_swap_while_gated_copies_in_only(self):
+        from lab_expert_tier import promote as pm
+
+        layer = self.make_promote_layer(backing=True)
+        temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
+        ram_before = {name: t.clone() for name, t in layer.cold_cpu.items()}
+        layer.swap(0, 2, 0, 0, temp)
+        tables = layer.promote_tables
+        self.assertEqual(tables.hot_map.tolist(), [-1, 1, 0, -1, -1, -1])
+        self.assertEqual(tables.cold_map.tolist(), [0, -1, -1, 1, 2, 3])
+        self.assertEqual(tables.cold_phys.tolist(), [0, -1, -1, 3, 4, 5])
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][0][0]), 20)
+        pm.check_tables(tables, 2, 4)
+        layer.swap(2, 0, 0, 0, temp)
+        self.assertEqual(tables.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+        self.assertEqual(tables.cold_phys.tolist(), [-1, -1, 2, 3, 4, 5])
+        pm.check_tables(tables, 2, 4)
+        for name in rt.TENSORS:
+            self.assertTrue(torch.equal(layer.cold_cpu[name], ram_before[name]))
 
     def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
         settings = rt.Settings(

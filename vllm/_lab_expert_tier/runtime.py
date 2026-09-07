@@ -105,6 +105,13 @@ class Settings:
     # "reference" (torch, host-synchronizing; tests and non-CUDA devices) or
     # "device" (vllm._lab_expert_tier.device_lru, graph-capturable).
     planner: str = "device"
+    # RAM backing (promote mode only): keep the loader's pinned UVA source
+    # of every expert as the RAM bank instead of compacting the cold rows
+    # into a new allocation. RAM row e always holds expert e, so an eviction
+    # flips the tables and never writes back (no D2H, no RAM pool, no
+    # shadows). Host bytes: the full source stays resident (the loader's
+    # own peak); no second copy of any bank is made.
+    ram_backing: bool = False
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -138,6 +145,7 @@ class Settings:
             "LAYER_SLOTS",
             "PROMOTE",
             "PLANNER",
+            "RAM_BACKING",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -154,12 +162,15 @@ class Settings:
         staging = os.environ.get(PREFIX + "STAGING", "0")
         asynchronous = os.environ.get(PREFIX + "ASYNC_MIGRATION", "0")
         promote = os.environ.get(PREFIX + "PROMOTE", "0")
-        flags = (verify, staging, asynchronous, promote)
+        ram_backing = os.environ.get(PREFIX + "RAM_BACKING", "0")
+        flags = (verify, staging, asynchronous, promote, ram_backing)
         if stats < 1 or any(flag not in ("0", "1") for flag in flags):
             raise ValueError(
                 "STATS_EVERY must be positive; VERIFY_INIT, STAGING, "
-                "ASYNC_MIGRATION, and PROMOTE must be 0 or 1"
+                "ASYNC_MIGRATION, PROMOTE, and RAM_BACKING must be 0 or 1"
             )
+        if ram_backing == "1" and promote != "1":
+            raise ValueError("RAM_BACKING requires PROMOTE=1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -227,6 +238,7 @@ class Settings:
             layer_slots,
             promote == "1",
             planner,
+            ram_backing == "1",
         )
 
 
@@ -485,7 +497,15 @@ class TierLayer:
         )
         staging_end = slots + self.staging_slots
         self.bank_rows = staging_end + self.spare_slots
-        self.cold_rows_total = self.cold_slots + self.spare_slots
+        # RAM backing: the loader's pinned source (every expert, row = expert
+        # id) is the RAM bank itself; nothing is copied or released on the
+        # host, and there are no spare RAM rows because nothing is written.
+        self.ram_backing = bool(settings.ram_backing)
+        if self.ram_backing and not settings.promote:
+            raise ValueError("RAM backing requires promote mode")
+        self.cold_rows_total = (
+            self.num_experts if self.ram_backing else self.cold_slots + self.spare_slots
+        )
         self.bank = {}
         self.hot = {}
         self.staging = {}
@@ -499,13 +519,16 @@ class TierLayer:
             )
             self.hot[name] = self.bank[name][:slots]
             self.staging[name] = self.bank[name][slots:staging_end]
-            self.cold_cpu[name] = torch.empty(
-                (self.cold_rows_total, *source.shape[1:]),
-                dtype=source.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            self.cold_cpu[name][: self.cold_slots].copy_(source[slots:])
+            if self.ram_backing:
+                self.cold_cpu[name] = source
+            else:
+                self.cold_cpu[name] = torch.empty(
+                    (self.cold_rows_total, *source.shape[1:]),
+                    dtype=source.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.cold_cpu[name][: self.cold_slots].copy_(source[slots:])
             self.hot[name].copy_(source[:slots], non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
         self.cold = {
@@ -513,9 +536,15 @@ class TierLayer:
             for name, t in self.cold_cpu.items()
         }
         self.hot_rows = list(range(slots))
-        self.cold_rows = list(range(self.cold_slots))
+        self.cold_rows = list(
+            range(slots, self.num_experts)
+            if self.ram_backing
+            else range(self.cold_slots)
+        )
         self.vram_spares = SpareRing(range(staging_end, self.bank_rows))
-        self.ram_spares = SpareRing(range(self.cold_slots, self.cold_rows_total))
+        self.ram_spares = SpareRing(
+            () if self.ram_backing else range(self.cold_slots, self.cold_rows_total)
+        )
         self.hot_map_host = tuple(range(slots)) + (-1,) * self.cold_slots
         self.cold_map_host = (-1,) * slots + tuple(range(self.cold_slots))
         self.hot_map = self.cold_map = None
@@ -533,7 +562,10 @@ class TierLayer:
                 slots,
                 self.cold_slots,
                 range(staging_end, self.bank_rows),
-                range(self.cold_slots, self.cold_rows_total),
+                ()
+                if self.ram_backing
+                else range(self.cold_slots, self.cold_rows_total),
+                backing=self.ram_backing,
             )
             self.promote_buffers = allocate_step_buffers(
                 self.device,
@@ -583,6 +615,8 @@ class TierLayer:
         self.spare_bytes = self.row_bytes * self.spare_slots
         self.cold_bytes = self.row_bytes * self.cold_slots
         self.cold_spare_bytes = self.row_bytes * self.spare_slots
+        # Host bytes actually resident for this layer's RAM bank.
+        self.host_bytes = self.row_bytes * self.cold_rows_total
         if self.hot_bytes + self.cold_bytes != self.row_bytes * self.num_experts:
             raise AssertionError("Exclusive partition lost or duplicated source bytes")
         self.coordinator = None
@@ -646,13 +680,16 @@ class TierLayer:
                 )
                 tables.hot_map.copy_(hot_logical)
                 tables.cold_map.copy_(cold_logical)
+                tables.hot_rows.copy_(torch.tensor(hot_rows, dtype=torch.int32))
+                tables.cold_rows.copy_(torch.tensor(cold_rows, dtype=torch.int32))
                 tables.hot_phys.copy_(hot_physical)
                 tables.cold_phys.copy_(cold_physical)
-                shadow = tables.ram_shadow.tolist()
-                for expert, slot in enumerate(self.cold_map_host):
-                    if slot >= 0:
-                        shadow[cold_rows[slot]] = expert
-                tables.ram_shadow.copy_(torch.tensor(shadow, dtype=torch.int32))
+                if not tables.backing:
+                    shadow = tables.ram_shadow.tolist()
+                    for expert, slot in enumerate(self.cold_map_host):
+                        if slot >= 0:
+                            shadow[cold_rows[slot]] = expert
+                    tables.ram_shadow.copy_(torch.tensor(shadow, dtype=torch.int32))
             return
         # Pageable staging: the runtime finishes reading it before returning,
         # so no pinned host buffer can be overwritten during DMA. Device maps
@@ -743,13 +780,14 @@ class TierLayer:
             buffers.gather_dst,
             buffers.gather_count,
         )
-        copy_rows(
-            self.bank,
-            self.cold,
-            buffers.evict_src,
-            buffers.evict_dst,
-            buffers.evict_count,
-        )
+        if not tables.backing:
+            copy_rows(
+                self.bank,
+                self.cold,
+                buffers.evict_src,
+                buffers.evict_dst,
+                buffers.evict_count,
+            )
         return self._run_marlin_chains(
             x,
             weights,
@@ -961,6 +999,19 @@ class TierLayer:
 
     def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
         """One sequential swap with its own waits; used by init verification."""
+        if getattr(self, "ram_backing", False):
+            # The evicted expert's RAM row is intact: copy in, point the
+            # logical cold slot at that row, nothing written to the host.
+            hot_row, cold_row = self.resolve_hot_row(hot_slot), new_expert
+            if self.resolve_cold_row(cold_slot) != cold_row:
+                raise AssertionError("Backing cold slot must point at its expert row")
+            self.stage_swap(old_expert, new_expert, hot_slot, cold_slot)
+            for name in TENSORS:
+                self.bank[name][hot_row].copy_(self.cold[name][cold_row])
+            _current_stream(self.device).synchronize()
+            self.cold_rows[cold_slot] = old_expert
+            self.publish_maps()
+            return
         self.stage_swap(old_expert, new_expert, hot_slot, cold_slot)
         swap_tensor_rows(
             getattr(self, "bank", self.hot),
@@ -2228,7 +2279,7 @@ def initialize_model(model, model_config):
             temporary_row(temporary, 0),
         )
         gc.collect()
-        if any(ref() is not None for ref in raw_refs):
+        if not settings.ram_backing and any(ref() is not None for ref in raw_refs):
             raise RuntimeError(
                 f"{name}: original host source remains referenced after compaction"
             )
@@ -2239,9 +2290,10 @@ def initialize_model(model, model_config):
                 {
                     "layer": name,
                     "index": index,
-                    "raw_host_owners_released": True,
+                    "raw_host_owners_released": not settings.ram_backing,
                     "hot_bytes": tier.hot_bytes,
                     "cold_bytes": tier.cold_bytes,
+                    "host_bytes": tier.host_bytes,
                     "host_allocator": _host_allocator_stats(),
                 },
                 sort_keys=True,
@@ -2298,6 +2350,8 @@ def initialize_model(model, model_config):
                 "spare_bytes": sum(t.spare_bytes for t in tiers),
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
                 "host_cold_spare_bytes": sum(t.cold_spare_bytes for t in tiers),
+                "host_bytes": sum(t.host_bytes for t in tiers),
+                "ram_backing": settings.ram_backing,
                 "async_migration": settings.async_migration,
                 "promote_mode": settings.promote,
                 "planner": settings.planner if settings.promote else None,
