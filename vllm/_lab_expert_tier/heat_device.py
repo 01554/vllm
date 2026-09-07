@@ -199,9 +199,7 @@ class DeviceHeatAccumulator:
         self.max_rows = None if max_rows is None else _integer("max_rows", max_rows, 1)
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a bool")
-        self._base_tokens_total = _integer(
-            "base_tokens_total", base_tokens_total, 0
-        )
+        self._base_tokens_total = _integer("base_tokens_total", base_tokens_total, 0)
         self._base_version = _integer("base_version", base_version, 0)
         self._base_last_sync_tokens = _integer(
             "base_last_sync_tokens", base_last_sync_tokens, 0
@@ -236,12 +234,23 @@ class DeviceHeatAccumulator:
         self._scratch = torch.zeros_like(self.heat)
         self._expected_layer = torch.zeros((), dtype=torch.int64, device=self.device)
         self._error_flag = torch.zeros((), dtype=torch.bool, device=self.device)
-        self._step_route_total = torch.zeros(
-            (), dtype=torch.int64, device=self.device
-        )
+        self._step_route_total = torch.zeros((), dtype=torch.int64, device=self.device)
         self._step_route_hot = torch.zeros((), dtype=torch.int64, device=self.device)
         self._route_total = torch.zeros((), dtype=torch.int64, device=self.device)
         self._route_hot = torch.zeros((), dtype=torch.int64, device=self.device)
+        # These flags are device state because record_layer may execute only
+        # during graph capture.  The captured zero/fill operations replay even
+        # when Python does not call record_layer again.
+        self._step_hot_map_seen = torch.zeros(
+            (self.num_layers,), dtype=torch.bool, device=self.device
+        )
+        self._step_hot_map_missing = torch.zeros(
+            (), dtype=torch.bool, device=self.device
+        )
+        self._hot_stats_initialized = torch.zeros(
+            (), dtype=torch.bool, device=self.device
+        )
+        self._hot_stats_valid = torch.ones((), dtype=torch.bool, device=self.device)
 
         self._tokens_total = torch.tensor(
             self._base_tokens_total, dtype=torch.int64, device=self.device
@@ -252,9 +261,7 @@ class DeviceHeatAccumulator:
         self._last_step_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
         self._forward_count = torch.zeros((), dtype=torch.int64, device=self.device)
         self._step_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
-        self._step_valid_tokens = torch.zeros(
-            (), dtype=torch.int64, device=self.device
-        )
+        self._step_valid_tokens = torch.zeros((), dtype=torch.int64, device=self.device)
 
         # These scalar tensors are inputs to the captured update.  The Python
         # heat-enable call changes their values at a named lifecycle boundary,
@@ -289,7 +296,6 @@ class DeviceHeatAccumulator:
         self._host_last_step_tokens = 0
         self._host_forwards = 0
         self._host_route_total = 0
-        self._route_hot_available = False
         self._host_due = False
         self._pending_snapshot: DeviceSnapshot | None = None
         self._last_snapshot_forwards = 0
@@ -298,10 +304,6 @@ class DeviceHeatAccumulator:
         self._last_snapshot_route_hot = 0
         self._last_snapshot_step_tokens = 0
         self._sequence = -1
-        self._step_hot_map_layers: set[int] = set()
-        self._step_hot_map_missing = False
-        self._hot_stats_initialized = False
-        self._hot_stats_valid = True
 
     @property
     def error_flag(self) -> torch.Tensor:
@@ -363,7 +365,18 @@ class DeviceHeatAccumulator:
     @property
     def route_hot_available(self) -> bool:
         """Whether the cumulative hot-route count is complete and measured."""
-        return self._hot_stats_initialized and self._hot_stats_valid
+        available = self._hot_stats_initialized & self._hot_stats_valid
+        return bool(available.detach().cpu().item())
+
+    def _record_hot_map_state(self, layer_index: int, hot_map: Any) -> None:
+        """Record map availability using replay-safe device operations."""
+        if layer_index == 0:
+            self._step_hot_map_seen.zero_()
+            self._step_hot_map_missing.zero_()
+        if hot_map is None:
+            self._step_hot_map_missing.fill_(True)
+        else:
+            self._step_hot_map_seen[layer_index].fill_(True)
 
     def _set_gate(self, enabled: bool) -> None:
         """Update the persistent device gate at a named lifecycle boundary."""
@@ -434,8 +447,8 @@ class DeviceHeatAccumulator:
         layer_index = _integer("layer_index", layer_index, 0)
         if layer_index >= self.num_layers:
             raise ValueError("layer_index is outside the allocated layer count")
-        ids, activity_flags, valid_mask, rows, hot_map = (
-            self._normalise_record_args(ids, activity_flags, valid_mask, rows, hot_map)
+        ids, activity_flags, valid_mask, rows, hot_map = self._normalise_record_args(
+            ids, activity_flags, valid_mask, rows, hot_map
         )
         if (
             rows > ids.shape[0]
@@ -445,8 +458,7 @@ class DeviceHeatAccumulator:
             raise ValueError("rows exceeds the record tensor capacity")
         if ids.ndim != 2 or activity_flags.ndim != 2 or valid_mask.ndim != 1:
             raise ValueError(
-                "routing records must have shapes [rows, top_k], "
-                "[rows, top_k], [rows]"
+                "routing records must have shapes [rows, top_k], [rows, top_k], [rows]"
             )
         if ids.shape != activity_flags.shape or ids.shape[0] != valid_mask.shape[0]:
             raise ValueError("routing record tensors have incompatible shapes")
@@ -482,20 +494,15 @@ class DeviceHeatAccumulator:
             # initial state of the next replay; retain errors only when the
             # preceding sequence was incomplete.
             self._error_flag.logical_or_(
-                self._expected_layer.ne(0)
-                & self._expected_layer.ne(self.num_layers)
+                self._expected_layer.ne(0) & self._expected_layer.ne(self.num_layers)
             )
             self.counts.zero_()
             self._step_route_total.zero_()
             self._step_route_hot.zero_()
-            self._step_hot_map_layers.clear()
-            self._step_hot_map_missing = False
             self._step_valid_tokens.zero_()
             self._expected_layer.zero_()
         self._error_flag.logical_or_(self._expected_layer.ne(layer_index))
-        self._step_hot_map_layers.add(layer_index)
-        if hot_map is None:
-            self._step_hot_map_missing = True
+        self._record_hot_map_state(layer_index, hot_map)
 
         ids_view = ids[:rows].to(dtype=torch.int64)
         active_view = activity_flags[:rows].ne(0)
@@ -524,9 +531,7 @@ class DeviceHeatAccumulator:
             # carries the original in-range predicate, so malformed IDs can
             # never contribute while duplicate routing lanes are retained.
             self._step_route_hot.add_(
-                (selected & hot_map[safe_ids].ge(0))
-                .to(dtype=torch.int64)
-                .sum()
+                (selected & hot_map[safe_ids].ge(0)).to(dtype=torch.int64).sum()
             )
         self._expected_layer.add_(1)
 
@@ -595,23 +600,21 @@ class DeviceHeatAccumulator:
             else:
                 self._host_last_step_tokens = 0
 
-        if self._host_enabled:
-            if (
-                self._step_hot_map_missing
-                or len(self._step_hot_map_layers) != self.num_layers
-            ):
-                # A cumulative counter cannot become complete after one model
-                # boundary lacked a map, because that boundary's hot routes
-                # were intentionally not recoverable later.
-                self._hot_stats_valid = False
-            self._hot_stats_initialized = True
+        # Keep availability on device so a captured record sequence still
+        # updates it during replay.  Disabled startup forwards do not poison
+        # cumulative hot statistics; the device gate remains dynamic here.
+        hot_map_incomplete = self._step_hot_map_missing | (
+            ~self._step_hot_map_seen.all()
+        )
+        self._hot_stats_valid.logical_and_(~(self._enabled & hot_map_incomplete))
+        self._hot_stats_initialized.logical_or_(self._enabled)
 
         self.counts.zero_()
         self._expected_layer.zero_()
         self._step_route_total.zero_()
         self._step_route_hot.zero_()
-        self._step_hot_map_layers.clear()
-        self._step_hot_map_missing = False
+        self._step_hot_map_seen.zero_()
+        self._step_hot_map_missing.zero_()
 
         # A new observation supersedes an unconsumed boundary snapshot.  The
         # importer still rejects an old sequence if a caller attempts to use it.
@@ -723,9 +726,7 @@ class DeviceHeatAccumulator:
         self._base_last_sync_tokens = last_sync_tokens
         self._host_last_sync_tokens = last_sync_tokens
         self._last_sync_tokens.fill_(last_sync_tokens)
-        self._host_due = (
-            self._host_due and last_sync_tokens < self._host_tokens_total
-        )
+        self._host_due = self._host_due and last_sync_tokens < self._host_tokens_total
         self._resync_due.fill_(self._host_due)
         self._pending_snapshot = None
 
@@ -752,9 +753,7 @@ class DeviceObserver:
         session_id: str | int | None = None,
     ) -> None:
         self._num_layers = (
-            None
-            if num_layers is None
-            else _integer("num_layers", num_layers, 1)
+            None if num_layers is None else _integer("num_layers", num_layers, 1)
         )
         self._num_experts = (
             None if num_experts is None else _integer("num_experts", num_experts, 1)
@@ -975,9 +974,7 @@ class DeviceObserver:
             raise RuntimeError("device observer is not configured")
         self._accumulator.acknowledge_snapshot(snapshot)
 
-    def rebase(
-        self, *, tokens_total: int, version: int, last_sync_tokens: int
-    ) -> None:
+    def rebase(self, *, tokens_total: int, version: int, last_sync_tokens: int) -> None:
         if self._accumulator is None:
             raise RuntimeError("device observer is not configured")
         self._accumulator.rebase(
