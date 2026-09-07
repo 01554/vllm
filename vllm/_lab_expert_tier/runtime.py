@@ -98,6 +98,13 @@ class Settings:
     # Static for the process: bank sizes fix the addresses captured graphs
     # read. A global, demand-driven pool like FreeToken's is separate work.
     layer_slots: str = "uniform"
+    # Promote mode: per-token device LRU owns the placement (FreeToken-style
+    # miss fill); the heat policy only observes. Needs staging; excludes the
+    # asynchronous exchange path (its spare rings become the promote rings).
+    promote: bool = False
+    # "reference" (torch, host-synchronizing; tests and non-CUDA devices) or
+    # "device" (vllm._lab_expert_tier.device_lru, graph-capturable).
+    planner: str = "device"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -129,6 +136,8 @@ class Settings:
             "STAGING",
             "ASYNC_MIGRATION",
             "LAYER_SLOTS",
+            "PROMOTE",
+            "PLANNER",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -144,12 +153,18 @@ class Settings:
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
         staging = os.environ.get(PREFIX + "STAGING", "0")
         asynchronous = os.environ.get(PREFIX + "ASYNC_MIGRATION", "0")
-        flags = (verify, staging, asynchronous)
+        promote = os.environ.get(PREFIX + "PROMOTE", "0")
+        flags = (verify, staging, asynchronous, promote)
         if stats < 1 or any(flag not in ("0", "1") for flag in flags):
             raise ValueError(
-                "STATS_EVERY must be positive; VERIFY_INIT, STAGING, and "
-                "ASYNC_MIGRATION must be 0 or 1"
+                "STATS_EVERY must be positive; VERIFY_INIT, STAGING, "
+                "ASYNC_MIGRATION, and PROMOTE must be 0 or 1"
             )
+        planner = os.environ.get(PREFIX + "PLANNER", "device")
+        if planner not in ("reference", "device"):
+            raise ValueError("PLANNER must be reference or device")
+        if promote == "1" and (staging != "1" or asynchronous == "1"):
+            raise ValueError("PROMOTE requires STAGING=1 and ASYNC_MIGRATION=0")
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
             raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
@@ -210,6 +225,8 @@ class Settings:
             asynchronous == "1",
             staging == "1",
             layer_slots,
+            promote == "1",
+            planner,
         )
 
 
@@ -463,7 +480,9 @@ class TierLayer:
         # Spare rows for asynchronous exchanges follow the staging rows in
         # VRAM and the cold rows in RAM; logical slots map to physical rows
         # through hot_rows / cold_rows, which flip when a transfer commits.
-        self.spare_slots = settings.temp_slots if settings.async_migration else 0
+        self.spare_slots = (
+            settings.temp_slots if (settings.async_migration or settings.promote) else 0
+        )
         staging_end = slots + self.staging_slots
         self.bank_rows = staging_end + self.spare_slots
         self.cold_rows_total = self.cold_slots + self.spare_slots
@@ -500,6 +519,34 @@ class TierLayer:
         self.hot_map_host = tuple(range(slots)) + (-1,) * self.cold_slots
         self.cold_map_host = (-1,) * slots + tuple(range(self.cold_slots))
         self.hot_map = self.cold_map = None
+        self.promote_tables = self.promote_buffers = None
+        self.promote_gate = False
+        self.staging_rows = list(range(slots, staging_end))
+        if settings.promote:
+            from .promote import allocate_step_buffers, allocate_tables
+
+            # Device tables own the placement; the kernel maps alias them so
+            # every path (prefill, verification) reads the current rows.
+            self.promote_tables = allocate_tables(
+                self.device,
+                self.num_experts,
+                slots,
+                self.cold_slots,
+                range(staging_end, self.bank_rows),
+                range(self.cold_slots, self.cold_rows_total),
+            )
+            self.promote_buffers = allocate_step_buffers(
+                self.device,
+                self.num_experts,
+                max(self.staging_slots, 1),
+                self.staging_rows,
+            )
+            if settings.planner == "device" and self.device.type == "cuda":
+                from . import device_lru
+
+                # Planner state is allocated once, before any capture, and
+                # kept on the tables; the gate starts closed.
+                device_lru.allocate_state(self.promote_tables, self.staging_slots)
         self.publish_maps()
         # With spare rows a logical hot slot can live anywhere in the bank,
         # so the kernels address the whole bank / whole cold bank.
@@ -575,6 +622,38 @@ class TierLayer:
         validate_partition(
             self.hot_map_host, self.cold_map_host, self.hot_slots, self.cold_slots
         )
+        tables = getattr(self, "promote_tables", None)
+        if tables is not None:
+            # Promote mode: the kernel maps alias the device physical maps.
+            # While the gate is closed (init, verification) the host maps are
+            # authoritative and exchanges made on the host (verify's forced
+            # swap) are pushed into the tables; once the gate is open the
+            # device is the truth and the host only reads snapshots.
+            if self.hot_map is None or self.cold_map is None:
+                self.hot_map, self.cold_map = tables.hot_phys, tables.cold_phys
+            if not getattr(self, "promote_gate", False):
+                hot_rows: Any = self.hot_rows
+                cold_rows: Any = self.cold_rows
+                hot_logical = torch.tensor(self.hot_map_host, dtype=torch.int32)
+                cold_logical = torch.tensor(self.cold_map_host, dtype=torch.int32)
+                hot_physical = torch.tensor(
+                    [hot_rows[v] if v >= 0 else -1 for v in self.hot_map_host],
+                    dtype=torch.int32,
+                )
+                cold_physical = torch.tensor(
+                    [cold_rows[v] if v >= 0 else -1 for v in self.cold_map_host],
+                    dtype=torch.int32,
+                )
+                tables.hot_map.copy_(hot_logical)
+                tables.cold_map.copy_(cold_logical)
+                tables.hot_phys.copy_(hot_physical)
+                tables.cold_phys.copy_(cold_physical)
+                shadow = tables.ram_shadow.tolist()
+                for expert, slot in enumerate(self.cold_map_host):
+                    if slot >= 0:
+                        shadow[cold_rows[slot]] = expert
+                tables.ram_shadow.copy_(torch.tensor(shadow, dtype=torch.int32))
+            return
         # Pageable staging: the runtime finishes reading it before returning,
         # so no pinned host buffer can be overwritten during DMA. Device maps
         # hold physical rows; the host maps stay logical for the policy.
@@ -621,6 +700,8 @@ class TierLayer:
     def split(self, x, weights, ids):
         staging = getattr(self, "staging_slots", 0)
         if staging and x.shape[0] * ids.shape[1] <= staging:
+            if getattr(self, "promote_tables", None) is not None:
+                return self.split_promote(x, weights, ids)
             return self.split_staged(x, weights, ids)
         if self.settings.split == "fused":
             return self.split_fused(x, weights, ids)
@@ -637,6 +718,88 @@ class TierLayer:
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
+
+    def split_promote(self, x, weights, ids):
+        """Batch-1 decode in promote mode: plan, gather, evict, flip, one chain.
+
+        Every step runs on the compute stream with fixed shapes: the planner
+        (device LRU) decides promotions, victims, and staged-only misses; the
+        flip updates the device tables and writes the copy lists and the
+        step map; the copies move rows; the bank kernel runs through the
+        step map. With the gate closed (startup, verification) every miss is
+        staged only and the placement does not change.
+        """
+        from .promote import copy_rows, flip_step
+
+        tables, buffers = self.promote_tables, self.promote_buffers
+        if self.bank_kernel is None or tables is None or buffers is None:
+            raise RuntimeError("Promote mode requires the bank kernel and tables")
+        plan = self.plan_step(ids)
+        flip_step(tables, plan, buffers, self.staging_rows)
+        copy_rows(
+            self.cold,
+            self.bank,
+            buffers.gather_src,
+            buffers.gather_dst,
+            buffers.gather_count,
+        )
+        copy_rows(
+            self.bank,
+            self.cold,
+            buffers.evict_src,
+            buffers.evict_dst,
+            buffers.evict_count,
+        )
+        return self._run_marlin_chains(
+            x,
+            weights,
+            ids,
+            (
+                (
+                    self.bank_kernel.fused_experts,
+                    self.bank,
+                    buffers.step_map,
+                    self.bank_rows,
+                ),
+            ),
+        )
+
+    def plan_step(self, ids):
+        """Ask the configured planner for this step's promotions."""
+        if self.settings.planner == "reference" or self.device.type != "cuda":
+            from .promote import reference_plan
+
+            return reference_plan(
+                ids, self.promote_tables, self.staging_slots, self.promote_gate
+            )
+        from .device_lru import plan_step
+
+        return plan_step(ids, self.promote_tables, self.staging_slots)
+
+    def set_promote_gate(self, enabled):
+        """Open or close promotion; closed leaves placement and recency alone."""
+        self.promote_gate = bool(enabled)
+        if self.promote_tables is None:
+            return
+        if self.settings.planner == "device" and self.device.type == "cuda":
+            from . import device_lru
+
+            (device_lru.open_gate if enabled else device_lru.close_gate)(
+                self.promote_tables.lru_state
+            )
+
+    def promote_snapshot(self):
+        """Host copy of the device placement; validates and refreshes host maps."""
+        from .promote import check_tables
+
+        tables = self.promote_tables
+        if tables is None:
+            return
+        check_tables(tables, self.hot_slots, self.cold_slots)
+        self.hot_map_host = tuple(tables.hot_map.tolist())
+        self.cold_map_host = tuple(tables.cold_map.tolist())
+        self.hot_rows = tables.hot_rows.tolist()
+        self.cold_rows = tables.cold_rows.tolist()
 
     def split_staged(self, x, weights, ids):
         """Batch-1 decode: stage the selected cold experts, then one chain.
@@ -914,6 +1077,7 @@ class TierLayer:
                 }
             )
         staged_checks = []
+        self.set_promote_gate(False)
         if self.staging_slots:
             # Batch-1 rows take the staged path: hot only, cold only, mixed,
             # and padding, each against the same source-kernel reference.
@@ -1512,6 +1676,10 @@ class TierCoordinator:
             self.stats["ignored_synthetic_forwards"] += 1
 
     def _plan_and_migrate(self):
+        if self.settings.promote:
+            # The device LRU owns the placement; the heat policy observes only.
+            self.stats["promote_steps_observed"] += 1
+            return
         if True:
             started = time.perf_counter()
             plan = self.policy.plan_resync()
@@ -1691,6 +1859,12 @@ class TierCoordinator:
             layer.publish_maps()
 
     def report(self):
+        if self.settings.promote:
+            # The device placement is the truth: validate it and refresh the
+            # host maps for the report. One host copy per report, not per step.
+            for layer in self.layers:
+                if getattr(layer, "promote_tables", None) is not None:
+                    layer.promote_snapshot()
         # Defaults make snapshots/deltas stable even before the first swap.
         fields = (
             "model_forwards",
@@ -1712,6 +1886,7 @@ class TierCoordinator:
             "async_enqueue_seconds",
             "async_flip_delay_seconds",
             "sync_fallbacks",
+            "promote_steps_observed",
             "recorded_forwards",
             "replayed_forwards",
             "captured_forwards",
@@ -1745,6 +1920,7 @@ class TierCoordinator:
                 "pending_layers": self.recorded,
                 "unfinished_forward_rows": self.forward_rows,
                 "async_pending": self.pending is not None,
+                "promote_mode": self.settings.promote,
                 "per_layer_swaps": list(self.per_layer_swaps),
                 "policy_cpu_seconds": sum(
                     self.stats[key]
@@ -1784,6 +1960,9 @@ class TierCoordinator:
             # Captured graphs cannot see this Python flag: the observer must
             # flip its own in-place device gate now, after the startup wait.
             self.observer.on_heat_enabled()
+            if self.settings.promote:
+                for layer in self.layers:
+                    layer.set_promote_gate(True)
             LOGGER.warning(
                 "LAB_EXPERT_TIER_HEAT_ENABLED %s",
                 json.dumps(
@@ -1995,7 +2174,16 @@ def initialize_model(model, model_config):
             f"Expected all 48 FlashNext MoE layers, found {len(candidates)}"
         )
     staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
-    spare_rows = settings.temp_slots if settings.async_migration else 0
+    spare_rows = (
+        settings.temp_slots if (settings.async_migration or settings.promote) else 0
+    )
+    if settings.promote and settings.planner == "device":
+        import importlib.util
+
+        if importlib.util.find_spec("vllm._lab_expert_tier.device_lru") is None:
+            raise NotImplementedError(
+                "PROMOTE=1 with PLANNER=device needs vllm._lab_expert_tier.device_lru"
+            )
     explicit = (
         None
         if settings.layer_slots == "uniform"
@@ -2107,6 +2295,8 @@ def initialize_model(model, model_config):
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
                 "host_cold_spare_bytes": sum(t.cold_spare_bytes for t in tiers),
                 "async_migration": settings.async_migration,
+                "promote_mode": settings.promote,
+                "planner": settings.planner if settings.promote else None,
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
