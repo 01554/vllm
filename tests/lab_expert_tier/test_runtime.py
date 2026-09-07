@@ -1022,7 +1022,10 @@ class TensorTests(unittest.TestCase):
         self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
 
     def test_observer_registry_builds_default_and_rejects_unknown(self):
-        self.assertIsInstance(rt.make_observer("records"), rt.RecordObserver)
+        observer = rt.make_observer(
+            "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1
+        )
+        self.assertIsInstance(observer, rt.RecordObserver)
         with self.assertRaises(ValueError):
             rt.make_observer("missing")
         with (
@@ -1113,6 +1116,14 @@ class TensorTests(unittest.TestCase):
                 self.results: list[Any] = []
                 self.calls: list[Any] = []
                 self.gate_opened = 0
+                self.acknowledged: list[Any] = []
+                self.rebased: list[Any] = []
+
+            def acknowledge_snapshot(self, snapshot):
+                self.acknowledged.append(snapshot)
+
+            def rebase(self, **state):
+                self.rebased.append(state)
 
             def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
                 self.calls.append((rows, valid_rows, heat_enabled))
@@ -1201,6 +1212,29 @@ class TensorTests(unittest.TestCase):
         coordinator.poisoned = False
         with self.assertRaises(ValueError):
             coordinator.finish_forward(1, 2)
+        coordinator.poisoned = False
+        # Foreign result objects are recognized by shape: a device module's
+        # own snapshot/deferred classes never import this module.
+        foreign = SimpleNamespace(
+            heat=[[0.0] * 4] * 2, tokens=1, forwards=1, route_total=2, error=False
+        )
+        observer.results = [foreign, SimpleNamespace(forwards=3)]
+        coordinator.finish_forward(1, 1)
+        coordinator.finish_forward(1, 1)
+        self.assertIs(observer.acknowledged[-1], foreign)
+        self.assertEqual(
+            observer.rebased[-1],
+            {
+                "tokens_total": coordinator.policy.tokens_total,
+                "version": coordinator.policy.version,
+                "last_sync_tokens": coordinator.policy.last_sync_tokens,
+            },
+        )
+        self.assertEqual(len(observer.rebased), 4)
+        self.assertEqual(coordinator.stats["deferred_forwards"], 5)
+        observer.results = [SimpleNamespace(heat=[], tokens=0, forwards=1, error=True)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
 
 
 if __name__ == "__main__":

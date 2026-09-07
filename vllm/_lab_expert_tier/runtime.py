@@ -905,7 +905,8 @@ class RecordObserver:
       resync, and shutdown.
     """
 
-    def __init__(self):
+    def __init__(self, **_config):
+        # Device observers take the policy configuration; this one needs none.
         self.records: Any = None
         self.records_host: Any = None
         self.device: Any = None
@@ -914,7 +915,7 @@ class RecordObserver:
     def capacity(self):
         return 0 if self.records is None else self.records.shape[0]
 
-    def allocate(self, device, layers, top_k, max_tokens):
+    def allocate(self, device, layers, top_k, max_tokens, num_experts=None):
         import torch
 
         if self.records is not None:
@@ -968,7 +969,8 @@ OBSERVERS: dict[str, Any] = {
 }
 
 
-def make_observer(name):
+def make_observer(name, **config):
+    """Instantiate a registered observer with the policy configuration."""
     import importlib
 
     target = OBSERVERS.get(name)
@@ -977,7 +979,19 @@ def make_observer(name):
     if isinstance(target, str):
         module_name, _, class_name = target.partition(":")
         target = getattr(importlib.import_module(module_name), class_name)
-    return target()
+    return target(**config)
+
+
+def _is_snapshot(result):
+    return hasattr(result, "heat")
+
+
+def _is_deferred(result):
+    return (
+        hasattr(result, "forwards")
+        and not hasattr(result, "heat")
+        and not hasattr(result, "routes")
+    )
 
 
 class TierCoordinator:
@@ -1014,7 +1028,13 @@ class TierCoordinator:
 
     def allocate_records(self, device, top_k, max_tokens):
         self.device = device
-        self.observer.allocate(device, len(self.layers), top_k, max_tokens)
+        self.observer.allocate(
+            device,
+            len(self.layers),
+            top_k,
+            max_tokens,
+            num_experts=self.layers[0].num_experts,
+        )
 
     def adopt_stream(self, stream, boundary):
         if self.stream_id == stream.cuda_stream:
@@ -1199,33 +1219,49 @@ class TierCoordinator:
         report collects the observation only, so no GPU work starts outside
         a forward boundary.
         """
-        if isinstance(result, Deferred):
-            # The observation arrives with a later snapshot; nothing may be
-            # planned against stale heat.
-            self.stats["deferred_forwards"] += result.forwards
-            return
-        if isinstance(result, DeviceSnapshot):
+        # Device observers return their own result types without importing
+        # this module, so results are recognized by shape, not by class.
+        if _is_snapshot(result):
             if not self.heat_enabled:
                 raise RuntimeError(
                     "Device observers must not advance heat before it is enabled"
                 )
-            if not result.verified:
-                raise RuntimeError("Device routing validation failed")
+            if not getattr(result, "verified", True) or getattr(result, "error", False):
+                raise RuntimeError(
+                    "Device routing validation failed (delayed device check)"
+                )
             importer = getattr(self.policy, "import_snapshot", None)
             if importer is None:
                 raise NotImplementedError("Policy cannot import device snapshots")
             started = time.perf_counter()
             importer(result)
+            acknowledge = getattr(self.observer, "acknowledge_snapshot", None)
+            if acknowledge is not None:
+                acknowledge(result)
             self.stats["policy_observe_seconds"] += time.perf_counter() - started
-            self.stats["route_hot"] += result.route_hot
-            self.stats["route_total"] += result.route_total
+            self.stats["route_hot"] += getattr(result, "route_hot", 0)
+            self.stats["route_total"] += getattr(result, "route_total", 0)
             self.stats["model_tokens"] += result.tokens
             self.stats["snapshot_forwards"] += result.forwards
             self.stats["device_snapshots"] += 1
             if plan:
                 self._plan_and_migrate()
+            # The device restarts from the policy state that now holds,
+            # whether or not a plan was committed.
+            rebase = getattr(self.observer, "rebase", None)
+            if rebase is not None:
+                rebase(
+                    tokens_total=self.policy.tokens_total,
+                    version=self.policy.version,
+                    last_sync_tokens=self.policy.last_sync_tokens,
+                )
             return
-        if not isinstance(result, LegacyRoutes):
+        if _is_deferred(result):
+            # The observation arrives with a later snapshot; nothing may be
+            # planned against stale heat.
+            self.stats["deferred_forwards"] += getattr(result, "forwards", 1)
+            return
+        if not hasattr(result, "routes"):
             raise TypeError("Observer returned an unknown result type")
         routes, activity, mask, tokens = (
             result.routes,
@@ -1660,7 +1696,17 @@ def initialize_model(model, model_config):
             ),
         )
     coordinator = TierCoordinator(
-        tiers, settings, temporary, make_observer(settings.observer)
+        tiers,
+        settings,
+        temporary,
+        make_observer(
+            settings.observer,
+            num_layers=len(tiers),
+            num_experts=512,
+            decay=settings.decay,
+            sync_period=settings.sync_tokens,
+            session_id=os.getpid(),
+        ),
     )
     coordinator.allocate_records(
         tiers[0].device, candidates[0][2].moe.experts_per_token, max_tokens
