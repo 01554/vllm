@@ -64,6 +64,7 @@ SPLIT_MODES = ("fused", "modular")
 # aligned by logical id and its blocks are mapped to rows afterwards.
 NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
 _NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
+_NATIVE_PREFILL_WORKSPACES: dict[tuple[str, int], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -126,6 +127,10 @@ class Settings:
     # (FreeToken-derived GEMV on the checkpoint layout, `native_nvfp4`;
     # needs RAM_BACKING=1 and SPLIT=fused; the loader keeps the raw banks).
     moe_kernel: str = "marlin"
+    # Native multi-token path: "gemv" runs the decode GEMV per route (the
+    # adapter's fallback); "grouped" calls native_prefill.prefill (grouped
+    # GEMM over the same bank and workspace). Decode is unaffected.
+    native_prefill: str = "gemv"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -162,6 +167,7 @@ class Settings:
             "RAM_BACKING",
             "GLOBAL_POOL",
             "MOE_KERNEL",
+            "NATIVE_PREFILL",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -198,6 +204,11 @@ class Settings:
             raise ValueError("MOE_KERNEL must be marlin or native")
         if moe_kernel == "native" and ram_backing != "1":
             raise ValueError("MOE_KERNEL=native requires RAM_BACKING=1")
+        native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
+        if native_prefill not in ("gemv", "grouped"):
+            raise ValueError("NATIVE_PREFILL must be gemv or grouped")
+        if native_prefill != "gemv" and moe_kernel != "native":
+            raise ValueError("NATIVE_PREFILL requires MOE_KERNEL=native")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -270,6 +281,7 @@ class Settings:
             ram_backing == "1",
             global_pool == "1",
             moe_kernel,
+            native_prefill,
         )
 
 
@@ -719,6 +731,9 @@ class TierLayer:
             self.hot_quant = self.cold_quant = self.bank_quant = None
             self.native_workspace(self.hot_tensors)
             self.native_workspace(self.cold)
+            if settings.native_prefill == "grouped":
+                self.native_prefill_workspace(self.hot_tensors)
+                self.native_prefill_workspace(self.cold)
         else:
             self.hot_kernel, self.hot_quant = self.make_kernel(
                 self.hot_tensors, self.hot_local
@@ -1109,6 +1124,26 @@ class TierLayer:
 
         return require_silu(self.layer.activation)
 
+    def native_prefill_workspace(self, tensors):
+        """The grouped prefill kernel's workspace (its own allocator, with
+        alignment scratch), one per physical row count, shared by layers."""
+        from .native_prefill import allocate_workspace
+
+        rows = tensors[TENSORS[0]].shape[0]
+        key = (str(self.device), rows)
+        workspace = _NATIVE_PREFILL_WORKSPACES.get(key)
+        if workspace is None:
+            if self.max_tokens is None:
+                raise RuntimeError("Native workspaces need the runner token budget")
+            workspace = allocate_workspace(
+                tensors,
+                self.max_tokens,
+                self.method.moe.experts_per_token,
+                num_experts=self.num_experts,
+            )
+            _NATIVE_PREFILL_WORKSPACES[key] = workspace
+        return workspace
+
     def _run_native_chains(self, x, weights, ids, partitions):
         """One adapter call per partition; routes outside a partition are
         masked to padding so the adapter never records them as missing."""
@@ -1116,6 +1151,11 @@ class TierLayer:
 
         from .native_nvfp4 import gemv
 
+        compute, workspace_for = gemv, self.native_workspace
+        if x.shape[0] > 1 and self.settings.native_prefill == "grouped":
+            from .native_prefill import prefill
+
+            compute, workspace_for = prefill, self.native_prefill_workspace
         total = None
         for _experts, tensors, expert_map, _rows in partitions:
             if len(partitions) > 1:
@@ -1129,13 +1169,13 @@ class TierLayer:
                 routed = torch.where(foreign, torch.full_like(ids, -1), ids)
             else:
                 routed = ids
-            out = gemv(
+            out = compute(
                 x,
                 weights,
                 routed.contiguous(),
                 tensors,
                 expert_map,
-                self.native_workspace(tensors),
+                workspace_for(tensors),
                 activation=self.native_activation(),
             )
             # The output aliases the workspace: own it before the next call.
@@ -2206,7 +2246,10 @@ class TierCoordinator:
         if self.settings.moe_kernel == "native":
             # The adapter records missing or out-of-range routes on the
             # device; one host read per report, as for the promote tables.
-            for workspace in _NATIVE_WORKSPACES.values():
+            for workspace in (
+                *_NATIVE_WORKSPACES.values(),
+                *_NATIVE_PREFILL_WORKSPACES.values(),
+            ):
                 if int(workspace.error.reshape(-1)[0].item()):
                     self.poisoned = True
                     raise RuntimeError("Native adapter recorded a routing error")
@@ -2741,6 +2784,7 @@ def initialize_model(model, model_config):
                 "static_partition": settings.sync_tokens == 0,
                 "source_bank_retained": settings.ram_backing,
                 "moe_kernel": settings.moe_kernel,
+                "native_prefill": settings.native_prefill,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

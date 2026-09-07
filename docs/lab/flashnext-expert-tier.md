@@ -279,7 +279,12 @@ boundaries:
   verification compares the tier against the adapter over the full RAM
   source (every expert's own row, identity map). The adapter's sticky
   routing error is read at each stats report and poisons the tier. SiLU
-  only. Not verified on a GPU.
+  only. Measured with the global pool: B 48.92 tok/s. Multi-token rows
+  run the decode GEMV per route by default (slow prefill);
+  `VLLM_LAB_EXPERT_TIER_NATIVE_PREFILL=grouped` calls
+  `native_prefill.prefill` (separate ownership) with the same arguments
+  and that module's own workspace (allocated at init per physical row
+  count) for rows > 1; decode is unaffected either way.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
