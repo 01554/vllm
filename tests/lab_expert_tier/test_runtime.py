@@ -1053,6 +1053,64 @@ class TensorTests(unittest.TestCase):
             (snapshot["route_hot"], snapshot["route_hot_available"]), (None, False)
         )
 
+    def test_device_observer_end_to_end_on_cpu(self):
+        """The real device observer drives the real policy through the seam."""
+        from lab_expert_tier import heat_device
+
+        rt.OBSERVERS["device"] = heat_device.DeviceObserver
+        try:
+            observer = rt.make_observer(
+                "device", num_layers=2, num_experts=4, decay=1.0, sync_period=1
+            )
+        finally:
+            rt.OBSERVERS["device"] = "vllm._lab_expert_tier.heat_device:DeviceObserver"
+        settings = rt.Settings(
+            32 * 2**30, sync_tokens=1, swaps_per_token=2, decay=1.0, hysteresis=0
+        )
+        coordinator = self.make_coordinator(settings=settings)
+        coordinator.observer = observer
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
+        for layer in coordinator.layers:
+            layer.hot_map = torch.tensor(layer.hot_map_host, dtype=torch.int32)
+            layer.hot, layer.cold_cpu, layer.row_bytes = {}, {}, 1
+            layer.publish_maps = Mock()
+
+            def stage_swap(old, new, hs, cs, layer=layer):
+                layer.hot_map_host, layer.cold_map_host = rt.maps_after_swap(
+                    layer.hot_map_host, layer.cold_map_host, old, new, hs, cs
+                )
+
+            layer.stage_swap = stage_swap
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+
+        def forward(ids):
+            with self.forward_context(coordinator, torch.tensor([False])):
+                for tier in coordinator.layers:
+                    coordinator.begin_layer(tier, x, weights, ids)
+                    coordinator.end_layer(tier)
+            coordinator.finish_forward(1, 1)
+
+        # Startup: nothing reaches the policy or the device heat.
+        forward(torch.tensor([[2, 3]]))
+        self.assertEqual(coordinator.policy.tokens_total, 0)
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 1)
+        coordinator.enable_heat()
+        # Cold experts 2 and 3 are selected every step; with sync_period 1 and
+        # no hysteresis the policy must plan them into the hot slots.
+        with patch.object(rt, "swap_tensor_rows_wave", lambda items, sync: None):
+            for _ in range(3):
+                forward(torch.tensor([[2, 3]]))
+        self.assertGreater(coordinator.policy.tokens_total, 0)
+        self.assertGreater(coordinator.stats["device_snapshots"], 0)
+        self.assertGreater(coordinator.stats["swaps"], 0)
+        self.assertEqual(coordinator.layers[0].hot_map_host[2:], (0, 1))
+        self.assertFalse(coordinator.poisoned)
+        with patch.object(rt.LOGGER, "warning") as log:
+            coordinator.report()
+        snapshot = json.loads(log.call_args.args[1])
+        self.assertTrue(snapshot["route_hot_available"])
+
     def test_observer_registry_builds_default_and_rejects_unknown(self):
         observer = rt.make_observer(
             "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1
@@ -1205,6 +1263,7 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(coordinator.policy.tokens_total, 1)
         # A snapshot needs a policy importer; without one it fails closed.
         observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 2, 2, 1, 4)]
+        coordinator.policy.import_snapshot = None
         with self.assertRaises(NotImplementedError):
             coordinator.finish_forward(1, 1)
         self.assertTrue(coordinator.poisoned)

@@ -1030,6 +1030,8 @@ class TierCoordinator:
         # Cumulative totals of the last consumed device snapshot, per session.
         self.snapshot_totals: dict[str, int] = {}
         self.snapshot_session: Any = None
+        # Whether the last device snapshot counted hot hits from real maps.
+        self.route_hot_measured = False
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
@@ -1280,6 +1282,9 @@ class TierCoordinator:
                 self.stats[stat] += delta
             self.stats["model_tokens"] += self.policy.tokens_total - tokens_before
             self.stats["device_snapshots"] += 1
+            self.route_hot_measured = bool(
+                getattr(result, "route_hot_available", False)
+            )
             if plan:
                 self._plan_and_migrate()
             # The device restarts from the policy state that now holds,
@@ -1434,9 +1439,13 @@ class TierCoordinator:
         )
         snapshot: dict[str, Any] = {key: self.stats[key] for key in fields}
         snapshot.update(self.stats)
-        # An observer without hot-map accounting has not measured hit rate;
-        # never present its zero as a measured 0%.
-        route_hot_available = bool(getattr(self.observer, "reports_route_hot", False))
+        # Hit rate is measured by the host readback observer, or by a device
+        # snapshot that says it counted from real maps; never present an
+        # unmeasured zero as 0%.
+        route_hot_available = (
+            bool(getattr(self.observer, "reports_route_hot", False))
+            or self.route_hot_measured
+        )
         if not route_hot_available:
             snapshot["route_hot"] = None
         snapshot["route_hot_available"] = route_hot_available
