@@ -112,6 +112,10 @@ class Settings:
     # shadows). Host bytes: the full source stays resident (the loader's
     # own peak); no second copy of any bank is made.
     ram_backing: bool = False
+    # Global pool (promote + RAM backing only): one VRAM bank shared by all
+    # layers with one LRU over every (layer, expert), FreeToken style, so
+    # the resident count per layer floats. Staging rows are shared too.
+    global_pool: bool = False
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -146,6 +150,7 @@ class Settings:
             "PROMOTE",
             "PLANNER",
             "RAM_BACKING",
+            "GLOBAL_POOL",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -163,14 +168,18 @@ class Settings:
         asynchronous = os.environ.get(PREFIX + "ASYNC_MIGRATION", "0")
         promote = os.environ.get(PREFIX + "PROMOTE", "0")
         ram_backing = os.environ.get(PREFIX + "RAM_BACKING", "0")
-        flags = (verify, staging, asynchronous, promote, ram_backing)
+        global_pool = os.environ.get(PREFIX + "GLOBAL_POOL", "0")
+        flags = (verify, staging, asynchronous, promote, ram_backing, global_pool)
         if stats < 1 or any(flag not in ("0", "1") for flag in flags):
             raise ValueError(
                 "STATS_EVERY must be positive; VERIFY_INIT, STAGING, "
-                "ASYNC_MIGRATION, PROMOTE, and RAM_BACKING must be 0 or 1"
+                "ASYNC_MIGRATION, PROMOTE, RAM_BACKING, and GLOBAL_POOL must "
+                "be 0 or 1"
             )
         if ram_backing == "1" and promote != "1":
             raise ValueError("RAM_BACKING requires PROMOTE=1")
+        if global_pool == "1" and ram_backing != "1":
+            raise ValueError("GLOBAL_POOL requires RAM_BACKING=1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -239,6 +248,7 @@ class Settings:
             promote == "1",
             planner,
             ram_backing == "1",
+            global_pool == "1",
         )
 
 
@@ -472,7 +482,7 @@ def replace_full_source_references(layer, method, hot, hot_kernel, hot_quant):
 
 
 class TierLayer:
-    def __init__(self, index, name, layer, method, sources, slots, settings):
+    def __init__(self, index, name, layer, method, sources, slots, settings, pool=None):
         import torch
 
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -503,6 +513,13 @@ class TierLayer:
         self.ram_backing = bool(settings.ram_backing)
         if self.ram_backing and not settings.promote:
             raise ValueError("RAM backing requires promote mode")
+        # Global pool: the bank, staging rows, and tables are the pool's;
+        # this layer's initial rows are a contiguous run of the pool.
+        self.pool = pool
+        if (pool is None) != (not settings.global_pool):
+            raise ValueError("Global pool settings and pool object disagree")
+        if pool is not None and not self.ram_backing:
+            raise ValueError("Global pool requires RAM backing")
         self.cold_rows_total = (
             self.num_experts if self.ram_backing else self.cold_slots + self.spare_slots
         )
@@ -511,14 +528,26 @@ class TierLayer:
         self.staging = {}
         self.cold_cpu = {}
         # Slicing without an independent allocation would retain the full bank.
+        if pool is not None:
+            self.spare_slots = 0
+            self.bank_rows = pool.rows
+            self.pool_offset = pool.offset(index)
+            if self.pool_offset + slots > pool.tables.pool_rows:
+                raise ValueError("Layer rows exceed the pool")
         for name, source in sources.items():
-            self.bank[name] = torch.zeros(
-                (self.bank_rows, *source.shape[1:]),
-                dtype=source.dtype,
-                device=self.device,
-            )
-            self.hot[name] = self.bank[name][:slots]
-            self.staging[name] = self.bank[name][slots:staging_end]
+            if pool is not None:
+                self.bank[name] = pool.bank[name]
+                start = self.pool_offset
+                self.hot[name] = self.bank[name][start : start + slots]
+                self.staging[name] = pool.staging[name]
+            else:
+                self.bank[name] = torch.zeros(
+                    (self.bank_rows, *source.shape[1:]),
+                    dtype=source.dtype,
+                    device=self.device,
+                )
+                self.hot[name] = self.bank[name][:slots]
+                self.staging[name] = self.bank[name][slots:staging_end]
             if self.ram_backing:
                 self.cold_cpu[name] = source
             else:
@@ -535,7 +564,11 @@ class TierLayer:
             name: get_accelerator_view_from_cpu_tensor(t)
             for name, t in self.cold_cpu.items()
         }
-        self.hot_rows = list(range(slots))
+        self.hot_rows = list(
+            range(self.pool_offset, self.pool_offset + slots)
+            if pool is not None
+            else range(slots)
+        )
         self.cold_rows = list(
             range(slots, self.num_experts)
             if self.ram_backing
@@ -551,7 +584,17 @@ class TierLayer:
         self.promote_tables = self.promote_buffers = None
         self.promote_gate = False
         self.staging_rows = list(range(slots, staging_end))
-        if settings.promote:
+        self.step_buffers = None
+        if pool is not None:
+            from .global_pool import allocate_step_buffers as pool_buffers
+
+            self.staging_rows = pool.tables.staging_rows.tolist()
+            self.step_buffers = pool_buffers(
+                self.device, self.num_experts, max(self.staging_slots, 1)
+            )
+            self.hot_map = pool.tables.layer_slice(pool.tables.hot_phys, index)
+            self.cold_map = pool.tables.layer_slice(pool.tables.cold_phys, index)
+        elif settings.promote:
             from .promote import allocate_step_buffers, allocate_tables
 
             # Device tables own the placement; the kernel maps alias them so
@@ -582,7 +625,7 @@ class TierLayer:
         self.publish_maps()
         # With spare rows a logical hot slot can live anywhere in the bank,
         # so the kernels address the whole bank / whole cold bank.
-        if self.spare_slots:
+        if pool is not None or self.spare_slots:
             self.hot_tensors, self.hot_local = self.bank, self.bank_rows
             self.cold_local = self.cold_rows_total
         else:
@@ -594,7 +637,7 @@ class TierLayer:
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_local)
         self.bank_kernel = self.bank_quant = None
         if self.staging_slots:
-            if self.spare_slots:
+            if self.spare_slots or pool is not None:
                 self.bank_kernel, self.bank_quant = self.hot_kernel, self.hot_quant
             else:
                 self.bank_kernel, self.bank_quant = self.make_kernel(
@@ -611,7 +654,10 @@ class TierLayer:
             self.marlin_workspace = marlin_make_workspace_new(self.device, 4)
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
-        self.staging_bytes = self.row_bytes * self.staging_slots
+        # The pool's staging rows are charged once, by the pool.
+        self.staging_bytes = (
+            0 if pool is not None else self.row_bytes * self.staging_slots
+        )
         self.spare_bytes = self.row_bytes * self.spare_slots
         self.cold_bytes = self.row_bytes * self.cold_slots
         # No physical RAM spare rows under backing: nothing is written.
@@ -656,6 +702,10 @@ class TierLayer:
     def publish_maps(self):
         import torch
 
+        if getattr(self, "pool", None) is not None:
+            # The kernel maps alias the pool tables from the start; the host
+            # maps are refreshed from the device at snapshots only.
+            return
         validate_partition(
             self.hot_map_host, self.cold_map_host, self.hot_slots, self.cold_slots
         )
@@ -740,6 +790,8 @@ class TierLayer:
     def split(self, x, weights, ids):
         staging = getattr(self, "staging_slots", 0)
         if staging and x.shape[0] * ids.shape[1] <= staging:
+            if getattr(self, "pool", None) is not None:
+                return self.split_global(x, weights, ids)
             if getattr(self, "promote_tables", None) is not None:
                 return self.split_promote(x, weights, ids)
             return self.split_staged(x, weights, ids)
@@ -758,6 +810,30 @@ class TierLayer:
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
+
+    def split_global(self, x, weights, ids):
+        """Batch-1 decode on the global pool: one step program, one copy
+        launch from this layer's RAM bank, one chain through the step map."""
+        from .global_pool import copy_in, step
+
+        buffers = self.step_buffers
+        if self.bank_kernel is None or buffers is None:
+            raise RuntimeError("Global pool requires the bank kernel and buffers")
+        step(self.pool.tables, self.index, ids, buffers)
+        copy_in(self.cold, self.bank, buffers)
+        return self._run_marlin_chains(
+            x,
+            weights,
+            ids,
+            (
+                (
+                    self.bank_kernel.fused_experts,
+                    self.bank,
+                    buffers.step_map,
+                    self.bank_rows,
+                ),
+            ),
+        )
 
     def split_promote(self, x, weights, ids):
         """Batch-1 decode in promote mode: plan, gather, evict, flip, one chain.
@@ -820,6 +896,11 @@ class TierLayer:
     def set_promote_gate(self, enabled):
         """Open or close promotion; closed leaves placement and recency alone."""
         self.promote_gate = bool(enabled)
+        if getattr(self, "pool", None) is not None:
+            from .global_pool import set_gate
+
+            set_gate(self.pool.tables, enabled)
+            return
         if self.promote_tables is None:
             return
         if self.settings.planner == "device" and self.device.type == "cuda":
@@ -829,10 +910,19 @@ class TierLayer:
                 self.promote_tables.lru_state
             )
 
+    def pool_maps_host(self):
+        hot_map, cold_map = cast(Any, self.hot_map), cast(Any, self.cold_map)
+        return tuple(hot_map.tolist()), tuple(cold_map.tolist())
+
     def promote_snapshot(self):
         """Host copy of the device placement; validates and refreshes host maps."""
         from .promote import check_tables
 
+        pool = getattr(self, "pool", None)
+        if pool is not None:
+            # Rows, not logical slots: the resident set of a layer floats.
+            self.hot_map_host, self.cold_map_host = self.pool_maps_host()
+            return
         tables = self.promote_tables
         if tables is None:
             return
@@ -1002,6 +1092,15 @@ class TierLayer:
 
     def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
         """One sequential swap with its own waits; used by init verification."""
+        if getattr(self, "pool", None) is not None:
+            self.pool.host_swap(self.index, old_expert, new_expert)
+            hot_map = cast(Any, self.hot_map)
+            for name in TENSORS:
+                row = int(hot_map[new_expert])
+                self.bank[name][row].copy_(self.cold[name][new_expert])
+            _current_stream(self.device).synchronize()
+            self.hot_map_host, self.cold_map_host = self.pool_maps_host()
+            return
         if getattr(self, "ram_backing", False):
             # The evicted expert's RAM row is intact: copy in, point the
             # logical cold slot at that row, nothing written to the host.
@@ -1392,6 +1491,7 @@ def _is_deferred(result):
 class TierCoordinator:
     def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
+        self.pool = None
         hot_slots = tuple(layer.hot_slots for layer in layers)
         self.policy = TierPolicy(
             len(layers),
@@ -1920,8 +2020,14 @@ class TierCoordinator:
         if self.settings.promote:
             # The device placement is the truth: validate it and refresh the
             # host maps for the report. One host copy per report, not per step.
+            pool = getattr(self, "pool", None)
+            if pool is not None:
+                self.stats["pool_resident_per_layer"] = pool.snapshot()
             for layer in self.layers:
-                if getattr(layer, "promote_tables", None) is not None:
+                if (
+                    pool is not None
+                    or getattr(layer, "promote_tables", None) is not None
+                ):
                     layer.promote_snapshot()
         # Defaults make snapshots/deltas stable even before the first swap.
         fields = (
@@ -1979,6 +2085,7 @@ class TierCoordinator:
                 "unfinished_forward_rows": self.forward_rows,
                 "async_pending": self.pending is not None,
                 "promote_mode": self.settings.promote,
+                "global_pool": self.settings.global_pool,
                 "per_layer_swaps": list(self.per_layer_swaps),
                 "policy_cpu_seconds": sum(
                     self.stats[key]
@@ -2128,13 +2235,13 @@ def _validate_sources(name, layer):
     return sources
 
 
-def _compact_one(index, name, layer, method, slots, settings, temporary):
+def _compact_one(index, name, layer, method, slots, settings, temporary, pool=None):
     sources = _validate_sources(name, layer)
     refs = tuple(weakref.ref(tensor) for tensor in sources.values())
     original = {key: getattr(layer, key) for key in TENSORS}
     original_kernel = method.moe_kernel
     _check_kernel_scales(original_kernel, original)
-    tier = TierLayer(index, name, layer, method, sources, slots, settings)
+    tier = TierLayer(index, name, layer, method, sources, slots, settings, pool)
     if settings.verify_init:
         tier.verify_initial(original_kernel, original, temporary)
     replace_full_source_references(
@@ -2247,13 +2354,24 @@ def initialize_model(model, model_config):
         if settings.layer_slots == "uniform"
         else [int(item) for item in settings.layer_slots.split(",")]
     )
-    slots_per_layer, expected_bytes = allocate_slots(
-        settings.capacity_bytes,
-        row_sizes,
-        512,
-        reserve=staging_rows + spare_rows,
-        layer_slots=explicit,
-    )
+    pool = None
+    if settings.global_pool:
+        # Shared staging rows are charged once; every other byte is pool
+        # rows, distributed uniformly (or as LAYER_SLOTS) as the starting
+        # placement that the LRU then rebalances.
+        pool_capacity = settings.capacity_bytes - staging_rows * sum(row_sizes)
+        slots_per_layer, expected_bytes = allocate_slots(
+            pool_capacity, row_sizes, 512, reserve=0, layer_slots=explicit
+        )
+        expected_bytes += staging_rows * sum(row_sizes)
+    else:
+        slots_per_layer, expected_bytes = allocate_slots(
+            settings.capacity_bytes,
+            row_sizes,
+            512,
+            reserve=staging_rows + spare_rows,
+            layer_slots=explicit,
+        )
     if any(not 0 < slots < 512 for slots in slots_per_layer):
         raise ValueError("Expert tier requires both a hot and cold partition")
     if settings.verify_init:
@@ -2270,6 +2388,15 @@ def initialize_model(model, model_config):
         )
         for name in TENSORS
     }
+    if settings.global_pool:
+        from .global_pool import GlobalPool
+
+        pool = GlobalPool(
+            first.w13_weight.device,
+            _validate_sources(candidates[0][0], first),
+            slots_per_layer,
+            staging_rows,
+        )
     tiers = []
     for index, (name, layer, method) in enumerate(candidates):
         tier, raw_refs = _compact_one(
@@ -2280,6 +2407,7 @@ def initialize_model(model, model_config):
             slots_per_layer[index],
             settings,
             temporary_row(temporary, 0),
+            pool,
         )
         gc.collect()
         if not settings.ram_backing and any(ref() is not None for ref in raw_refs):
@@ -2324,9 +2452,14 @@ def initialize_model(model, model_config):
         tier.method._lab_expert_tier = tier
     model._lab_expert_tiers = tiers
     model._lab_expert_tier_coordinator = coordinator
+    coordinator.pool = pool
     atexit.register(coordinator.report)
     atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
     actual_bytes = sum(t.hot_bytes + t.staging_bytes + t.spare_bytes for t in tiers)
+    if pool is not None:
+        actual_bytes += pool.staging_bytes
+        if pool.pool_bytes != sum(t.hot_bytes for t in tiers):
+            raise AssertionError("Pool rows and layer hot rows disagree")
     if actual_bytes != expected_bytes or actual_bytes > settings.capacity_bytes:
         raise AssertionError("Tier exceeds exact six-tensor GPU budget")
     LOGGER.warning(
@@ -2356,6 +2489,8 @@ def initialize_model(model, model_config):
                 "host_cold_spare_bytes": sum(t.cold_spare_bytes for t in tiers),
                 "host_bytes": sum(t.host_bytes for t in tiers),
                 "ram_backing": settings.ram_backing,
+                "global_pool": settings.global_pool,
+                "pool_rows": None if pool is None else pool.tables.pool_rows,
                 "async_migration": settings.async_migration,
                 "promote_mode": settings.promote,
                 "planner": settings.planner if settings.promote else None,
