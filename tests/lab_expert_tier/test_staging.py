@@ -33,15 +33,17 @@ except ImportError:
 
 
 def reference_plan(ids, cold_map, hot_map, hot_slots):
-    """Sequential semantics: distinct selected cold experts in ID order."""
-    experts = sorted(
-        {
-            int(e)
-            for row in ids
-            for e in row
-            if 0 <= int(e) < len(hot_map) and int(cold_map[int(e)]) >= 0
-        }
-    )
+    """Sequential semantics: distinct cold experts in first-occurrence order."""
+    experts: list[int] = []
+    for row in ids:
+        for e in row:
+            expert = int(e)
+            if (
+                0 <= expert < len(hot_map)
+                and int(cold_map[expert]) >= 0
+                and expert not in experts
+            ):
+                experts.append(expert)
     expert_map = [int(v) for v in hot_map]
     gather = []
     for slot, expert in enumerate(experts):
@@ -71,6 +73,7 @@ class StagingPlanTests(unittest.TestCase):
         self.assertEqual(gather[:2].tolist(), [2, 4])  # cold slots of 5 and 7
         self.assertEqual(gather[2:].tolist(), [0, 0, 0, 0])
         self.assertEqual(expert_map.tolist(), [0, 1, 2, -1, -1, 3, -1, 4])
+        self.assertEqual(count.shape, (1,))
         # The input maps are untouched: the plan never carries over.
         self.assertEqual(hot_map.tolist(), [0, 1, 2, -1, -1, -1, -1, -1])
         self.assertEqual(expert_map.dtype, torch.int32)
@@ -93,10 +96,13 @@ class StagingPlanTests(unittest.TestCase):
             torch.tensor([[7, 3, 6, 4]]), cold_map, hot_map, 3, 4
         )
         self.assertEqual(int(count), 4)
-        self.assertEqual(gather.tolist(), [0, 1, 3, 4])
-        self.assertEqual(expert_map.tolist(), [0, 1, 2, 3, 4, -1, 5, 6])
+        # First-occurrence order: 7, 3, 6, 4 take staging slots 0..3.
+        self.assertEqual(gather.tolist(), [4, 0, 3, 1])
+        self.assertEqual(expert_map.tolist(), [0, 1, 2, 4, 6, -1, 5, 3])
         with self.assertRaises(ValueError):
             st.plan_staging(torch.tensor([[7, 3, 6, 4, 5]]), cold_map, hot_map, 3, 4)
+        with self.assertRaises(ValueError):
+            st.plan_staging(torch.zeros(1, st.PLAN_WIDTH + 1), cold_map, hot_map, 3, 32)
 
     def test_plan_out_of_range_ids_never_index_and_never_stage(self):
         hot_map, cold_map = self.maps()
@@ -121,7 +127,7 @@ class StagingPlanTests(unittest.TestCase):
                 cold[expert] = slot
             hot_map = torch.tensor(hot, dtype=torch.int32)
             cold_map = torch.tensor(cold, dtype=torch.int32)
-            k = rng.randint(1, 10)
+            k = rng.randint(1, 8)
             rows = rng.choice([1, 1, 1, 2])
             capacity = rows * k
             ids = [
