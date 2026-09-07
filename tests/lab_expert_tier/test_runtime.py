@@ -69,12 +69,23 @@ class InvariantTests(unittest.TestCase):
         self.assertEqual((mask, tokens), ([True, False], 1))
         self.assertEqual(rt.unpack_routes([[[-1, -1, 0, 0, 0]]], 4)[-1], 0)
 
+    def test_padded_positive_and_sentinel_ids_keep_route_shape(self):
+        packed = [
+            [[2, 2, 1, 0, 1], [3, -1, 0, 0, 0]],
+            [[2, 2, 1, 0, 1], [3, -1, 0, 0, 0]],
+        ]
+        routes, activity, mask, tokens = rt.unpack_routes(packed, 4)
+        self.assertEqual(routes[0], [[2, 2], [3, -1]])
+        self.assertEqual(activity[0], [[1, 0], [0, 0]])
+        self.assertEqual((mask, tokens), ([True, False], 1))
+
     def test_invalid_real_sentinel_and_bad_model_record_fail(self):
         packed: list[Any]
         for packed in (
             [[[-1, 1, 1]]],
             [[[4, 1, 1]]],
             [[[-2, 1, 0]]],
+            [[[0, 1, 1]], [[-1, 1, 1]]],
             [[[0, 1, 1]], [[0, 1, 0]]],
             [[[0, 3, 1]]],
             [[[0, 1, 2]]],
