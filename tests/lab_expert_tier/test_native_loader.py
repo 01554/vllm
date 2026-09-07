@@ -111,6 +111,34 @@ class NativeLoaderTests(unittest.TestCase):
         # The prepared layer is a valid adapter bank as is.
         self.assertEqual(native_nvfp4.validate_bank(bank), (3, 32, 16))
 
+    def test_activation_accepts_the_real_enum_and_rejects_others(self):
+        """RoutedExperts stores MoEActivation, not a string: the enum's
+        SiLU member must pass and any other member or string must not."""
+        spec = importlib.util.spec_from_file_location(
+            "moe_activation",
+            HERE.parent / "model_executor" / "layers" / "fused_moe" / "activation.py",
+        )
+        module = importlib.util.module_from_spec(cast(ModuleSpec, spec))
+        cast(Loader, cast(ModuleSpec, spec).loader).exec_module(module)
+        enum = module.MoEActivation
+        self.assertEqual(nl.require_silu(enum.SILU), "silu")
+        self.assertEqual(nl.require_silu("silu"), "silu")
+        for bad in (enum.GELU, enum.SILU_NO_MUL, enum.SWIGLUOAI, "gelu"):
+            with self.assertRaises(NotImplementedError):
+                nl.require_silu(bad)
+        with self.assertRaises(TypeError):
+            nl.require_silu(3)
+        layer = make_layer()
+        layer.activation = enum.SILU
+        method = SimpleNamespace(
+            moe=SimpleNamespace(is_act_and_mul=True),
+            moe_kernel=None,
+            moe_quant_config=None,
+        )
+        self.assertEqual(
+            nl.prepare_native_layer(method, layer, nl._set_parameter), (3, 32, 16)
+        )
+
     def test_prepare_rejects_other_activations(self):
         layer = make_layer()
         layer.activation = "gelu"

@@ -26,6 +26,24 @@ def native_requested():
     return settings is not None and settings.moe_kernel == "native"
 
 
+def activation_name(activation):
+    """The activation as the adapter's string: RoutedExperts holds the
+    MoEActivation enum (value "silu"), tests and configs may hold a str."""
+    value = getattr(activation, "value", activation)
+    if not isinstance(value, str):
+        raise TypeError(f"Unsupported MoE activation representation: {activation!r}")
+    return value
+
+
+def require_silu(activation):
+    name = activation_name(activation)
+    if name != "silu":
+        raise NotImplementedError(
+            f"Native backend supports SiLU experts only (got {name!r})"
+        )
+    return name
+
+
 def expand_w13_globals(scale_2, intermediate, dtype=None):
     """[E, 2] -> [E, 2I]: gate rows carry column 0, up rows column 1."""
     import torch
@@ -87,8 +105,7 @@ def prepare_native_layer(method: Any, layer: Any, replace_parameter=None):
     if replace_parameter is None:
         from vllm.model_executor.utils import replace_parameter
 
-    if getattr(layer, "activation", "silu") != "silu":
-        raise NotImplementedError("Native backend supports SiLU experts only")
+    require_silu(getattr(layer, "activation", "silu"))
     if not getattr(method.moe, "is_act_and_mul", True):
         raise NotImplementedError("Native backend expects gate/up (act-and-mul)")
     experts, hidden, intermediate = native_bank_shapes(

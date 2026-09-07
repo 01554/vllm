@@ -1706,7 +1706,7 @@ class TensorTests(unittest.TestCase):
 
         layer = self.make_promote_layer(backing=True)
         layer.native = True
-        layer.layer = SimpleNamespace(activation="silu")
+        layer.layer = SimpleNamespace(activation=SimpleNamespace(value="silu"))
         layer.native_workspace = lambda tensors: ("ws", tensors[rt.TENSORS[0]].shape[0])
         calls: list[Any] = []
         output = torch.ones(2, 3, dtype=torch.bfloat16)
