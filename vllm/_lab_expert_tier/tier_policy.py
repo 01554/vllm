@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-wide heat policy for compact, exclusive CPU/GPU expert banks.
 
+Heat storage uses NumPy float64 arrays; NumPy is a direct vLLM common dependency.
+
 Adapted from 01554/llama.cpp, expert-tier commit
 7e6be0190af284b576690545c7cf38f3c9f2f453 (MIT; LICENSE.llama-cpp):
   https://github.com/01554/llama.cpp/blob/7e6be0190af284b576690545c7cf38f3c9f2f453/src/llama-expert-heatmap.cpp
@@ -192,6 +194,9 @@ class TierPolicy:
             return []
         heat = self._heat[layer]
         if np.isnan(heat).any():
+            # Validated updates should never create NaN, but retain this
+            # defensive path because NumPy and Python order NaN differently;
+            # the scalar sort preserves the historical Python ordering.
             values = heat.tolist()
             return sorted(range(self.num_experts), key=lambda e: (-values[e], e))[
                 : self.hot_slots
