@@ -49,6 +49,7 @@ def run_case(rows, graph_mode):
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         [20, 21, 20, 29, 0, 1, -1, 100, 20, -1],
         [-1] * 10,
+        [512, 9999, -2, -1, 0, 20, 100, -1, 1, 29],
     ]
     for iteration in range(2):
         for route in routes:
@@ -70,7 +71,7 @@ def run_case(rows, graph_mode):
             expected = {
                 i: int(map_cpu[e])
                 for i, e in enumerate(host_ids.flatten().tolist())
-                if e >= 0 and map_cpu[e] >= 0
+                if 0 <= e < experts and map_cpu[e] >= 0
             }
             seen = {}
             for position in range(n):
