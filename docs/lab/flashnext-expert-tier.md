@@ -142,6 +142,28 @@ boundaries:
   alignment and two GEMMs per partition remain. `SPLIT=modular` restores the
   two stock modular kernel calls. Init verification compares either path
   against the source kernel.
+- **Staged cold experts for batch-1 decode** (`VLLM_LAB_EXPERT_TIER_STAGING`,
+  default 1). Each layer's hot bank has `top_k` spare rows, charged to the
+  capacity budget (32 GiB: 258 hot slots become 248 plus 10 staging rows).
+  For a one-token forward, `plan_staging` derives on the device, with fixed
+  shapes and no host sync, the distinct selected cold experts, a gather index
+  per spare row, the staged count, and a per-step expert map rebuilt from the
+  hot map. `gather_staging` copies exactly that many rows of all six tensors
+  from the pinned cold bank into the spare rows (a Triton kernel reads the
+  count on the device and exits early for unused slots), and hot plus staged
+  rows run through one Marlin chain from VRAM. Prefill and any forward wider
+  than one token keep the fused two-partition path. Staged rows are
+  transient copies, never written back, and outside the swap slot range.
+  Init verification adds single-row hot, cold, mixed, and padding checks
+  through this path. `vllm/_lab_expert_tier/staging.py` holds the pure
+  functions and their CPU contract tests.
+- **Observer seam** (`VLLM_LAB_EXPERT_TIER_OBSERVER`, default `records`). The
+  per-forward routing record and its readback live in an observer object;
+  `device` selects `heat_device.DeviceObserver` (separate work) which keeps
+  heat on the device and hands the coordinator a `DeviceSnapshot` at its own
+  cadence, or `Deferred` for forwards with no readback. The coordinator
+  counts forwards once per finish, plans only on a snapshot, and `flush`
+  collects deferred observations without planning unless asked.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
