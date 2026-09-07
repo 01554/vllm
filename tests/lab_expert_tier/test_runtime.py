@@ -1015,7 +1015,95 @@ class TensorTests(unittest.TestCase):
         rt.finish_model_forward(
             SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8
         )
-        coordinator.finish_forward.assert_called_once_with(8)
+        coordinator.finish_forward.assert_called_once_with(8, None)
+        rt.finish_model_forward(
+            SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8, 1
+        )
+        coordinator.finish_forward.assert_called_with(8, 1)
+
+    def test_observer_seam_dispatches_legacy_deferred_and_device_snapshots(self):
+        class Observer(rt.RecordObserver):
+            def __init__(self):
+                super().__init__()
+                self.results: list[Any] = []
+                self.calls: list[Any] = []
+                self.gate_opened = 0
+
+            def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+                self.calls.append((rows, valid_rows, heat_enabled))
+                result = self.results.pop(0)
+                if result == "legacy":
+                    return super().finish(
+                        rows, valid_rows, heat_enabled, stream, num_experts
+                    )
+                return result
+
+            def flush(self):
+                return self.results.pop(0) if self.results else None
+
+            def on_heat_enabled(self):
+                self.gate_opened += 1
+
+        observer = Observer()
+        coordinator = self.make_coordinator(
+            settings=rt.Settings(32 * 2**30, sync_tokens=0)
+        )
+        coordinator.observer = observer
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        coordinator.records[:1] = record[:, None, :]
+        # Startup: a snapshot before heat is enabled is a contract violation.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        observer.results = [rt.Deferred()]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 1)
+        coordinator.enable_heat()
+        self.assertEqual(observer.gate_opened, 1)
+        # Legacy readback still observes and plans exactly as before.
+        observer.results = ["legacy"]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(observer.calls[-1], (1, 1, True))
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        # Deferred forwards count but never plan against stale heat.
+        observer.results = [rt.Deferred(), rt.Deferred(forwards=1)]
+        coordinator.finish_forward(1, 1)
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(coordinator.stats["deferred_forwards"], 2)
+        self.assertEqual(coordinator.stats["model_forwards"], 3)
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        # A snapshot needs a policy importer; without one it fails closed.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 2, 2, 1, 4)]
+        with self.assertRaises(NotImplementedError):
+            coordinator.finish_forward(1, 1)
+        self.assertTrue(coordinator.poisoned)
+        coordinator.poisoned = False
+        imported: list[Any] = []
+        coordinator.policy.import_snapshot = imported.append
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 2, 2, 1, 4)]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(coordinator.stats["device_snapshots"], 1)
+        self.assertEqual(coordinator.stats["model_tokens"], 3)
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (1, 8)
+        )
+        # flush delivers a pending snapshot through the same path.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+        coordinator.flush()
+        self.assertEqual(len(imported), 2)
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2, False)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        observer.results = ["unknown"]
+        with self.assertRaises(TypeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        with self.assertRaises(ValueError):
+            coordinator.finish_forward(1, 2)
 
 
 if __name__ == "__main__":

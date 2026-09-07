@@ -762,8 +762,113 @@ def _is_capturing(device):
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
+@dataclass(frozen=True)
+class LegacyRoutes:
+    """Host routing lists for one forward; the coordinator observes them."""
+
+    routes: Any
+    activity: Any
+    mask: Any
+    tokens: int
+
+
+@dataclass(frozen=True)
+class DeviceSnapshot:
+    """Heat already advanced on the device; the coordinator only plans.
+
+    `heat` is a host float64 [layers, experts] array that the policy imports
+    verbatim (integer counts were accumulated per forward, decayed, then
+    added once, in the policy's order). The deltas cover every forward since
+    the previous snapshot. Observers must not advance device state while
+    heat is disabled, so a snapshot may only arrive with heat enabled.
+    """
+
+    heat: Any
+    tokens: int
+    forwards: int
+    route_hot: int
+    route_total: int
+    verified: bool = True
+
+
+@dataclass(frozen=True)
+class Deferred:
+    """No host readback this forward; `flush` delivers the snapshot later."""
+
+    forwards: int = 1
+
+
+class RecordObserver:
+    """Default observer: static device records, one D2H per forward.
+
+    Contract shared with device-side observers:
+    - `record_layer` runs inside the (possibly captured) forward and may only
+      touch fixed-address device state.
+    - `finish` runs on the runner's stream at the model boundary and returns
+      LegacyRoutes, DeviceSnapshot, or Deferred. It must raise on an invalid
+      device record, which poisons the coordinator.
+    - `flush` returns a pending snapshot or None; used at stats, forced
+      resync, and shutdown.
+    """
+
+    def __init__(self):
+        self.records: Any = None
+        self.records_host: Any = None
+        self.device: Any = None
+
+    @property
+    def capacity(self):
+        return 0 if self.records is None else self.records.shape[0]
+
+    def allocate(self, device, layers, top_k, max_tokens):
+        import torch
+
+        if self.records is not None:
+            raise RuntimeError("Tier routing records are already allocated")
+        if top_k < 1 or max_tokens < 1:
+            raise ValueError("Routing records need positive top-k and token capacity")
+        # Token-major so a forward's rows are one contiguous prefix.
+        shape = (max_tokens, layers, 2 * top_k + 1)
+        self.device = device
+        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
+        self.records_host = torch.zeros(
+            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
+        )
+
+    def record_layer(self, layer_index, rows, ids, active, valid):
+        import torch
+
+        packed = torch.cat(
+            (
+                ids.to(torch.int32),
+                active.to(torch.int32),
+                valid[:, None].to(torch.int32),
+            ),
+            dim=1,
+        )
+        if packed.shape[1] != self.records.shape[2]:
+            raise ValueError("Routing record width does not match the allocation")
+        # Graph-safe: a fixed destination written on the forward's stream.
+        self.records[:rows, layer_index].copy_(packed)
+
+    def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+        # One batched D2H at the model boundary, matching update_from_graph.
+        # This also completes all hot/cold uses before any RAM TEMP migration.
+        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
+        stream.synchronize()
+        packed = self.records_host[:rows].transpose(0, 1).tolist()
+        return LegacyRoutes(*unpack_routes(packed, num_experts))
+
+    def flush(self):
+        return None
+
+    def on_heat_enabled(self):
+        """Open a persistent device gate; Python flags never reach a replay."""
+        return None
+
+
 class TierCoordinator:
-    def __init__(self, layers, settings, temporary):
+    def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
         self.policy = TierPolicy(
             len(layers),
@@ -774,12 +879,9 @@ class TierCoordinator:
         self.lock = threading.Lock()
         self.poisoned, self.stream_id = False, None
         self.stream: Any = None
-        # Static routing records: one [tokens, layers, 2k+1] int32 device
-        # buffer written inside the (possibly captured) forward, and a pinned
-        # host mirror read once after it. Replays rewrite the same addresses.
-        # Token-major so a forward's rows are one contiguous prefix.
-        self.records: Any = None
-        self.records_host: Any = None
+        # The observer owns every per-forward device record. The default
+        # keeps static routing records and reads them back once per forward.
+        self.observer = RecordObserver() if observer is None else observer
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
         self.forward_rows: int | None = None  # recorded, not yet finished
@@ -789,19 +891,17 @@ class TierCoordinator:
         # Only the successful compile_or_warm_up_model tail enables heat.
         self.heat_enabled = False
 
-    def allocate_records(self, device, top_k, max_tokens):
-        import torch
+    @property
+    def records(self):
+        return getattr(self.observer, "records", None)
 
-        if self.records is not None:
-            raise RuntimeError("Tier routing records are already allocated")
-        if top_k < 1 or max_tokens < 1:
-            raise ValueError("Routing records need positive top-k and token capacity")
-        shape = (max_tokens, len(self.layers), 2 * top_k + 1)
+    @property
+    def records_host(self):
+        return getattr(self.observer, "records_host", None)
+
+    def allocate_records(self, device, top_k, max_tokens):
         self.device = device
-        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
-        self.records_host = torch.zeros(
-            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
-        )
+        self.observer.allocate(device, len(self.layers), top_k, max_tokens)
 
     def adopt_stream(self, stream, boundary):
         if self.stream_id == stream.cuda_stream:
@@ -836,7 +936,7 @@ class TierCoordinator:
 
         if self.poisoned:
             raise RuntimeError("Expert tier is poisoned by a previous failure")
-        if self.records is None:
+        if self.device is None or not self.observer.capacity:
             raise RuntimeError("Tier routing records are not allocated")
         if tier.index != self.recorded:
             raise RuntimeError("Tier requires one sequential full-model forward")
@@ -845,7 +945,7 @@ class TierCoordinator:
         if tier.index == 0:
             if self.forward_rows is not None:
                 self.discard_unconsumed("next forward started")
-            if not 0 < rows <= self.records.shape[0]:
+            if not 0 < rows <= self.observer.capacity:
                 raise ValueError("Forward exceeds the tier routing record capacity")
             if (
                 self.stream_id is not None
@@ -895,18 +995,7 @@ class TierCoordinator:
             "Invalid routing: -1 requires padding; "
             "real weights must be finite/nonnegative",
         )
-        packed = torch.cat(
-            (
-                ids.to(torch.int32),
-                (weights != 0).to(torch.int32),
-                valid[:, None].to(torch.int32),
-            ),
-            dim=1,
-        )
-        if packed.shape[1] != self.records.shape[2]:
-            raise ValueError("Routing record width does not match the allocation")
-        # Graph-safe: a fixed destination written on the forward's stream.
-        self.records[:rows, tier.index].copy_(packed)
+        self.observer.record_layer(tier.index, rows, ids, weights != 0, valid)
         self.recorded += 1
 
     def end_layer(self, tier):
@@ -918,30 +1007,48 @@ class TierCoordinator:
             self.stats["captured_forwards"] += 1
             self.forward_rows = None
 
-    def finish_forward(self, rows):
+    def finish_forward(self, rows, valid_rows=None):
         """Runner-side model boundary: the one host copy per forward.
 
         Called after eager forwards and CUDA Graph replays alike. A replay
         executes no Python in the layers, so the runner supplies the padded
         row count and the static records carry this forward's routing/mask.
+        `valid_rows` is the runner's real token count (None when unknown); it
+        is an upper bound for observers that defer host readback, never a
+        substitute for the device padding mask.
         """
         with self.lock:
             if self.poisoned:
                 raise RuntimeError("Expert tier is poisoned by a previous failure")
             try:
-                self._finish_forward(rows)
+                self._finish_forward(rows, valid_rows)
             except Exception:
                 self.poisoned = True
                 raise
 
-    def _finish_forward(self, rows):
-        if self.records is None:
+    def flush(self):
+        """Deliver a deferred device observation (stats, forced resync, exit)."""
+        with self.lock:
+            if self.poisoned:
+                raise RuntimeError("Expert tier is poisoned by a previous failure")
+            try:
+                result = self.observer.flush()
+                if result is not None:
+                    self._consume(result)
+            except Exception:
+                self.poisoned = True
+                raise
+
+    def _finish_forward(self, rows, valid_rows=None):
+        if valid_rows is not None and not 0 <= valid_rows <= rows:
+            raise ValueError("Runner valid token count exceeds the padded rows")
+        if self.device is None or not self.observer.capacity:
             raise RuntimeError("Tier routing records are not allocated")
         if self.recorded:
             raise RuntimeError("Model forward finished with incomplete tier layers")
         if _is_capturing(self.device):
             raise RuntimeError("Tier forward cannot be finished during graph capture")
-        if not 0 < rows <= self.records.shape[0]:
+        if not 0 < rows <= self.observer.capacity:
             raise ValueError("Finished forward exceeds the routing record capacity")
         if self.forward_rows is None:
             self.stats["replayed_forwards"] += 1
@@ -954,13 +1061,51 @@ class TierCoordinator:
             self.stats["recorded_forwards"] += 1
         stream = _current_stream(self.device)
         self.adopt_stream(stream, True)
-        # One batched D2H at the model boundary, matching update_from_graph.
-        # This also completes all hot/cold uses before any RAM TEMP migration.
-        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
-        stream.synchronize()
-        packed = self.records_host[:rows].transpose(0, 1).tolist()
-        routes, activity, mask, tokens = unpack_routes(
-            packed, self.layers[0].num_experts
+        result = self.observer.finish(
+            rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
+        )
+        self._consume(result)
+
+    def _consume(self, result):
+        if isinstance(result, Deferred):
+            # Lifecycle continues; the observation arrives with a later
+            # snapshot. Nothing may be planned against stale heat.
+            self.stats["model_forwards"] += result.forwards
+            self.stats["deferred_forwards"] += result.forwards
+            if not self.heat_enabled:
+                self.stats["ignored_startup_forwards"] += result.forwards
+            if self.stats["model_forwards"] % self.settings.stats_every == 0:
+                self.report()
+            return
+        if isinstance(result, DeviceSnapshot):
+            self.stats["model_forwards"] += result.forwards
+            if not self.heat_enabled:
+                raise RuntimeError(
+                    "Device observers must not advance heat before it is enabled"
+                )
+            if not result.verified:
+                raise RuntimeError("Device routing validation failed")
+            importer = getattr(self.policy, "import_snapshot", None)
+            if importer is None:
+                raise NotImplementedError("Policy cannot import device snapshots")
+            started = time.perf_counter()
+            importer(result)
+            self.stats["policy_observe_seconds"] += time.perf_counter() - started
+            self.stats["route_hot"] += result.route_hot
+            self.stats["route_total"] += result.route_total
+            self.stats["model_tokens"] += result.tokens
+            self.stats["device_snapshots"] += 1
+            self._plan_and_migrate()
+            if self.stats["model_forwards"] % self.settings.stats_every == 0:
+                self.report()
+            return
+        if not isinstance(result, LegacyRoutes):
+            raise TypeError("Observer returned an unknown result type")
+        routes, activity, mask, tokens = (
+            result.routes,
+            result.activity,
+            result.mask,
+            result.tokens,
         )
         self.stats["model_forwards"] += 1
         if not self.heat_enabled:
@@ -985,6 +1130,14 @@ class TierCoordinator:
             )
             self.stats["policy_observe_seconds"] += time.perf_counter() - started
             self.stats["model_tokens"] += tokens
+            self._plan_and_migrate()
+        else:
+            self.stats["ignored_synthetic_forwards"] += 1
+        if self.stats["model_forwards"] % self.settings.stats_every == 0:
+            self.report()
+
+    def _plan_and_migrate(self):
+        if True:
             started = time.perf_counter()
             plan = self.policy.plan_resync()
             self.stats["policy_plan_seconds"] += time.perf_counter() - started
@@ -1016,10 +1169,6 @@ class TierCoordinator:
                     ):
                         raise AssertionError("Policy and physical tier maps diverged")
                 self.stats["policy_commit_seconds"] += time.perf_counter() - started
-        else:
-            self.stats["ignored_synthetic_forwards"] += 1
-        if self.stats["model_forwards"] % self.settings.stats_every == 0:
-            self.report()
 
     def migrate(self, swaps):
         """Move a plan's rows in slot-independent waves, in plan order.
@@ -1079,6 +1228,8 @@ class TierCoordinator:
             "replayed_forwards",
             "captured_forwards",
             "dropped_startup_records",
+            "deferred_forwards",
+            "device_snapshots",
             "policy_observe_seconds",
             "policy_plan_seconds",
             "policy_commit_seconds",
@@ -1129,6 +1280,9 @@ class TierCoordinator:
             self.stats.clear()
             self.per_layer_swaps[:] = [0] * len(self.layers)
             self.heat_enabled = True
+            # Captured graphs cannot see this Python flag: the observer must
+            # flip its own in-place device gate now, after the startup wait.
+            self.observer.on_heat_enabled()
             LOGGER.warning(
                 "LAB_EXPERT_TIER_HEAT_ENABLED %s",
                 json.dumps(
@@ -1154,14 +1308,14 @@ def enable_model_heat(model):
     coordinator.enable_heat()
 
 
-def finish_model_forward(model, rows):
+def finish_model_forward(model, rows, valid_rows=None):
     """Runner hook after every model forward: eager, dummy, or graph replay.
 
     Cheap when the tier is disabled; never reads the environment.
     """
     coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
     if coordinator is not None:
-        coordinator.finish_forward(rows)
+        coordinator.finish_forward(rows, valid_rows)
 
 
 def unpack_routes(packed, num_experts):
@@ -1387,6 +1541,7 @@ def initialize_model(model, model_config):
     model._lab_expert_tiers = tiers
     model._lab_expert_tier_coordinator = coordinator
     atexit.register(coordinator.report)
+    atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
     actual_bytes = sum(t.hot_bytes for t in tiers)
     if actual_bytes != expected_bytes or actual_bytes > settings.capacity_bytes:
         raise AssertionError("Tier exceeds exact six-tensor GPU budget")
