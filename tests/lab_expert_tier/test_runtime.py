@@ -1166,6 +1166,42 @@ class TensorTests(unittest.TestCase):
             (snapshot["route_hot"], snapshot["route_hot_available"]), (None, False)
         )
 
+    def test_promote_observer_collects_periodically_without_placement_commits(self):
+        """Promote must not leave snapshot readback due on every decode."""
+        from lab_expert_tier.heat_device import DeviceObserver
+
+        layers = self.make_coordinator().layers
+        observer = DeviceObserver(num_layers=2, num_experts=4, sync_period=4)
+        coordinator = rt.TierCoordinator(
+            layers,
+            rt.Settings(32 * 2**30, promote=True, sync_tokens=4),
+            {},
+            observer=observer,
+        )
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
+        coordinator.heat_enabled = True
+        observer.on_heat_enabled()
+        snapshots = []
+        for step in range(1, 25):
+            for layer in layers:
+                observer.record_layer(
+                    layer.index,
+                    torch.tensor([[0, 2]]),
+                    torch.ones(1, 2, dtype=torch.bool),
+                    torch.ones(1, dtype=torch.bool),
+                    1,
+                    hot_map=torch.tensor(layer.hot_map_host, dtype=torch.int32),
+                )
+            result = observer.finish(1, 1, True, num_experts=4)
+            if rt._is_snapshot(result):
+                snapshots.append(step)
+            coordinator._consume(result, plan=True)
+        self.assertEqual(snapshots, [4, 8, 12, 16, 20, 24])
+        self.assertEqual(coordinator.policy.tokens_total, 24)
+        self.assertEqual(coordinator.policy.version, 0)
+        self.assertEqual(coordinator.policy.last_sync_tokens, 0)
+        self.assertEqual(coordinator.stats["device_snapshots"], 6)
+
     def test_device_observer_end_to_end_on_cpu(self):
         """The real device observer drives the real policy through the seam."""
         from lab_expert_tier import heat_device
