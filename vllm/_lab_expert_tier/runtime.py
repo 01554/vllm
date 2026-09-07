@@ -58,6 +58,8 @@ SCALE_PROPERTIES = {
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
 SPLIT_MODES = ("fused", "modular")
+NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
+_NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -112,6 +114,10 @@ class Settings:
     # shadows). Host bytes: the full source stays resident (the loader's
     # own peak); no second copy of any bank is made.
     ram_backing: bool = False
+    # Expert kernel: "marlin" (vLLM Marlin on repacked banks) or "native"
+    # (FreeToken-derived GEMV on the checkpoint layout, `native_nvfp4`;
+    # needs RAM_BACKING=1 and SPLIT=fused; the loader keeps the raw banks).
+    moe_kernel: str = "marlin"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -146,6 +152,7 @@ class Settings:
             "PROMOTE",
             "PLANNER",
             "RAM_BACKING",
+            "MOE_KERNEL",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -171,6 +178,11 @@ class Settings:
             )
         if ram_backing == "1" and promote != "1":
             raise ValueError("RAM_BACKING requires PROMOTE=1")
+        moe_kernel = os.environ.get(PREFIX + "MOE_KERNEL", "marlin")
+        if moe_kernel not in ("marlin", "native"):
+            raise ValueError("MOE_KERNEL must be marlin or native")
+        if moe_kernel == "native" and ram_backing != "1":
+            raise ValueError("MOE_KERNEL=native requires RAM_BACKING=1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -179,6 +191,8 @@ class Settings:
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
             raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
+        if moe_kernel == "native" and split != "fused":
+            raise ValueError("MOE_KERNEL=native requires SPLIT=fused")
         observer = os.environ.get(PREFIX + "OBSERVER", "records")
         if not observer.isidentifier():
             raise ValueError("OBSERVER must be an observer registry name")
@@ -239,6 +253,7 @@ class Settings:
             promote == "1",
             planner,
             ram_backing == "1",
+            moe_kernel,
         )
 
 
@@ -467,12 +482,14 @@ def replace_full_source_references(layer, method, hot, hot_kernel, hot_quant):
 
     for name in TENSORS:
         setattr(layer, name, torch.nn.Parameter(hot[name], requires_grad=False))
-    method.moe_kernel = hot_kernel
+    method.moe_kernel = None if hot_kernel is NATIVE_KERNEL else hot_kernel
     method.moe_quant_config = hot_quant
 
 
 class TierLayer:
-    def __init__(self, index, name, layer, method, sources, slots, settings):
+    def __init__(
+        self, index, name, layer, method, sources, slots, settings, max_tokens=None
+    ):
         import torch
 
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -503,6 +520,10 @@ class TierLayer:
         self.ram_backing = bool(settings.ram_backing)
         if self.ram_backing and not settings.promote:
             raise ValueError("RAM backing requires promote mode")
+        self.native = settings.moe_kernel == "native"
+        if self.native and not self.ram_backing:
+            raise ValueError("Native backend requires RAM backing")
+        self.max_tokens = max_tokens
         self.cold_rows_total = (
             self.num_experts if self.ram_backing else self.cold_slots + self.spare_slots
         )
@@ -588,20 +609,38 @@ class TierLayer:
         else:
             self.hot_tensors, self.hot_local = self.hot, slots
             self.cold_local = self.cold_slots
-        self.hot_kernel, self.hot_quant = self.make_kernel(
-            self.hot_tensors, self.hot_local
-        )
-        self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_local)
-        self.bank_kernel = self.bank_quant = None
-        if self.staging_slots:
-            if self.spare_slots:
-                self.bank_kernel, self.bank_quant = self.hot_kernel, self.hot_quant
-            else:
-                self.bank_kernel, self.bank_quant = self.make_kernel(
-                    self.bank, self.bank_rows
-                )
+        self.native_workspaces = {}
+        if self.native:
+            # No Marlin kernel objects: the adapter is called with the bank
+            # and a map. Workspaces are keyed by physical rows and shared by
+            # every layer with that row count (layers run sequentially).
+            from .native_nvfp4 import validate_bank
+
+            for tensors in (self.hot_tensors, self.cold):
+                validate_bank(tensors)
+            self.hot_kernel: Any = NATIVE_KERNEL
+            self.cold_kernel: Any = NATIVE_KERNEL
+            self.bank_kernel: Any = NATIVE_KERNEL
+            self.hot_quant = self.cold_quant = self.bank_quant = None
+            self.native_workspace(self.hot_tensors)
+            self.native_workspace(self.cold)
+        else:
+            self.hot_kernel, self.hot_quant = self.make_kernel(
+                self.hot_tensors, self.hot_local
+            )
+            self.cold_kernel, self.cold_quant = self.make_kernel(
+                self.cold, self.cold_local
+            )
+            self.bank_kernel = self.bank_quant = None
+            if self.staging_slots:
+                if self.spare_slots:
+                    self.bank_kernel, self.bank_quant = self.hot_kernel, self.hot_quant
+                else:
+                    self.bank_kernel, self.bank_quant = self.make_kernel(
+                        self.bank, self.bank_rows
+                    )
         self.marlin_workspace = None
-        if settings.split == "fused":
+        if settings.split == "fused" and not self.native:
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
                 marlin_make_workspace_new,
             )
@@ -903,7 +942,56 @@ class TierLayer:
         )
         return self._run_marlin_chains(x, weights, ids, partitions)
 
+    def native_workspace(self, tensors):
+        """The shared adapter workspace for this bank's physical row count."""
+        from .native_nvfp4 import allocate_workspace
+
+        rows = tensors[TENSORS[0]].shape[0]
+        key = (str(self.device), rows)
+        workspace = _NATIVE_WORKSPACES.get(key)
+        if workspace is None:
+            if self.max_tokens is None:
+                raise RuntimeError("Native workspaces need the runner token budget")
+            workspace = allocate_workspace(
+                tensors,
+                self.max_tokens,
+                self.method.moe.experts_per_token,
+                num_experts=self.num_experts,
+            )
+            _NATIVE_WORKSPACES[key] = workspace
+        self.native_workspaces[rows] = workspace
+        return workspace
+
+    def _run_native_chains(self, x, weights, ids, partitions):
+        """One adapter call per partition; routes outside a partition are
+        masked to padding so the adapter never records them as missing."""
+        import torch
+
+        from .native_nvfp4 import gemv
+
+        total = None
+        for _experts, tensors, expert_map, _rows in partitions:
+            if len(partitions) > 1:
+                present = (ids >= 0) & (expert_map[ids.clamp(min=0).long()] >= 0)
+                routed = torch.where(present, ids, torch.full_like(ids, -1))
+            else:
+                routed = ids
+            out = gemv(
+                x,
+                weights,
+                routed.contiguous(),
+                tensors,
+                expert_map,
+                self.native_workspace(tensors),
+                activation=self.layer.activation,
+            )
+            # The output aliases the workspace: own it before the next call.
+            total = out.clone() if total is None else total.add_(out)
+        return total
+
     def _run_marlin_chains(self, x, weights, ids, partitions):
+        if getattr(self, "native", False):
+            return self._run_native_chains(x, weights, ids, partitions)
         import torch
 
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
@@ -1092,9 +1180,28 @@ class TierLayer:
         )
         weights = torch.arange(1, k + 1, dtype=torch.float32, device=self.device)
         weights = (weights / weights.sum()).expand(4, -1).contiguous()
-        reference = self.call(
-            original_kernel, original, None, x.clone(), weights.clone(), ids.clone()
-        ).clone()
+        if getattr(self, "native", False):
+            from .native_nvfp4 import gemv
+
+            # The adapter over the full checkpoint banks (every expert's own
+            # row) is the reference; the tier must reproduce it exactly.
+            source = {name: original[name].data for name in TENSORS}
+            identity = torch.arange(
+                self.num_experts, dtype=torch.int32, device=self.device
+            )
+            reference = gemv(
+                x.clone(),
+                weights.clone(),
+                ids.clone(),
+                source,
+                identity,
+                self.native_workspace(source),
+                activation=self.layer.activation,
+            ).clone()
+        else:
+            reference = self.call(
+                original_kernel, original, None, x.clone(), weights.clone(), ids.clone()
+            ).clone()
         metrics = []
         padding_checks = []
         for stage in ("initial", "forced_swap", "restored"):
@@ -1917,6 +2024,13 @@ class TierCoordinator:
             layer.publish_maps()
 
     def report(self):
+        if self.settings.moe_kernel == "native":
+            # The adapter records missing or out-of-range routes on the
+            # device; one host read per report, as for the promote tables.
+            for workspace in _NATIVE_WORKSPACES.values():
+                if int(workspace.error.reshape(-1)[0].item()):
+                    self.poisoned = True
+                    raise RuntimeError("Native adapter recorded a routing error")
         if self.settings.promote:
             # The device placement is the truth: validate it and refresh the
             # host maps for the report. One host copy per report, not per step.
@@ -2128,13 +2242,21 @@ def _validate_sources(name, layer):
     return sources
 
 
-def _compact_one(index, name, layer, method, slots, settings, temporary):
+def _compact_one(
+    index, name, layer, method, slots, settings, temporary, max_tokens=None
+):
     sources = _validate_sources(name, layer)
     refs = tuple(weakref.ref(tensor) for tensor in sources.values())
     original = {key: getattr(layer, key) for key in TENSORS}
     original_kernel = method.moe_kernel
-    _check_kernel_scales(original_kernel, original)
-    tier = TierLayer(index, name, layer, method, sources, slots, settings)
+    if settings.moe_kernel == "native":
+        if original_kernel is not None or not getattr(method, "_lab_native", False):
+            raise RuntimeError(f"{name}: loader did not keep the native layout")
+    else:
+        _check_kernel_scales(original_kernel, original)
+    tier = TierLayer(
+        index, name, layer, method, sources, slots, settings, max_tokens=max_tokens
+    )
     if settings.verify_init:
         tier.verify_initial(original_kernel, original, temporary)
     replace_full_source_references(
@@ -2208,7 +2330,12 @@ def initialize_model(model, model_config):
             for key in ("tp_size", "dp_size", "ep_size", "pcp_size", "sp_size")
         ):
             raise NotImplementedError("Expert tier requires TP=DP=EP=PCP=SP=1")
-        if method.nvfp4_backend != NvFp4MoeBackend.MARLIN or method.is_monolithic:
+        if settings.moe_kernel == "native":
+            if not getattr(method, "_lab_native", False):
+                raise RuntimeError(f"{name}: native backend layout was not loaded")
+            if getattr(layer, "activation", "silu") != "silu":
+                raise NotImplementedError("Native backend supports SiLU only")
+        elif method.nvfp4_backend != NvFp4MoeBackend.MARLIN or method.is_monolithic:
             raise NotImplementedError("Only modular NVFP4 Marlin is supported")
         if layer.expert_map is not None or layer.global_num_experts != 512:
             raise NotImplementedError("Expected unsharded 512-expert source banks")
@@ -2280,6 +2407,7 @@ def initialize_model(model, model_config):
             slots_per_layer[index],
             settings,
             temporary_row(temporary, 0),
+            max_tokens=max_tokens,
         )
         gc.collect()
         if not settings.ram_backing and any(ref() is not None for ref in raw_refs):
@@ -2378,6 +2506,7 @@ def initialize_model(model, model_config):
                 "policy_config": settings.policy_kwargs(),
                 "static_partition": settings.sync_tokens == 0,
                 "source_bank_retained": settings.ram_backing,
+                "moe_kernel": settings.moe_kernel,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,
