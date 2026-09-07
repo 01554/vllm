@@ -99,6 +99,84 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(accumulator.heat.tolist(), policy._heat.tolist())
         self.assertFalse(accumulator.resync_due)
 
+    def test_disabled_positive_dummy_count_does_not_poison_first_enabled_step(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=2,
+            enabled=False,
+            session_id="disabled-positive-dummy",
+        )
+        dummy_ids = torch.tensor([[-1], [-1]], dtype=torch.int64)
+        dummy_active = torch.zeros((2, 1), dtype=torch.bool)
+        dummy_valid = torch.zeros((2,), dtype=torch.bool)
+        accumulator.record_layer(0, dummy_ids, dummy_active, dummy_valid, 2)
+        # The host knows two padded rows, while the all-false device mask has
+        # zero valid tokens.  Startup remains unverified only if it records a
+        # structural or routing error; this metadata mismatch is expected.
+        accumulator.finish_step(2)
+        self.assertFalse(accumulator.error)
+
+        accumulator.on_heat_enabled()
+        ids = torch.tensor([[0]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+        accumulator.record_layer(0, ids, active, valid, 1)
+        accumulator.finish_step(1)
+        snapshot = accumulator.flush()
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.verified)
+        self.assertFalse(snapshot.error)
+        self.assertEqual(snapshot.tokens, 1)
+
+    def test_disabled_structural_and_id_errors_remain_sticky_after_enable(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=1,
+            enabled=False,
+            session_id="disabled-errors",
+        )
+        invalid_ids = torch.tensor([[99]], dtype=torch.int64)
+        active = torch.ones((1, 1), dtype=torch.bool)
+        valid = torch.ones((1,), dtype=torch.bool)
+        accumulator.record_layer(0, invalid_ids, active, valid, 1)
+        accumulator.finish_step(1)
+        self.assertTrue(accumulator.error)
+
+        accumulator.on_heat_enabled()
+        accumulator.record_layer(0, torch.tensor([[0]]), active, valid, 1)
+        accumulator.finish_step(1)
+        snapshot = accumulator.flush()
+        self.assertIsNotNone(snapshot)
+        self.assertFalse(snapshot.verified)
+        self.assertTrue(snapshot.error)
+
+        structural = DeviceHeatAccumulator(
+            2,
+            2,
+            sync_period=1,
+            top_k=1,
+            max_rows=1,
+            enabled=False,
+            session_id="disabled-structural",
+        )
+        structural.record_layer(1, torch.tensor([[0]]), active, valid, 1)
+        structural.finish_step(1)
+        self.assertTrue(structural.error)
+        structural.on_heat_enabled()
+        structural.record_layer(0, torch.tensor([[0]]), active, valid, 1)
+        structural.record_layer(1, torch.tensor([[0]]), active, valid, 1)
+        structural.finish_step(1)
+        structural_snapshot = structural.flush()
+        self.assertIsNotNone(structural_snapshot)
+        self.assertFalse(structural_snapshot.verified)
+        self.assertTrue(structural_snapshot.error)
+
     def test_prefill_boundary_is_retained_until_first_decode_snapshot(self):
         kwargs = dict(
             num_layers=1,
