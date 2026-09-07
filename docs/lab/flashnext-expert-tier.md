@@ -260,6 +260,26 @@ boundaries:
   `GlobalPool.host_swap` while the gate is closed. Stats reports validate
   the pool (`check_global_tables`) and log `pool_resident_per_layer`.
   Not verified on a GPU.
+- **Native backend** (`VLLM_LAB_EXPERT_TIER_MOE_KERNEL=native`, default
+  `marlin`; needs `RAM_BACKING=1` and `SPLIT=fused`). The FreeToken-derived
+  NVFP4 GEMV adapter (`native_nvfp4.py`, separate ownership) replaces the
+  Marlin chains. The loader branch (`native_loader.py`, called at the top
+  of ModelOpt's `process_weights_after_loading`) keeps the checkpoint
+  layout for every expert bank: packed uint8 `[E, 2I, H/2]` / `[E, H, I/2]`,
+  E4M3 block scales, and per-row float16 globals expanded from the
+  checkpoint's `[E, 2]` / `[E]` (gate rows take column 0, up rows column
+  1; Marlin folds these into one). Input scales are dropped (BF16
+  activations), no Marlin kernel object is built, and the layout is
+  exclusive per process. The runtime calls `gemv(x, weights, ids, bank,
+  map, workspace)` once per partition: the decode paths pass their step
+  map; the eager two-partition path masks each partition's foreign routes
+  to padding so the adapter never records them as missing. Workspaces are
+  allocated once per physical row count (the bank and the RAM source) and
+  shared by every layer, sized by the runner's token budget. Init
+  verification compares the tier against the adapter over the full RAM
+  source (every expert's own row, identity map). The adapter's sticky
+  routing error is read at each stats report and poisons the tier. SiLU
+  only. Not verified on a GPU.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.

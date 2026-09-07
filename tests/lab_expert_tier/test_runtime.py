@@ -1508,10 +1508,20 @@ class TensorTests(unittest.TestCase):
         pooled = {**backing, rt.PREFIX + "GLOBAL_POOL": "1"}
         with patch.dict(os.environ, pooled, clear=True):
             self.assertTrue(rt.Settings.from_env().global_pool)
+        native = {**backing, rt.PREFIX + "MOE_KERNEL": "native"}
+        with patch.dict(os.environ, native, clear=True):
+            self.assertEqual(rt.Settings.from_env().moe_kernel, "native")
         for extra in (
             {rt.PREFIX + "PROMOTE": "1"},
             {rt.PREFIX + "RAM_BACKING": "1"},
             {**env, rt.PREFIX + "GLOBAL_POOL": "1"},
+            {**env, rt.PREFIX + "MOE_KERNEL": "native"},
+            {
+                **backing,
+                rt.PREFIX + "MOE_KERNEL": "native",
+                rt.PREFIX + "SPLIT": "modular",
+            },
+            {**backing, rt.PREFIX + "MOE_KERNEL": "cutlass"},
             {rt.PREFIX + "RAM_BACKING": "1", rt.PREFIX + "STAGING": "1"},
             {
                 rt.PREFIX + "PROMOTE": "1",
@@ -1831,6 +1841,32 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
 
+    def test_pool_decode_with_native_backend_calls_the_adapter_once(self):
+        """Global pool + native: the step map of the pool bank reaches gemv."""
+        from lab_expert_tier import native_nvfp4
+
+        pool, (first, second) = self.make_pool_layers()
+        calls: list[Any] = []
+        for layer in (first, second):
+            layer.native = True
+            layer.layer = SimpleNamespace(activation="silu")
+            layer.native_workspace = lambda tensors: tensors[rt.TENSORS[0]].shape[0]
+            layer.bank_kernel = rt.NATIVE_KERNEL
+
+        def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
+            calls.append((ids.tolist(), step_map.tolist(), workspace))
+            return torch.ones(1, 3, dtype=torch.bfloat16)
+
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        second.set_promote_gate(True)
+        with patch.object(native_nvfp4, "gemv", fake_gemv):
+            out = second.split(x, torch.ones(1, 2), torch.tensor([[4, 1]]))
+        # The victim is key 0 (layer 0 expert 0: last_use 0, lowest key), so
+        # layer 1's expert 4 takes row 0 and the pool tilts toward layer 1.
+        self.assertEqual(calls, [([[4, 1]], [2, 3, -1, -1, 0, -1], pool.rows)])
+        self.assertEqual(out.shape, (1, 3))
+        self.assertEqual(pool.snapshot(), [1, 3])
+
     def test_pool_host_swap_while_gated_copies_in_and_restores(self):
         pool, (first, second) = self.make_pool_layers()
         temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
@@ -1843,6 +1879,52 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(first.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
         self.assertEqual(int(pool.bank[rt.TENSORS[0]][0][0]), 0)
         pool.snapshot()
+
+    def test_native_chains_mask_routes_per_partition_and_own_the_output(self):
+        """Two partitions call the adapter once each with the other side's
+        routes turned into padding; one partition passes ids through."""
+        from lab_expert_tier import native_nvfp4
+
+        layer = self.make_promote_layer(backing=True)
+        layer.native = True
+        layer.layer = SimpleNamespace(activation="silu")
+        layer.native_workspace = lambda tensors: ("ws", tensors[rt.TENSORS[0]].shape[0])
+        calls: list[Any] = []
+        output = torch.ones(2, 3, dtype=torch.bfloat16)
+
+        def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
+            calls.append((ids.clone(), step_map, workspace, activation))
+            return output
+
+        x = torch.ones(2, 3, dtype=torch.bfloat16)
+        weights = torch.ones(2, 2)
+        ids = torch.tensor([[0, 4], [-1, 1]], dtype=torch.int32)
+        hot_map = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
+        cold_map = torch.tensor([-1, -1, 2, 3, 4, 5], dtype=torch.int32)
+        with patch.object(native_nvfp4, "gemv", fake_gemv):
+            total = layer._run_marlin_chains(
+                x,
+                weights,
+                ids,
+                (
+                    (rt.NATIVE_KERNEL, layer.bank, hot_map, 6),
+                    (rt.NATIVE_KERNEL, layer.cold_cpu, cold_map, 6),
+                ),
+            )
+            single = layer._run_marlin_chains(
+                x, weights, ids, ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),)
+            )
+        self.assertEqual(calls[0][0].tolist(), [[0, -1], [-1, 1]])
+        self.assertEqual(calls[1][0].tolist(), [[-1, 4], [-1, -1]])
+        self.assertEqual(calls[2][0].tolist(), ids.tolist())
+        self.assertEqual(calls[0][2], ("ws", layer.bank_rows))
+        self.assertEqual(calls[1][2], ("ws", 6))
+        self.assertEqual(calls[0][3], "silu")
+        self.assertTrue(
+            torch.equal(total, torch.full((2, 3), 2.0, dtype=torch.bfloat16))
+        )
+        self.assertIsNot(single, output)
+        self.assertTrue(torch.equal(single, output))
 
     def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
         settings = rt.Settings(

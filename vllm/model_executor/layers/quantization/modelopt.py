@@ -963,6 +963,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+        from vllm._lab_expert_tier.native_loader import native_requested
+
+        if native_requested():
+            # Lab expert tier, native backend: keep the checkpoint layout.
+            from vllm._lab_expert_tier.native_loader import prepare_native_layer
+
+            prepare_native_layer(self, layer)
+            return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
