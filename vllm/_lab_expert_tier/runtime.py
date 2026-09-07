@@ -1354,6 +1354,10 @@ class TierCoordinator:
         # The observer owns every per-forward device record. The default
         # keeps static routing records and reads them back once per forward.
         self.observer = RecordObserver() if observer is None else observer
+        if settings.promote:
+            observation_only = getattr(self.observer, "set_observation_only", None)
+            if observation_only is not None:
+                observation_only(True)
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
         self.forward_rows: int | None = None  # recorded, not yet finished
