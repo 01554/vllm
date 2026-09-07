@@ -43,6 +43,15 @@ class InvariantTests(unittest.TestCase):
     def test_exact_six_tensor_budget_and_complementary_partition(self):
         slots, size = rt.uniform_slots(32 * 2**30, [2764808] * 48, 512)
         self.assertEqual((slots, size), (258, 34239382272))
+        # Ten staging rows per layer come out of the same budget.
+        staged_slots, staged_size = rt.uniform_slots(
+            32 * 2**30, [2764808] * 48, 512, reserve=10
+        )
+        self.assertEqual((staged_slots, staged_size), (248, size))
+        with self.assertRaises(ValueError):
+            rt.uniform_slots(32 * 2**30, [2764808] * 48, 512, reserve=-1)
+        with self.assertRaises(ValueError):
+            rt.uniform_slots(10 * 2764808 * 48, [2764808] * 48, 512, reserve=10)
         h, c = tuple(range(258)) + (-1,) * 254, (-1,) * 258 + tuple(range(254))
         rt.validate_partition(h, c, 258, 254)
         self.assertEqual(size + 254 * 2764808 * 48, 67947921408)
@@ -108,6 +117,7 @@ class InvariantTests(unittest.TestCase):
             ("STATS_EVERY", "0"),
             ("TEMP_SLOTS", "0"),
             ("SPLIT", "single"),
+            ("STAGING", "2"),
         ):
             env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
@@ -125,6 +135,7 @@ class InvariantTests(unittest.TestCase):
             "STATS_EVERY": "1",
             "TEMP_SLOTS": "4",
             "SPLIT": "modular",
+            "STAGING": "0",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -134,9 +145,10 @@ class InvariantTests(unittest.TestCase):
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
         self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
-        self.assertEqual(settings.split, "modular")
+        self.assertEqual((settings.split, settings.staging), ("modular", False))
         with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
-            self.assertEqual(rt.Settings.from_env().split, "fused")
+            defaults = rt.Settings.from_env()
+        self.assertEqual((defaults.split, defaults.staging), ("fused", True))
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,
@@ -1024,6 +1036,63 @@ class TensorTests(unittest.TestCase):
             rt.Settings.from_env()
         with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
             self.assertEqual(rt.Settings.from_env().observer, "records")
+
+    def test_split_routes_batch_one_through_staging_and_one_chain(self):
+        from lab_expert_tier import staging as st
+
+        tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30)
+        tier.device = torch.device("cpu")
+        tier.num_experts, tier.hot_slots, tier.cold_slots = 4, 2, 2
+        tier.staging_slots = 2
+        tier.hot_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+        tier.cold_map = torch.tensor([-1, -1, 0, 1], dtype=torch.int32)
+        tier.bank = {"w13_weight": "bank13", "w2_weight": "bank2"}
+        tier.hot = {"w13_weight": "hot13", "w2_weight": "hot2"}
+        tier.cold = {"w13_weight": "cold13", "w2_weight": "cold2"}
+        tier.staging = {"w13_weight": "stage13", "w2_weight": "stage2"}
+        tier.bank_kernel = SimpleNamespace(fused_experts="bank-experts")
+        tier.hot_kernel = SimpleNamespace(fused_experts="hot-experts")
+        tier.cold_kernel = SimpleNamespace(fused_experts="cold-experts")
+        calls: list[Any] = []
+        planned = (torch.tensor([1, 0]), torch.tensor([0, 1, -1, 2]), torch.tensor(1))
+
+        def plan(ids, cold_map, hot_map, hot_slots, staging_slots):
+            calls.append(("plan", ids.tolist(), hot_slots, staging_slots))
+            self.assertIs(cold_map, tier.cold_map)
+            self.assertIs(hot_map, tier.hot_map)
+            return planned
+
+        def gather(source, staging, gather_index, count):
+            calls.append(("gather", source, staging, gather_index.tolist()))
+
+        def chains(x, weights, ids, partitions):
+            calls.append(("chains", partitions))
+            return "output"
+
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        ids = torch.tensor([[3, 0]])
+        with (
+            patch.object(st, "plan_staging", plan),
+            patch.object(st, "gather_staging", gather),
+            patch.object(tier, "_run_marlin_chains", chains),
+        ):
+            self.assertEqual(tier.split(x, weights, ids), "output")
+            # Two rows exceed the staging rows: the two-partition path runs.
+            tier.split(x.expand(2, -1), weights.expand(2, -1), ids.expand(2, -1))
+        self.assertEqual(calls[0], ("plan", [[3, 0]], 2, 2))
+        self.assertEqual(calls[1], ("gather", tier.cold, tier.staging, [1, 0]))
+        kind, partitions = calls[2]
+        self.assertEqual(kind, "chains")
+        self.assertEqual(len(partitions), 1)
+        experts, tensors, expert_map, slots = partitions[0]
+        self.assertEqual((experts, tensors, slots), ("bank-experts", tier.bank, 4))
+        self.assertIs(expert_map, planned[1])
+        kind, partitions = calls[3]
+        self.assertEqual(len(partitions), 2)
+        self.assertEqual(partitions[0][1], tier.hot)
+        self.assertEqual(partitions[1][1], tier.cold)
 
     def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
         rt.finish_model_forward(SimpleNamespace(), 8)

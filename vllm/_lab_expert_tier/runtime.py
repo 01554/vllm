@@ -83,6 +83,9 @@ class Settings:
     # "records": static routing records read back once per forward. Other
     # names resolve through OBSERVERS (device-side observers register there).
     observer: str = "records"
+    # Decode-time VRAM staging of the selected cold experts: top_k spare rows
+    # per layer at the end of the hot bank, charged to the capacity budget.
+    staging: bool = True
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -111,6 +114,7 @@ class Settings:
             "TEMP_SLOTS",
             "SPLIT",
             "OBSERVER",
+            "STAGING",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -124,8 +128,11 @@ class Settings:
             return None
         stats = int(os.environ.get(PREFIX + "STATS_EVERY", "256"))
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
-        if stats < 1 or verify not in ("0", "1"):
-            raise ValueError("STATS_EVERY must be positive; VERIFY_INIT must be 0 or 1")
+        staging = os.environ.get(PREFIX + "STAGING", "1")
+        if stats < 1 or verify not in ("0", "1") or staging not in ("0", "1"):
+            raise ValueError(
+                "STATS_EVERY must be positive; VERIFY_INIT and STAGING must be 0 or 1"
+            )
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
             raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
@@ -174,6 +181,7 @@ class Settings:
             integers["TEMP_SLOTS"],
             split,
             observer,
+            staging == "1",
         )
 
 
@@ -234,13 +242,16 @@ def validate_mapping(mapping, required, slots):
             raise AssertionError(f"Required expert {expert} has no GPU cache slot")
 
 
-def uniform_slots(capacity_bytes, rows, num_experts):
+def uniform_slots(capacity_bytes, rows, num_experts, reserve=0):
+    """Hot slots per layer; `reserve` staging rows per layer come first."""
     if not rows or len(set(rows)) != 1 or rows[0] <= 0:
         raise ValueError("Only uniform positive expert row sizes are supported")
-    slots = min(num_experts, capacity_bytes // sum(rows))
+    if reserve < 0:
+        raise ValueError("Staging reserve must be nonnegative")
+    slots = min(num_experts, capacity_bytes // sum(rows) - reserve)
     if slots < 1:
         raise ValueError("Capacity cannot hold one expert in every layer")
-    return slots, slots * sum(rows)
+    return slots, (slots + reserve) * sum(rows)
 
 
 def _check_kernel_scales(kernel, tensors):
@@ -382,13 +393,23 @@ class TierLayer:
             raise ValueError(
                 "First tier version requires nonempty hot and cold partitions"
             )
+        # Staging rows follow the hot rows in one bank so a single expert
+        # map can address both; they hold transient copies of selected cold
+        # experts during batch-1 decode and are outside the swap slot range.
+        self.staging_slots = method.moe.experts_per_token if settings.staging else 0
+        self.bank = {}
         self.hot = {}
+        self.staging = {}
         self.cold_cpu = {}
         # Slicing without an independent allocation would retain the full bank.
         for name, source in sources.items():
-            self.hot[name] = torch.empty(
-                (slots, *source.shape[1:]), dtype=source.dtype, device=self.device
+            self.bank[name] = torch.zeros(
+                (slots + self.staging_slots, *source.shape[1:]),
+                dtype=source.dtype,
+                device=self.device,
             )
+            self.hot[name] = self.bank[name][:slots]
+            self.staging[name] = self.bank[name][slots:]
             self.cold_cpu[name] = torch.empty(
                 (self.cold_slots, *source.shape[1:]),
                 dtype=source.dtype,
@@ -408,6 +429,11 @@ class TierLayer:
         self.publish_maps()
         self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
+        self.bank_kernel = self.bank_quant = None
+        if self.staging_slots:
+            self.bank_kernel, self.bank_quant = self.make_kernel(
+                self.bank, slots + self.staging_slots
+            )
         self.marlin_workspace = None
         if settings.split == "fused":
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -419,6 +445,7 @@ class TierLayer:
             self.marlin_workspace = marlin_make_workspace_new(self.device, 4)
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
+        self.staging_bytes = self.row_bytes * self.staging_slots
         self.cold_bytes = sum(
             t.numel() * t.element_size() for t in self.cold_cpu.values()
         )
@@ -490,6 +517,9 @@ class TierLayer:
         )
 
     def split(self, x, weights, ids):
+        staging = getattr(self, "staging_slots", 0)
+        if staging and x.shape[0] * ids.shape[1] <= staging:
+            return self.split_staged(x, weights, ids)
         if self.settings.split == "fused":
             return self.split_fused(x, weights, ids)
         # Marlin uses shared workspaces. Preserve the hot result before cold
@@ -500,6 +530,37 @@ class TierLayer:
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
+
+    def split_staged(self, x, weights, ids):
+        """Batch-1 decode: stage the selected cold experts, then one chain.
+
+        `plan_staging` and `gather_staging` are fixed-shape and never touch
+        the host, so this whole path captures into the decode graph. The
+        bank kernel covers hot rows plus staging rows through the step's
+        expert map; the cold RAM bank stays the owner and nothing is written
+        back.
+        """
+        from .staging import gather_staging, plan_staging
+
+        if self.bank_kernel is None:
+            raise RuntimeError("Staging requires the bank kernel")
+        gather, expert_map, count = plan_staging(
+            ids, self.cold_map, self.hot_map, self.hot_slots, self.staging_slots
+        )
+        gather_staging(self.cold, self.staging, gather, count)
+        return self._run_marlin_chains(
+            x,
+            weights,
+            ids,
+            (
+                (
+                    self.bank_kernel.fused_experts,
+                    self.bank,
+                    expert_map,
+                    self.hot_slots + self.staging_slots,
+                ),
+            ),
+        )
 
     def split_fused(self, x, weights, ids):
         """Both partitions into one per-slot row buffer, reduced once.
@@ -513,6 +574,18 @@ class TierLayer:
         GEMMs per partition. Numerics are checked against the source kernel
         by init verification.
         """
+        partitions = (
+            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
+            (
+                self.cold_kernel.fused_experts,
+                self.cold,
+                self.cold_map,
+                self.cold_slots,
+            ),
+        )
+        return self._run_marlin_chains(x, weights, ids, partitions)
+
+    def _run_marlin_chains(self, x, weights, ids, partitions):
         import torch
 
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
@@ -538,15 +611,6 @@ class TierLayer:
             ((rows_count, hidden), x.dtype),
         )
         rows.zero_()
-        partitions = (
-            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
-            (
-                self.cold_kernel.fused_experts,
-                self.cold,
-                self.cold_map,
-                self.cold_slots,
-            ),
-        )
         for experts, tensors, expert_map, slots in partitions:
             block = marlin_block_size(
                 tokens, top_k, slots, self.num_experts, experts.input_dtype
@@ -685,6 +749,27 @@ class TierLayer:
                     "mixed_padding_exact_zero": True,
                 }
             )
+        staged_checks = []
+        if self.staging_slots:
+            # Batch-1 rows take the staged path: hot only, cold only, mixed,
+            # and padding, each against the same source-kernel reference.
+            for row, label in enumerate(("hot", "cold", "mixed", "mixed_reversed")):
+                single = self.split(
+                    x[row : row + 1].clone(),
+                    weights[row : row + 1].clone(),
+                    ids[row : row + 1].clone(),
+                ).clone()
+                staged_checks.append(
+                    compare_outputs(
+                        single, reference[row : row + 1], self.name, "staged_" + label
+                    )
+                )
+            pad_ids = torch.full((1, k), -1, dtype=ids.dtype, device=self.device)
+            pad = self.split(x[:1].clone(), weights[:1].clone(), pad_ids).clone()
+            torch.testing.assert_close(
+                pad, torch.zeros_like(pad), rtol=0, atol=0, equal_nan=False
+            )
+            staged_checks.append({"stage": "staged_padding", "exact_zero": True})
         torch.cuda.current_stream(self.device).synchronize()
         LOGGER.warning(
             "LAB_EXPERT_TIER_VERIFY_INIT %s",
@@ -694,6 +779,7 @@ class TierLayer:
                     "layer_index": self.index,
                     "passed": True,
                     "stages": metrics,
+                    "staged_checks": staged_checks,
                     "input_nonzero": int(torch.count_nonzero(x).item()),
                     "input_tokens": 4,
                     "shared_experts_reexecuted": False,
@@ -876,7 +962,10 @@ class RecordObserver:
 
 
 # name -> class or "module:Class"; device observers register here.
-OBSERVERS: dict[str, Any] = {"records": RecordObserver}
+OBSERVERS: dict[str, Any] = {
+    "records": RecordObserver,
+    "device": "vllm._lab_expert_tier.heat_device:DeviceObserver",
+}
 
 
 def make_observer(name):
@@ -1529,7 +1618,10 @@ def initialize_model(model, model_config):
         raise NotImplementedError(
             f"Expected all 48 FlashNext MoE layers, found {len(candidates)}"
         )
-    slots, expected_bytes = uniform_slots(settings.capacity_bytes, row_sizes, 512)
+    staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
+    slots, expected_bytes = uniform_slots(
+        settings.capacity_bytes, row_sizes, 512, reserve=staging_rows
+    )
     if not 0 < slots < 512:
         raise ValueError("Expert tier requires both a hot and cold partition")
     first = candidates[0][1]
@@ -1580,7 +1672,7 @@ def initialize_model(model, model_config):
     model._lab_expert_tier_coordinator = coordinator
     atexit.register(coordinator.report)
     atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
-    actual_bytes = sum(t.hot_bytes for t in tiers)
+    actual_bytes = sum(t.hot_bytes + t.staging_bytes for t in tiers)
     if actual_bytes != expected_bytes or actual_bytes > settings.capacity_bytes:
         raise AssertionError("Tier exceeds exact six-tensor GPU budget")
     LOGGER.warning(
@@ -1593,6 +1685,8 @@ def initialize_model(model, model_config):
                 "cold_slots_per_layer": 512 - slots,
                 "capacity_bytes": settings.capacity_bytes,
                 "gpu_weight_bytes": actual_bytes,
+                "staging_slots_per_layer": staging_rows,
+                "staging_bytes": sum(t.staging_bytes for t in tiers),
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
