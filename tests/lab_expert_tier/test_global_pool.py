@@ -161,6 +161,27 @@ class GlobalPoolTests(unittest.TestCase):
         self.assertEqual(b.step_map.tolist(), [0, 1, 2, -1])
         pool.snapshot()
 
+    def test_every_current_route_is_protected_when_the_pool_is_saturated(self):
+        """All residents are this step's hits and one more expert misses:
+        no victim may be a current route, so the miss is staged only, and
+        a promotion in the same step is never re-evicted by a later miss."""
+        pool, sources, buffers = self.setup(layers=1, experts=8, slots=(3,), staging=4)
+        gp.set_gate(pool.tables, True)
+        b = self.run_step(pool, sources, buffers, 0, [0, 1, 2, 5])
+        self.assertEqual(int(b.promoted_count[0]), 0)
+        self.assertEqual(int(b.staged_count[0]), 1)
+        self.assertEqual(pool.tables.hot_phys.tolist()[:3], [0, 1, 2])
+        self.assertEqual(b.routes.tolist(), [0, 1, 2, 3])
+        # Two misses against one stale row: the first takes it, the second
+        # cannot take it back and is staged.
+        self.run_step(pool, sources, buffers, 0, [0, 1, -1, -1])
+        b = self.run_step(pool, sources, buffers, 0, [0, 5, 6, 1])
+        self.assertEqual(int(b.promoted_count[0]), 1)
+        self.assertEqual(int(b.staged_count[0]), 1)
+        self.assertEqual(pool.tables.hot_phys.tolist()[5], 2)
+        self.assertEqual(b.routes.tolist(), [0, 2, 3, 1])
+        pool.snapshot()
+
     def test_invalid_ids_set_the_sticky_error(self):
         pool, sources, buffers = self.setup()
         self.run_step(pool, sources, buffers, 0, [9, 0])

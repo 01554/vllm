@@ -403,8 +403,10 @@ def _step_kernel():
         offs_r = tl.arange(0, BLOCK_R)
         in_pool = offs_r < pool_rows
         use = tl.load(row_use_ptr + offs_r, mask=in_pool, other=never)
+        # Extract lane i's hit row (or -1): the other lanes contribute 0.
+        hit_rows = tl.where(hit, resident, -1)
         for i in range(0, WIDTH):
-            hit_row = tl.sum(tl.where(lane == i, tl.where(hit, resident, -1), -1), 0)
+            hit_row = tl.sum(tl.where(lane == i, hit_rows, 0), 0)
             use = tl.where(offs_r.to(tl.int64) == hit_row, never, use)
         promoted = 0
         staged = 0
