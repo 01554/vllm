@@ -198,3 +198,50 @@ class PromoteReferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def smoke_sequence():
+    """Fixed batch-1 routing steps for a 24-expert layer, 12 hot, top-k 10,
+    8 free VRAM rows, 8 pool rows. Reused by the GPU smoke: step 1 promotes 8
+    and stages 2; step 2 promotes 8 more whose victims include experts
+    promoted in step 1, so most evictions reclaim intact shadows without a
+    copy; steps 3-5 churn the pool so shadows get invalidated and later
+    re-misses copy again."""
+    import torch
+
+    return [
+        torch.tensor([[12, 13, 14, 15, 16, 17, 18, 19, 20, 21]]),
+        torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]),
+        torch.tensor([[20, 21, 22, 23, 10, 11, 18, 19, 8, 9]]),
+        torch.tensor([[12, 13, 14, 15, 16, 17, 0, 1, 2, 3]]),
+        torch.tensor([[4, 5, 6, 7, 20, 21, 22, 23, 10, 11]]),
+    ]
+
+
+@unittest.skipIf(torch is None, "CPU torch is not installed")
+class PromoteSmokeSequenceTests(PromoteReferenceTests):
+    def test_smoke_sequence_reference_covers_promote_stage_reclaim_and_churn(self):
+        tables, bank, ram, staging_rows = self.setup(
+            experts=24, hot=12, vram_free=8, ram_free=8, staging=10
+        )
+        expected_counts = []
+        for ids in smoke_sequence():
+            plan, gathers, staged, evicts, step_map = self.run_step(
+                tables, bank, ram, staging_rows, ids
+            )
+            expected_counts.append(
+                (int(plan.count[0]), int(plan.staged_only_count[0]), len(evicts))
+            )
+            pm.check_tables(tables, 12, 12)
+            self.assert_rows_hold_experts(tables, bank, ram)
+            # Every selected expert is served: hot after the flip or staged.
+            for expert in {int(e) for e in ids.reshape(-1).tolist()}:
+                self.assertGreaterEqual(int(step_map[expert]), 0)
+        # Step 1: 8 promoted, 2 staged, 8 victims written. Step 2: 8 promoted
+        # again; six of the victims are step-1 promotions whose shadows are
+        # intact, so only two D2H copies. Churn afterwards invalidates
+        # shadows, so a later step copies again.
+        self.assertEqual(expected_counts[0], (8, 2, 8))
+        self.assertEqual(expected_counts[1][:2], (8, 0))
+        self.assertLess(expected_counts[1][2], 8)
+        self.assertTrue(any(evicts > 0 for _, _, evicts in expected_counts[2:]))

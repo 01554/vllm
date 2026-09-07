@@ -221,6 +221,16 @@ def apply_step_reference(tables, plan, staging_rows):
     evicts: list[tuple[int, int]] = []  # (vram row, ram row)
     if count > len(vram_free):
         raise RuntimeError("Promotion exceeds the free VRAM ring")
+    # Pass 1: victims whose shadow is intact reclaim their pool position
+    # first, so a later victim's write never invalidates a reclaimable one.
+    positions = [-1] * count
+    taken: set[int] = set()
+    for i in range(count):
+        victim = int(plan.victim_expert[i])
+        for j, row in enumerate(ram_free):
+            if j not in taken and shadow[row] == victim:
+                positions[i], taken = j, taken | {j}
+                break
     for i in range(count):
         expert = int(plan.promote_expert[i])
         victim = int(plan.victim_expert[i])
@@ -233,12 +243,14 @@ def apply_step_reference(tables, plan, staging_rows):
         vram_free[vram_head] = victim_row
         vram_head = (vram_head + 1) % len(vram_free)
         gathers.append((src_ram, dst_vram))
-        # RAM: reclaim the victim's intact shadow, else write the pool head.
-        position = next(
-            (j for j, row in enumerate(ram_free) if shadow[row] == victim), -1
-        )
+        # RAM: pass 2 writes the round-robin head, skipping reclaimed
+        # positions, after invalidating that row's old shadow.
+        position = positions[i]
         if position < 0:
+            while ram_head in taken:
+                ram_head = (ram_head + 1) % len(ram_free)
             position = ram_head
+            taken.add(position)
             ram_head = (ram_head + 1) % len(ram_free)
             dst_ram = ram_free[position]
             shadow[dst_ram] = victim
@@ -354,6 +366,7 @@ class StepBuffers:
     evict_src: Any  # [S] int32 VRAM rows
     evict_dst: Any  # [S] int32 RAM rows
     evict_count: Any  # [1] int32
+    evict_pos: Any  # [S] int32 flip scratch: reclaimed pool position or -1
     step_map: Any  # [E] int32 physical expert map for this step
 
 
@@ -370,6 +383,7 @@ def allocate_step_buffers(device, num_experts, width):
         evict_src=ints(width),
         evict_dst=ints(width),
         evict_count=ints(1),
+        evict_pos=ints(width),
         step_map=torch.full((num_experts,), -1, dtype=torch.int32, device=device),
     )
 
@@ -424,6 +438,7 @@ def flip_step(tables, plan, buffers, staging_rows):
         buffers.evict_src,
         buffers.evict_dst,
         buffers.evict_count,
+        buffers.evict_pos,
         buffers.step_map,
         tables.hot_map.shape[0],
         tables.vram_free.shape[0],
@@ -500,6 +515,7 @@ def _flip_kernel():
         evict_src_ptr,
         evict_dst_ptr,
         evict_count_ptr,
+        evict_pos_ptr,
         step_map_ptr,
         num_experts,
         vram_ring,
@@ -512,6 +528,23 @@ def _flip_kernel():
         vram_head = tl.load(ring_state_ptr)
         ram_head = tl.load(ring_state_ptr + 1)
         evicts = 0
+        # Pass 1: record, per promotion lane, the pool position whose shadow
+        # is the victim (or -1); a position claimed by one lane is not
+        # matched again by another.
+        for i in range(0, count):
+            victim = tl.load(victim_expert_ptr + i)
+            position = -1
+            for j in range(0, ram_pool):
+                row = tl.load(ram_free_ptr + j)
+                owner = tl.load(ram_shadow_ptr + row)
+                claimed = 0
+                for k in range(0, i):
+                    if tl.load(evict_pos_ptr + k) == j:
+                        claimed = 1
+                if (owner == victim) & (position < 0) & (claimed == 0):
+                    position = j
+            tl.store(evict_pos_ptr + i, position)
+        tl.debug_barrier()
         for i in range(0, count):
             expert = tl.load(promote_expert_ptr + i)
             victim = tl.load(victim_expert_ptr + i)
@@ -524,16 +557,20 @@ def _flip_kernel():
             vram_head = (vram_head + 1) % vram_ring
             tl.store(gather_src_ptr + i, src_ram)
             tl.store(gather_dst_ptr + i, dst_vram)
-            # Reclaim the victim's intact shadow from the pool, else write
-            # the round-robin head after invalidating its old shadow.
-            position = -1
-            for j in range(0, ram_pool):
-                row = tl.load(ram_free_ptr + j)
-                owner = tl.load(ram_shadow_ptr + row)
-                if (owner == victim) & (position < 0):
-                    position = j
+            position = tl.load(evict_pos_ptr + i)
             if position < 0:
+                # Round-robin head, skipping positions reclaimed in pass 1
+                # or already handed out this step.
+                claimed = 1
+                while claimed == 1:
+                    claimed = 0
+                    for k in range(0, count):
+                        if tl.load(evict_pos_ptr + k) == ram_head:
+                            claimed = 1
+                    if claimed == 1:
+                        ram_head = (ram_head + 1) % ram_pool
                 position = ram_head
+                tl.store(evict_pos_ptr + i, position)
                 ram_head = (ram_head + 1) % ram_pool
                 dst_ram = tl.load(ram_free_ptr + position)
                 tl.store(ram_shadow_ptr + dst_ram, victim)
