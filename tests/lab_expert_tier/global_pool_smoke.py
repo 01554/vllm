@@ -15,9 +15,9 @@ from pathlib import Path
 import torch
 
 
-def load_pool():
+def load_pool(repo):
     # Isolated package permits CPU reference validation without a built vLLM.
-    path = Path(__file__).resolve().parents[2] / "vllm" / "_lab_expert_tier"
+    path = repo / "vllm" / "_lab_expert_tier"
     spec = importlib.util.spec_from_file_location(
         "pool_smoke_lab", path / "__init__.py", submodule_search_locations=[str(path)]
     )
@@ -174,8 +174,11 @@ def run_case(gp, graph_mode, cpu_only):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parents[2]
+    )
     args = parser.parse_args()
-    module = load_pool()
+    module = load_pool(args.repo)
     if args.cpu_only:
         run_case(module, False, True)
     else:
