@@ -261,3 +261,60 @@ class PromoteSmokeSequenceTests(PromoteReferenceTests):
         self.assertEqual(expected_counts[1][:2], (8, 0))
         self.assertLess(expected_counts[1][2], 8)
         self.assertTrue(any(evicts > 0 for _, _, evicts in expected_counts[2:]))
+
+
+@unittest.skipIf(torch is None, "CPU torch is not installed")
+class DevicePlannerIntegrationTests(PromoteReferenceTests):
+    """The real planner module drives the flip and copies on CPU tables."""
+
+    def test_device_lru_plan_matches_reference_over_the_smoke_sequence(self):
+        from lab_expert_tier import device_lru
+
+        tables, bank, ram, staging_rows = self.setup(
+            experts=24, hot=12, vram_free=8, ram_free=8, staging=10
+        )
+        mirror, mbank, mram, mrows = self.setup(
+            experts=24, hot=12, vram_free=8, ram_free=8, staging=10
+        )
+        state = device_lru.allocate_state(tables, 10)
+        self.assertIs(tables.lru_state, state)
+        # Gate closed: no promotion, every miss staged, recency untouched.
+        plan = device_lru.plan_step(smoke_sequence()[0], tables, 10)
+        self.assertEqual(int(plan.count[0]), 0)
+        self.assertEqual(int(plan.staged_only_count[0]), 10)
+        self.assertEqual(int(tables.clock[0]), 0)
+        device_lru.open_gate(state)
+        for ids in smoke_sequence():
+            plan = device_lru.plan_step(ids, tables, 10)
+            gathers, staged, evicts, step_map = pm.apply_step_reference(
+                tables, plan, staging_rows
+            )
+            pm.copy_rows_reference(ram, bank, gathers + staged)
+            pm.copy_rows_reference(bank, ram, evicts)
+            reference = self.run_step(mirror, mbank, mram, mrows, ids)
+            ref_plan = reference[0]
+            for field in (
+                "promote_expert",
+                "promote_cold_slot",
+                "victim_expert",
+                "victim_hot_slot",
+                "staged_only_expert",
+                "staged_only_cold_slot",
+            ):
+                n = int(plan.count[0])
+                if field.startswith("staged"):
+                    n = int(plan.staged_only_count[0])
+                self.assertEqual(
+                    getattr(plan, field)[:n].tolist(),
+                    getattr(ref_plan, field)[:n].tolist(),
+                    field,
+                )
+            self.assertEqual(int(plan.count[0]), int(ref_plan.count[0]))
+            self.assertEqual(
+                int(plan.staged_only_count[0]), int(ref_plan.staged_only_count[0])
+            )
+            pm.check_tables(tables, 12, 12)
+            self.assert_rows_hold_experts(tables, bank, ram)
+            self.assertEqual(tables.hot_map.tolist(), mirror.hot_map.tolist())
+            self.assertEqual(tables.last_use.tolist(), mirror.last_use.tolist())
+        self.assertEqual(int(tables.error[0]), 0)
