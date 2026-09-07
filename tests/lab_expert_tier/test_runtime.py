@@ -1178,8 +1178,14 @@ class TensorTests(unittest.TestCase):
         self.assertTrue(coordinator.poisoned)
         coordinator.poisoned = False
         imported: list[Any] = []
-        coordinator.policy.import_snapshot = imported.append
-        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 2, 2, 1, 4)]
+
+        def import_snapshot(snapshot):
+            imported.append(snapshot)
+            coordinator.policy.tokens_total = snapshot.tokens
+
+        coordinator.policy.import_snapshot = import_snapshot
+        # Cumulative totals: 3 tokens so far (1 legacy + 2 new), 2 forwards.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 3, 2, 1, 4)]
         coordinator.finish_forward(1, 1)
         self.assertEqual(len(imported), 1)
         self.assertEqual(coordinator.stats["device_snapshots"], 1)
@@ -1193,15 +1199,25 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(coordinator.stats["snapshot_forwards"], 2)
         # flush collects a pending snapshot without counting a forward and,
         # by default, without planning.
-        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+        # A second cumulative snapshot adds only its increments.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 3, 1, 6)]
         with patch.object(coordinator, "_plan_and_migrate") as planner:
             coordinator.flush()
             planner.assert_not_called()
-            observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+            observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 3, 1, 6)]
             coordinator.flush(plan=True)
             planner.assert_called_once_with()
         self.assertEqual(len(imported), 3)
         self.assertEqual(coordinator.stats["model_forwards"], 5)
+        self.assertEqual(coordinator.stats["model_tokens"], 4)
+        self.assertEqual(coordinator.stats["snapshot_forwards"], 3)
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (1, 10)
+        )
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 2, 1, 6)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
         observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2, False)]
         with self.assertRaises(RuntimeError):
             coordinator.finish_forward(1, 1)
@@ -1216,7 +1232,12 @@ class TensorTests(unittest.TestCase):
         # Foreign result objects are recognized by shape: a device module's
         # own snapshot/deferred classes never import this module.
         foreign = SimpleNamespace(
-            heat=[[0.0] * 4] * 2, tokens=1, forwards=1, route_total=2, error=False
+            heat=[[0.0] * 4] * 2,
+            tokens=5,
+            forwards=1,
+            route_total=2,
+            error=False,
+            session_id="other",
         )
         observer.results = [foreign, SimpleNamespace(forwards=3)]
         coordinator.finish_forward(1, 1)

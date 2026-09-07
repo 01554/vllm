@@ -872,9 +872,12 @@ class DeviceSnapshot:
 
     `heat` is a host float64 [layers, experts] array that the policy imports
     verbatim (integer counts were accumulated per forward, decayed, then
-    added once, in the policy's order). The deltas cover every forward since
-    the previous snapshot. Observers must not advance device state while
-    heat is disabled, so a snapshot may only arrive with heat enabled.
+    added once, in the policy's order). `tokens`, `forwards`, `route_hot`,
+    and `route_total` are cumulative device totals; the coordinator turns
+    them into deltas against the previous snapshot it consumed and derives
+    the token delta from the policy's own total. Observers must not advance
+    device state while heat is disabled, so a snapshot may only arrive with
+    heat enabled.
     """
 
     heat: Any
@@ -1012,6 +1015,9 @@ class TierCoordinator:
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
         self.forward_rows: int | None = None  # recorded, not yet finished
+        # Cumulative totals of the last consumed device snapshot, per session.
+        self.snapshot_totals: dict[str, int] = {}
+        self.snapshot_session: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
@@ -1233,16 +1239,27 @@ class TierCoordinator:
             importer = getattr(self.policy, "import_snapshot", None)
             if importer is None:
                 raise NotImplementedError("Policy cannot import device snapshots")
+            tokens_before = self.policy.tokens_total
             started = time.perf_counter()
             importer(result)
             acknowledge = getattr(self.observer, "acknowledge_snapshot", None)
             if acknowledge is not None:
                 acknowledge(result)
             self.stats["policy_observe_seconds"] += time.perf_counter() - started
-            self.stats["route_hot"] += getattr(result, "route_hot", 0)
-            self.stats["route_total"] += getattr(result, "route_total", 0)
-            self.stats["model_tokens"] += result.tokens
-            self.stats["snapshot_forwards"] += result.forwards
+            # Snapshot totals are cumulative per device session; account the
+            # increments only, and tokens from the policy's own total.
+            session = getattr(result, "session_id", None)
+            if session != self.snapshot_session:
+                self.snapshot_session, self.snapshot_totals = session, {}
+            for key in ("forwards", "route_hot", "route_total"):
+                total = getattr(result, key, 0)
+                delta = total - self.snapshot_totals.get(key, 0)
+                if delta < 0:
+                    raise RuntimeError(f"Device snapshot {key} went backwards")
+                self.snapshot_totals[key] = total
+                stat = "snapshot_forwards" if key == "forwards" else key
+                self.stats[stat] += delta
+            self.stats["model_tokens"] += self.policy.tokens_total - tokens_before
             self.stats["device_snapshots"] += 1
             if plan:
                 self._plan_and_migrate()
@@ -1702,7 +1719,7 @@ def initialize_model(model, model_config):
         make_observer(
             settings.observer,
             num_layers=len(tiers),
-            num_experts=512,
+            num_experts=tiers[0].num_experts,
             decay=settings.decay,
             sync_period=settings.sync_tokens,
             session_id=os.getpid(),
