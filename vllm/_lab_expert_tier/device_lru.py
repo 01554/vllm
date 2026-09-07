@@ -490,6 +490,9 @@ def _plan_kernel():
         # both ordering fields separately so arbitrary logical slot
         # values cannot collide in a packed key.
         key_max = 0x7FFFFFFFFFFFFFFF
+        # The initialization stores above and each iteration's scalar stores
+        # are re-read as a vector on the next iteration.
+        tl.debug_barrier()
         for i in range(WIDTH):
             active = i < limit
             best_use = tl.full((), key_max, tl.int64)
@@ -553,6 +556,7 @@ def _plan_kernel():
             valid_victim = active & (best_expert >= 0)
             tl.store(victim_expert_ptr + i, best_expert, mask=valid_victim)
             tl.store(victim_hot_ptr + i, best_hot, mask=valid_victim)
+            tl.debug_barrier()
 
         tl.debug_barrier()
         staged_total = miss_total - limit
@@ -572,6 +576,9 @@ def _plan_kernel():
             mask=staged_mask,
             other=0,
         )
+        # The shifted loads above alias the promotion buffers that are
+        # overwritten below; make all loads visible before those stores.
+        tl.debug_barrier()
         promote_mask = output_lane < limit
         tl.store(
             promote_expert_ptr + output_lane,
