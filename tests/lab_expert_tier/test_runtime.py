@@ -1562,6 +1562,34 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(layer.hot_map_host, (-1, 1, -1, -1, 0, -1))
         self.assertEqual(layer.hot_rows, [4, 1])
 
+    def test_promote_host_swap_while_gated_reaches_the_device_tables(self):
+        """Init verification's forced swap must be visible to the kernels."""
+        layer = self.make_promote_layer()
+        temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
+        # Exchange expert 0 (hot slot 0) with expert 2 (cold slot 0).
+        layer.swap(0, 2, 0, 0, temp)
+        tables = layer.promote_tables
+        self.assertEqual(tables.hot_map.tolist(), [-1, 1, 0, -1, -1, -1])
+        self.assertEqual(tables.cold_map.tolist(), [0, -1, -1, 1, 2, 3])
+        self.assertEqual(layer.hot_map.tolist(), [-1, 1, 0, -1, -1, -1])
+        self.assertEqual(layer.cold_map.tolist(), [0, -1, -1, 1, 2, 3])
+        self.assertEqual(int(tables.ram_shadow[0]), 0)
+        # Bank row 0 now holds expert 2 and RAM row 0 holds expert 0.
+        self.assertEqual(int(layer.bank[rt.TENSORS[0]][0][0]), 20)
+        self.assertEqual(int(layer.cold_cpu[rt.TENSORS[0]][0][0]), 0)
+        from lab_expert_tier import promote as pm
+
+        pm.check_tables(tables, 2, 4)
+        # Restoring works the same way and the tables follow.
+        layer.swap(2, 0, 0, 0, temp)
+        self.assertEqual(tables.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+        pm.check_tables(tables, 2, 4)
+        # Once the gate is open the host no longer overwrites the device.
+        layer.set_promote_gate(True)
+        layer.hot_map_host = (1, 0, -1, -1, -1, -1)
+        layer.publish_maps()
+        self.assertEqual(tables.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+
     def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
         settings = rt.Settings(
             32 * 2**30, sync_tokens=1, staging=True, promote=True, planner="reference"

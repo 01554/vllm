@@ -624,10 +624,35 @@ class TierLayer:
         )
         tables = getattr(self, "promote_tables", None)
         if tables is not None:
-            # Promote mode: the device tables are the truth. The kernel maps
-            # alias the physical maps; host maps are refreshed by snapshots.
+            # Promote mode: the kernel maps alias the device physical maps.
+            # While the gate is closed (init, verification) the host maps are
+            # authoritative and exchanges made on the host (verify's forced
+            # swap) are pushed into the tables; once the gate is open the
+            # device is the truth and the host only reads snapshots.
             if self.hot_map is None or self.cold_map is None:
                 self.hot_map, self.cold_map = tables.hot_phys, tables.cold_phys
+            if not getattr(self, "promote_gate", False):
+                hot_rows: Any = self.hot_rows
+                cold_rows: Any = self.cold_rows
+                hot_logical = torch.tensor(self.hot_map_host, dtype=torch.int32)
+                cold_logical = torch.tensor(self.cold_map_host, dtype=torch.int32)
+                hot_physical = torch.tensor(
+                    [hot_rows[v] if v >= 0 else -1 for v in self.hot_map_host],
+                    dtype=torch.int32,
+                )
+                cold_physical = torch.tensor(
+                    [cold_rows[v] if v >= 0 else -1 for v in self.cold_map_host],
+                    dtype=torch.int32,
+                )
+                tables.hot_map.copy_(hot_logical)
+                tables.cold_map.copy_(cold_logical)
+                tables.hot_phys.copy_(hot_physical)
+                tables.cold_phys.copy_(cold_physical)
+                shadow = tables.ram_shadow.tolist()
+                for expert, slot in enumerate(self.cold_map_host):
+                    if slot >= 0:
+                        shadow[cold_rows[slot]] = expert
+                tables.ram_shadow.copy_(torch.tensor(shadow, dtype=torch.int32))
             return
         # Pageable staging: the runtime finishes reading it before returning,
         # so no pinned host buffer can be overwritten during DMA. Device maps
