@@ -132,6 +132,16 @@ boundaries:
   sequential order the policy assumes. The pinned TEMP pool holds
   `VLLM_LAB_EXPERT_TIER_TEMP_SLOTS` rows (default 8), which also caps the
   wave size. `migration_waves` and `max_wave_swaps` are reported.
+- **One reduction per layer.** With `VLLM_LAB_EXPERT_TIER_SPLIT=fused`
+  (default) each MoE layer runs the hot and the cold Marlin GEMM chains
+  directly into disjoint rows of one shared `[tokens*k, hidden]` workspace
+  buffer and reduces it once. Every routing slot belongs to exactly one
+  partition, and padding slots stay at the zero fill. This removes both
+  output allocations, both masked reductions, the hot clone, the add, and
+  the modular-kernel prepare/finalize wrappers per layer; one block
+  alignment and two GEMMs per partition remain. `SPLIT=modular` restores the
+  two stock modular kernel calls. Init verification compares either path
+  against the source kernel.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.

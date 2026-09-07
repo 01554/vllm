@@ -56,6 +56,7 @@ SCALE_PROPERTIES = {
     "g2_alphas": "w2_weight_scale_2",
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
+SPLIT_MODES = ("fused", "modular")
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -75,6 +76,10 @@ class Settings:
     # Pinned RAM TEMP rows: the largest wave of slot-independent swaps that
     # one resync moves with two stream waits instead of two per swap.
     temp_slots: int = 8
+    # "fused": both partitions' Marlin GEMM chains write disjoint rows of one
+    # per-slot buffer that is reduced once. "modular": two stock modular
+    # kernel calls, clone, and add (the original path, kept for fallback).
+    split: str = "fused"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -101,6 +106,7 @@ class Settings:
             "DWELL_TOKENS",
             "MAX_SWAPS_PER_RESYNC",
             "TEMP_SLOTS",
+            "SPLIT",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -116,6 +122,9 @@ class Settings:
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
         if stats < 1 or verify not in ("0", "1"):
             raise ValueError("STATS_EVERY must be positive; VERIFY_INIT must be 0 or 1")
+        split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
+        if split not in SPLIT_MODES:
+            raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
         integers = {
             key: int(os.environ.get(PREFIX + key, default))
             for key, default in (
@@ -156,6 +165,7 @@ class Settings:
             integers["DWELL_TOKENS"],
             integers["MAX_SWAPS_PER_RESYNC"],
             integers["TEMP_SLOTS"],
+            split,
         )
 
 
@@ -353,6 +363,18 @@ def temporary_row(temporary, index):
     return {name: tensor[index] for name, tensor in temporary.items()}
 
 
+def marlin_block_size(tokens, top_k, local_experts, global_experts, input_dtype):
+    """The stock fused_marlin_moe M-block choice for one expert partition."""
+    estimated = math.ceil(tokens * local_experts / global_experts)
+    block = 8
+    for block in (8, 16, 32, 48, 64):
+        if estimated * top_k / local_experts / block < 0.9:
+            break
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block = max(block, 16)
+    return block
+
+
 def replace_full_source_references(layer, method, hot, hot_kernel, hot_quant):
     """Remove raw-bank roots in both Parameters and quant/kernel objects.
 
@@ -407,6 +429,15 @@ class TierLayer:
         self.publish_maps()
         self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
+        self.marlin_workspace = None
+        if settings.split == "fused":
+            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                marlin_make_workspace_new,
+            )
+
+            # One lock workspace per layer for the whole process, like the
+            # dense Marlin linear path; captured graphs keep its address.
+            self.marlin_workspace = marlin_make_workspace_new(self.device, 4)
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
         self.cold_bytes = sum(
@@ -480,6 +511,8 @@ class TierLayer:
         )
 
     def split(self, x, weights, ids):
+        if self.settings.split == "fused":
+            return self.split_fused(x, weights, ids)
         # Marlin uses shared workspaces. Preserve the hot result before cold
         # runs, and keep the two calls on one stream. Neither prepare mutates x
         # on this verified BF16 NoDPEP path (router-on-input is rejected).
@@ -488,6 +521,100 @@ class TierLayer:
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
+
+    def split_fused(self, x, weights, ids):
+        """Both partitions into one per-slot row buffer, reduced once.
+
+        Every (token, k) slot belongs to exactly one partition, so the hot and
+        cold Marlin chains write disjoint rows of the same [tokens*k, hidden]
+        buffer; padding slots belong to neither and stay at the zero fill.
+        Compared with two modular kernel calls this removes both output
+        allocations, both masked reductions, the hot clone, the add, and the
+        prepare/finalize wrappers, while keeping one block alignment and two
+        GEMMs per partition. Numerics are checked against the source kernel
+        by init verification.
+        """
+        import torch
+
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            _fused_marlin_moe,
+            marlin_moe_intermediate_size,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        from vllm.scalar_type import ScalarType
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        tokens, hidden = x.shape
+        top_k = ids.shape[1]
+        rows_count = tokens * top_k
+        inner = marlin_moe_intermediate_size(
+            self.hot["w13_weight"], self.hot["w2_weight"]
+        )
+        # Same manager as the stock kernels: stable addresses once locked.
+        cache13, cache2, rows = current_workspace_manager().get_simultaneous(
+            ((rows_count * max(2 * inner, hidden),), x.dtype),
+            ((rows_count, inner), x.dtype),
+            ((rows_count, hidden), x.dtype),
+        )
+        rows.zero_()
+        partitions = (
+            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
+            (
+                self.cold_kernel.fused_experts,
+                self.cold,
+                self.cold_map,
+                self.cold_slots,
+            ),
+        )
+        for experts, tensors, expert_map, slots in partitions:
+            block = marlin_block_size(
+                tokens, top_k, slots, self.num_experts, experts.input_dtype
+            )
+            sorted_ids, expert_ids, post_padded = moe_align_block_size(
+                ids, block, self.num_experts, expert_map, ignore_invalid_experts=True
+            )
+            _fused_marlin_moe(
+                hidden_states=x,
+                w1=tensors["w13_weight"],
+                w2=tensors["w2_weight"],
+                bias1=experts.w1_bias,
+                bias2=experts.w2_bias,
+                w1_scale=experts.w1_scale,
+                w2_scale=experts.w2_scale,
+                topk_weights=weights,
+                num_topk=top_k,
+                quant_type=ScalarType.from_id(experts.quant_type_id),
+                apply_router_weight_on_input=False,
+                expert_map=expert_map,
+                block_size_m=block,
+                sorted_token_ids=sorted_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=post_padded,
+                activation=self.layer.activation,
+                activation_func=experts.activation,
+                topk_ids=ids,
+                input_global_scale1=experts.a1_gscale,
+                input_global_scale2=experts.a2_gscale,
+                global_scale1=experts.g1_alphas,
+                global_scale2=experts.g2_alphas,
+                g_idx1=experts.w13_g_idx,
+                g_idx2=experts.w2_g_idx,
+                sort_indices1=experts.w13_g_idx_sort_indices,
+                sort_indices2=experts.w2_g_idx_sort_indices,
+                w1_zeros=experts.w1_zp,
+                w2_zeros=experts.w2_zp,
+                workspace=self.marlin_workspace,
+                intermediate_cache13=cache13,
+                intermediate_cache2=cache2,
+                output=rows,
+                input_dtype=experts.input_dtype,
+                is_k_full=experts.is_k_full,
+                activation_config=experts.activation_config,
+            )
+        # Rows already carry the router weights (second GEMM multiplies them).
+        return torch.sum(rows.view(tokens, top_k, hidden), dim=1)
 
     def stage_swap(self, old_expert, new_expert, hot_slot, cold_slot):
         """Validate against the current placement and advance the host maps.
@@ -1298,6 +1425,7 @@ def initialize_model(model, model_config):
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
                 "temporary_rows": settings.temp_slots,
+                "split": settings.split,
                 "host_source_bytes": sum(row_sizes) * 512,
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,

@@ -5,6 +5,7 @@
 import gc
 import importlib.util
 import json
+import math
 import os
 import sys
 import unittest
@@ -95,6 +96,7 @@ class InvariantTests(unittest.TestCase):
             ("VERIFY_INIT", "2"),
             ("STATS_EVERY", "0"),
             ("TEMP_SLOTS", "0"),
+            ("SPLIT", "single"),
         ):
             env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
@@ -111,6 +113,7 @@ class InvariantTests(unittest.TestCase):
             "MAX_SWAPS_PER_RESYNC": "3",
             "STATS_EVERY": "1",
             "TEMP_SLOTS": "4",
+            "SPLIT": "modular",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -120,6 +123,9 @@ class InvariantTests(unittest.TestCase):
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
         self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
+        self.assertEqual(settings.split, "modular")
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().split, "fused")
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,
@@ -389,6 +395,7 @@ class TensorTests(unittest.TestCase):
 
     def test_split_preserves_hot_output_across_workspace_reuse(self):
         tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30, split="modular")
         tier.hot_kernel, tier.cold_kernel = "hot", "cold"
         tier.hot, tier.cold, tier.hot_map, tier.cold_map = {}, {}, object(), object()
         workspace = torch.empty(2, 3, dtype=torch.bfloat16)
@@ -858,6 +865,138 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(waved[0].hot_map_host, (1, -1, -1, 0, -1))
         with self.assertRaises(AssertionError):
             coordinator.migrate((Swap(0, 0, 0, 0, 2),))
+
+    def test_marlin_block_size_matches_stock_selection(self):
+        def stock(tokens, top_k, local, global_, input_dtype):
+            m = math.ceil(tokens * local / global_)
+            for block in (8, 16, 32, 48, 64):
+                if m * top_k / local / block < 0.9:
+                    break
+            if input_dtype is not None and input_dtype.itemsize == 1:
+                block = max(block, 16)
+            return block
+
+        for tokens in (1, 2, 7, 64, 512):
+            for top_k in (1, 4, 10):
+                for local in (1, 3, 258, 254):
+                    for dtype in (None, torch.int8, torch.float8_e4m3fn):
+                        self.assertEqual(
+                            rt.marlin_block_size(tokens, top_k, local, 512, dtype),
+                            stock(tokens, top_k, local, 512, dtype),
+                        )
+
+    def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
+        tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30)
+        tier.device = torch.device("cpu")
+        tier.num_experts, tier.hot_slots, tier.cold_slots = 4, 2, 2
+        tier.hot_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+        tier.cold_map = torch.tensor([-1, -1, 0, 1], dtype=torch.int32)
+        tier.layer = SimpleNamespace(activation="silu")
+        tier.marlin_workspace = torch.zeros(4, dtype=torch.int32)
+        hidden, inner = 3, 5
+        tier.hot = {"w13_weight": "hot13", "w2_weight": "hot2"}
+        tier.cold = {"w13_weight": "cold13", "w2_weight": "cold2"}
+
+        def experts(tag):
+            return SimpleNamespace(
+                w1_bias=None,
+                w2_bias=None,
+                w1_scale=f"{tag}-s1",
+                w2_scale=f"{tag}-s2",
+                quant_type_id=7,
+                activation=f"{tag}-act",
+                a1_gscale=None,
+                a2_gscale=None,
+                g1_alphas=f"{tag}-g1",
+                g2_alphas=f"{tag}-g2",
+                w13_g_idx=None,
+                w2_g_idx=None,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                w1_zp=None,
+                w2_zp=None,
+                input_dtype=None,
+                is_k_full=True,
+                activation_config="cfg",
+            )
+
+        tier.hot_kernel = SimpleNamespace(fused_experts=experts("hot"))
+        tier.cold_kernel = SimpleNamespace(fused_experts=experts("cold"))
+        x = torch.ones(3, hidden, dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 2], [3, 1], [-1, -1]], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [0.0, 0.0]])
+        calls = []
+        handed = []
+
+        def get_simultaneous(*specs):
+            # Garbage-filled workspace: only an explicit zero fill may be relied on.
+            buffers = [torch.full(shape, 7, dtype=dtype) for shape, dtype in specs]
+            handed.append(buffers)
+            return buffers
+
+        def align(topk_ids, block, num_experts, expert_map, ignore_invalid_experts):
+            self.assertIs(topk_ids, ids)
+            self.assertTrue(ignore_invalid_experts)
+            self.assertEqual(num_experts, 4)
+            return ("sorted", expert_map), "experts", "post"
+
+        def fused(**kw):
+            calls.append(kw)
+            expert_map = kw["expert_map"]
+            self.assertEqual(kw["sorted_token_ids"], ("sorted", expert_map))
+            self.assertIs(kw["workspace"], tier.marlin_workspace)
+            self.assertIs(kw["intermediate_cache13"], handed[-1][0])
+            self.assertIs(kw["intermediate_cache2"], handed[-1][1])
+            self.assertIs(kw["output"], handed[-1][2])
+            self.assertFalse(kw["apply_router_weight_on_input"])
+            for t in range(ids.shape[0]):
+                for k in range(ids.shape[1]):
+                    expert = int(ids[t, k])
+                    if expert >= 0 and int(expert_map[expert]) >= 0:
+                        kw["output"][t * 2 + k].fill_(
+                            (expert + 1) * float(weights[t, k])
+                        )
+            return kw["output"]
+
+        fused_moe = "vllm.model_executor.layers.fused_moe"
+        modules = {
+            fused_moe + ".experts.marlin_moe": SimpleNamespace(
+                _fused_marlin_moe=fused,
+                marlin_moe_intermediate_size=lambda w1, w2: inner,
+            ),
+            fused_moe + ".moe_align_block_size": SimpleNamespace(
+                moe_align_block_size=align
+            ),
+            "vllm.scalar_type": SimpleNamespace(
+                ScalarType=SimpleNamespace(from_id=lambda i: ("scalar", i))
+            ),
+            "vllm.v1.worker.workspace": SimpleNamespace(
+                current_workspace_manager=lambda: SimpleNamespace(
+                    get_simultaneous=get_simultaneous
+                )
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            out = tier.split(x, weights, ids)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["w1"], "hot13")
+        self.assertEqual(calls[1]["w1"], "cold13")
+        self.assertIs(calls[0]["expert_map"], tier.hot_map)
+        self.assertIs(calls[1]["expert_map"], tier.cold_map)
+        self.assertEqual(calls[0]["w1_scale"], "hot-s1")
+        self.assertEqual(calls[1]["global_scale2"], "cold-g2")
+        self.assertEqual(calls[0]["quant_type"], ("scalar", 7))
+        self.assertEqual(calls[0]["activation_func"], "hot-act")
+        self.assertEqual(handed[-1][2].shape, (6, hidden))
+        self.assertEqual(handed[-1][0].shape, (6 * max(2 * inner, hidden),))
+        # Token 0: expert 0 (hot) * .25 + expert 2 (cold) * .75; token 1:
+        # expert 3 (cold) * .5 + expert 1 (hot) * .5; token 2 is padding.
+        expected = torch.tensor([[1 * 0.25 + 3 * 0.75], [4 * 0.5 + 2 * 0.5], [0.0]])
+        torch.testing.assert_close(
+            out.float(), expected.expand(3, hidden).float(), rtol=1e-2, atol=1e-2
+        )
+        self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
 
     def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
         rt.finish_model_forward(SimpleNamespace(), 8)
