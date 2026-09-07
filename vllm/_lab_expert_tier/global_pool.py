@@ -366,7 +366,8 @@ def _step_kernel():
         earlier = lane[None, :] < lane[:, None]
         duplicate = tl.sum((same & earlier & valid[None, :]).to(tl.int32), 1) > 0
         distinct = valid & (duplicate == 0)
-        base = layer.to(tl.int64) * num_experts
+        # `layer` may arrive as a Python int (Triton specializes 0 and 1).
+        base = tl.full((), 0, tl.int64) + layer * num_experts
         keys = base + safe
         gate = tl.load(gate_ptr) != 0
         clock = tl.load(clock_ptr)
