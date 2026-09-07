@@ -240,6 +240,26 @@ boundaries:
   experts, the loader's own peak) instead of the cold rows plus pool;
   no bank is held twice. VRAM budget and addresses are unchanged. The
   READY log carries `host_bytes` and `ram_backing`.
+- **Global pool** (`VLLM_LAB_EXPERT_TIER_GLOBAL_POOL`, default 0; needs
+  `RAM_BACKING=1`, hence `PROMOTE=1` and `STAGING=1`). One VRAM bank
+  shared by every layer (`global_pool.py`), FreeToken style: rows are
+  keyed by (layer, expert), one LRU over all keys, and the resident count
+  per layer floats (uniform or `LAYER_SLOTS` is only the starting
+  placement). Each layer's batch-1 step is one Triton program: distinct
+  selections in first-occurrence order are stamped with the step clock;
+  each miss takes the row of the least recently used resident expert of
+  any layer (ties by key) and is copied in from this layer's RAM bank
+  (the victim's RAM row is intact, nothing is copied out); a miss with no
+  victim, or any miss while the gate is closed, is staged only into
+  `top_k` staging rows shared by all layers. The step map is the layer's
+  slice of the pool's `hot_phys`, so the eager two-partition path reads
+  the same slices (hot rows in the pool, cold rows in the layer's RAM
+  bank). The pool's staging rows are charged once; everything else in the
+  budget is pool rows, so the per-layer staging and spare rows of promote
+  mode are freed for residency. Host swaps (init verification) go through
+  `GlobalPool.host_swap` while the gate is closed. Stats reports validate
+  the pool (`check_global_tables`) and log `pool_resident_per_layer`.
+  Not verified on a GPU.
 - **Native backend** (`VLLM_LAB_EXPERT_TIER_MOE_KERNEL=native`, default
   `marlin`; needs `RAM_BACKING=1` and `SPLIT=fused`). The FreeToken-derived
   NVFP4 GEMV adapter (`native_nvfp4.py`, separate ownership) replaces the

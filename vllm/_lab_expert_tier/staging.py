@@ -300,7 +300,8 @@ def _copy_kernel():
         count = tl.load(count_ptr)
         if slot >= count:
             return
-        src_row = tl.load(index_ptr + slot)
+        src_row = tl.load(index_ptr + slot).to(tl.int64)
+        slot = slot.to(tl.int64)
         offsets = chunk * BLOCK + tl.arange(0, BLOCK)
         if which == 0:
             mask = offsets < bytes0

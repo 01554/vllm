@@ -1505,12 +1505,16 @@ class TensorTests(unittest.TestCase):
         backing = {**env, rt.PREFIX + "RAM_BACKING": "1"}
         with patch.dict(os.environ, backing, clear=True):
             self.assertTrue(rt.Settings.from_env().ram_backing)
+        pooled = {**backing, rt.PREFIX + "GLOBAL_POOL": "1"}
+        with patch.dict(os.environ, pooled, clear=True):
+            self.assertTrue(rt.Settings.from_env().global_pool)
         native = {**backing, rt.PREFIX + "MOE_KERNEL": "native"}
         with patch.dict(os.environ, native, clear=True):
             self.assertEqual(rt.Settings.from_env().moe_kernel, "native")
         for extra in (
             {rt.PREFIX + "PROMOTE": "1"},
             {rt.PREFIX + "RAM_BACKING": "1"},
+            {**env, rt.PREFIX + "GLOBAL_POOL": "1"},
             {**env, rt.PREFIX + "MOE_KERNEL": "native"},
             {
                 **backing,
@@ -1698,6 +1702,183 @@ class TensorTests(unittest.TestCase):
         pm.check_tables(tables, 2, 4)
         for name in rt.TENSORS:
             self.assertTrue(torch.equal(layer.cold_cpu[name], ram_before[name]))
+
+    def make_pool_layers(self, layers=2, experts=6, slots=(2, 2), staging=2, width=3):
+        """Two TierLayers on one GlobalPool, built without a model."""
+        from lab_expert_tier import global_pool as gp
+
+        device = torch.device("cpu")
+        sources = [
+            {
+                name: torch.arange(experts, dtype=torch.int32)
+                .add(index * 100)
+                .unsqueeze(1)
+                .repeat(1, width)
+                .contiguous()
+                for name in rt.TENSORS
+            }
+            for index in range(layers)
+        ]
+        pool = gp.GlobalPool(device, sources[0], list(slots), staging)
+        settings = rt.Settings(
+            32 * 2**30,
+            staging=True,
+            promote=True,
+            planner="reference",
+            ram_backing=True,
+            global_pool=True,
+        )
+        built = []
+        for index in range(layers):
+            layer = object.__new__(rt.TierLayer)
+            layer.settings, layer.index, layer.device = settings, index, device
+            layer.num_experts, layer.hot_slots = experts, slots[index]
+            layer.cold_slots = experts - slots[index]
+            layer.staging_slots, layer.spare_slots = staging, 0
+            layer.ram_backing, layer.pool = True, pool
+            layer.bank_rows, layer.pool_offset = pool.rows, pool.offset(index)
+            layer.cold_rows_total = experts
+            layer.bank = pool.bank
+            start = layer.pool_offset
+            layer.hot = {
+                n: t[start : start + slots[index]] for n, t in pool.bank.items()
+            }
+            for name in rt.TENSORS:
+                layer.hot[name].copy_(sources[index][name][: slots[index]])
+            layer.cold_cpu = layer.cold = sources[index]
+            layer.hot_rows = list(range(start, start + slots[index]))
+            layer.cold_rows = list(range(slots[index], experts))
+            layer.staging_rows = pool.tables.staging_rows.tolist()
+            layer.step_buffers = gp.allocate_step_buffers(
+                device, experts, rt._next_power_of_two(staging)
+            )
+            layer.hot_map = pool.tables.layer_slice(pool.tables.hot_phys, index)
+            layer.cold_map = pool.tables.layer_slice(pool.tables.cold_phys, index)
+            layer.promote_tables = layer.promote_buffers = None
+            layer.promote_gate = False
+            layer.hot_map_host = tuple(layer.hot_map.tolist())
+            layer.cold_map_host = tuple(layer.cold_map.tolist())
+            layer.bank_kernel = SimpleNamespace(fused_experts="bank")
+            built.append(layer)
+        return pool, built
+
+    def test_pool_layers_share_one_lru_and_never_write_ram(self):
+        pool, (first, second) = self.make_pool_layers()
+        chains: list[Any] = []
+        for layer in (first, second):
+            layer._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        ram_before = {n: t.clone() for n, t in second.cold_cpu.items()}
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        # Gate closed: layer 1's miss is staged into the shared staging row.
+        second.split(x, weights, torch.tensor([[4, 1]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual((experts, tensors, rows), ("bank", pool.bank, pool.rows))
+        self.assertEqual(step_map.tolist(), [2, 3, -1, -1, 4, -1])
+        self.assertEqual(int(pool.bank[rt.TENSORS[0]][4][0]), 104)
+        # Gate open on every layer: layer 0 touches both residents, then
+        # layer 1's miss evicts layer 0's expert 1? No: the least recent
+        # resident is layer 1's own untouched expert 0 (key 6, clock 0).
+        first.set_promote_gate(True)
+        second.set_promote_gate(True)
+        first.split(x, weights, torch.tensor([[0, 1]]))
+        second.split(x, weights, torch.tensor([[4, 1]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual(step_map.tolist(), [-1, 3, -1, -1, 2, -1])
+        self.assertEqual(int(pool.bank[rt.TENSORS[0]][2][0]), 104)
+        self.assertEqual(pool.snapshot(), [2, 2])
+        # The kernel maps are the pool slices.
+        self.assertEqual(second.hot_map.tolist(), [-1, 3, -1, -1, 2, -1])
+        self.assertEqual(second.cold_map.tolist(), [0, -1, 2, 3, -1, 5])
+        # Layer 0 misses 5: the least recent resident anywhere is its own
+        # expert 1 (clock 1; layer 1's residents carry clock 2).
+        first.split(x, weights, torch.tensor([[5, 0]]))
+        self.assertEqual(pool.snapshot(), [2, 2])
+        self.assertEqual(first.hot_map.tolist(), [0, -1, -1, -1, -1, 1])
+        self.assertEqual(second.hot_map.tolist(), [-1, 3, -1, -1, 2, -1])
+        # Layer 1 misses 3 next: now layer 1's own expert 1 (clock 2) is
+        # older than layer 0's residents (clock 3), so the pool tilts.
+        second.split(x, weights, torch.tensor([[3, 4]]))
+        self.assertEqual(pool.snapshot(), [2, 2])
+        self.assertEqual(second.hot_map.tolist(), [-1, -1, -1, 3, 2, -1])
+        first.split(x, weights, torch.tensor([[0, 5]]))
+        first.split(x, weights, torch.tensor([[2, 0]]))
+        self.assertEqual(pool.snapshot(), [3, 1])
+        self.assertEqual(second.hot_map.tolist(), [-1, -1, -1, -1, 2, -1])
+        first.promote_snapshot()
+        self.assertEqual(first.hot_map_host, (0, -1, 3, -1, -1, 1))
+        for name in rt.TENSORS:
+            self.assertTrue(torch.equal(second.cold_cpu[name], ram_before[name]))
+
+    def test_pool_scratch_width_is_a_power_of_two_above_top_k(self):
+        pool, (first, second) = self.make_pool_layers(staging=3)
+        self.assertEqual(first.step_buffers.gather_src.shape[0], 4)
+        self.assertEqual(rt._next_power_of_two(10), 16)
+        self.assertEqual((rt._next_power_of_two(1), rt._next_power_of_two(16)), (1, 16))
+        chains: list[Any] = []
+        first._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        first.set_promote_gate(True)
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        first.split(x, torch.ones(1, 3), torch.tensor([[5, 4, 3]]))
+        self.assertEqual(pool.snapshot(), [3, 1])
+
+    def test_large_banks_align_by_logical_id_then_map_blocks_to_rows(self):
+        """Pool rows exceed the align op's expert limit: routes outside the
+        partition become padding and only used blocks index the map."""
+        expert_map = torch.tensor([550, -1, 7, -1, 1200, -1], dtype=torch.int32)
+        ids = torch.tensor([[0, 1], [-1, 4], [6, 2]], dtype=torch.int32)
+        self.assertEqual(
+            rt.mask_routes(ids, expert_map).tolist(), [[0, -1], [-1, 4], [-1, 2]]
+        )
+        # Three used blocks (12 padded tokens / block 4) then garbage.
+        logical = torch.tensor([0, 4, 2, 99999, -7], dtype=torch.int32)
+        post_padded = torch.tensor([12], dtype=torch.int32)
+        physical = rt.physical_block_experts(logical, post_padded, 4, expert_map, 6)
+        self.assertEqual(physical.tolist(), [550, 1200, 7, -1, -1])
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PROMOTE": "1"}
+        env.update({rt.PREFIX + "STAGING": "1", rt.PREFIX + "RAM_BACKING": "1"})
+        env.update({rt.PREFIX + "GLOBAL_POOL": "1", rt.PREFIX + "SPLIT": "modular"})
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+
+    def test_pool_decode_with_native_backend_calls_the_adapter_once(self):
+        """Global pool + native: the step map of the pool bank reaches gemv."""
+        from lab_expert_tier import native_nvfp4
+
+        pool, (first, second) = self.make_pool_layers()
+        calls: list[Any] = []
+        for layer in (first, second):
+            layer.native = True
+            layer.layer = SimpleNamespace(activation="silu")
+            layer.native_workspace = lambda tensors: tensors[rt.TENSORS[0]].shape[0]
+            layer.bank_kernel = rt.NATIVE_KERNEL
+
+        def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
+            calls.append((ids.tolist(), step_map.tolist(), workspace))
+            return torch.ones(1, 3, dtype=torch.bfloat16)
+
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        second.set_promote_gate(True)
+        with patch.object(native_nvfp4, "gemv", fake_gemv):
+            out = second.split(x, torch.ones(1, 2), torch.tensor([[4, 1]]))
+        # The victim is key 0 (layer 0 expert 0: last_use 0, lowest key), so
+        # layer 1's expert 4 takes row 0 and the pool tilts toward layer 1.
+        self.assertEqual(calls, [([[4, 1]], [2, 3, -1, -1, 0, -1], pool.rows)])
+        self.assertEqual(out.shape, (1, 3))
+        self.assertEqual(pool.snapshot(), [1, 3])
+
+    def test_pool_host_swap_while_gated_copies_in_and_restores(self):
+        pool, (first, second) = self.make_pool_layers()
+        temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
+        first.swap(0, 2, 0, 0, temp)
+        self.assertEqual(first.hot_map.tolist(), [-1, 1, 0, -1, -1, -1])
+        self.assertEqual(first.cold_map.tolist(), [0, -1, -1, 3, 4, 5])
+        self.assertEqual(int(pool.bank[rt.TENSORS[0]][0][0]), 2)
+        pool.snapshot()
+        first.swap(2, 0, 0, 0, temp)
+        self.assertEqual(first.hot_map.tolist(), [0, 1, -1, -1, -1, -1])
+        self.assertEqual(int(pool.bank[rt.TENSORS[0]][0][0]), 0)
+        pool.snapshot()
 
     def test_native_chains_mask_routes_per_partition_and_own_the_output(self):
         """Two partitions call the adapter once each with the other side's
