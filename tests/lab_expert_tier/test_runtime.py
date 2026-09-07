@@ -1091,10 +1091,18 @@ class TensorTests(unittest.TestCase):
                     coordinator.end_layer(tier)
             coordinator.finish_forward(1, 1)
 
-        # Startup: nothing reaches the policy or the device heat.
+        # Startup: nothing reaches the policy or the device heat. A dummy
+        # forward reports a positive runner token count over an all-padding
+        # mask (what warmup and capture look like); that mismatch must not
+        # poison the first real snapshot after heat is enabled.
         forward(torch.tensor([[2, 3]]))
+        with self.forward_context(coordinator, torch.tensor([True])):
+            for tier in coordinator.layers:
+                coordinator.begin_layer(tier, x, weights, torch.tensor([[-1, -1]]))
+                coordinator.end_layer(tier)
+        coordinator.finish_forward(1, 1)
         self.assertEqual(coordinator.policy.tokens_total, 0)
-        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 1)
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 2)
         coordinator.enable_heat()
         # Cold experts 2 and 3 are selected every step; with sync_period 1 and
         # no hysteresis the policy must plan them into the hot slots.
