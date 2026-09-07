@@ -82,13 +82,15 @@ class PromoteReferenceTests(unittest.TestCase):
         return plan, gathers, staged, evicts, step_map
 
     def assert_rows_hold_experts(self, tables, bank, ram):
+        """Every expert's owner row holds that expert's bytes in all six tensors."""
         for expert in range(tables.hot_map.shape[0]):
             h = int(tables.hot_phys[expert])
             c = int(tables.cold_phys[expert])
-            if h >= 0:
-                self.assertEqual(int(bank[pm.TENSORS[0]][h][0]) // 10, expert)
-            else:
-                self.assertEqual(int(ram[pm.TENSORS[0]][c][0]) // 10, expert)
+            for name in pm.TENSORS:
+                row = bank[name][h] if h >= 0 else ram[name][c]
+                self.assertTrue(
+                    bool((row // 10 == expert).all()), f"{name} expert {expert}"
+                )
 
     def test_initial_tables_are_consistent_and_a_hit_step_changes_nothing(self):
         tables, bank, ram, staging_rows = self.setup()
@@ -317,4 +319,9 @@ class DevicePlannerIntegrationTests(PromoteReferenceTests):
             self.assert_rows_hold_experts(tables, bank, ram)
             self.assertEqual(tables.hot_map.tolist(), mirror.hot_map.tolist())
             self.assertEqual(tables.last_use.tolist(), mirror.last_use.tolist())
+            # All six bank tensors, every VRAM and RAM row, byte-identical to
+            # the reference run.
+            for name in pm.TENSORS:
+                self.assertTrue(torch.equal(bank[name], mbank[name]), name)
+                self.assertTrue(torch.equal(ram[name], mram[name]), name)
         self.assertEqual(int(tables.error[0]), 0)
