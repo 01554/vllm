@@ -10,6 +10,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -23,8 +24,9 @@ class TierPolicyTests(unittest.TestCase):
     def assert_partition(self, policy):
         for layer in range(policy.num_layers):
             hot, cold = policy.hot_to_expert[layer], policy.cold_to_expert[layer]
-            self.assertEqual(len(hot), policy.hot_slots)
-            self.assertEqual(len(cold), policy.num_experts - policy.hot_slots)
+            hot_slots = policy.hot_slots_per_layer[layer]
+            self.assertEqual(len(hot), hot_slots)
+            self.assertEqual(len(cold), policy.num_experts - hot_slots)
             self.assertEqual(sorted(hot + cold), list(range(policy.num_experts)))
             for expert in range(policy.num_experts):
                 h = policy.expert_to_hot[layer][expert]
@@ -67,6 +69,99 @@ class TierPolicyTests(unittest.TestCase):
         self.assertEqual(policy.swaps_total, 0)  # Initial fill is not migration.
         self.assertEqual(policy.max_swaps_per_resync, 0)
         self.assert_partition(policy)
+
+    def test_per_layer_capacity_supports_zero_one_and_full_expert_banks(self):
+        policy = TierPolicy(
+            3,
+            4,
+            [0, 1, 4],
+            decay=0.0,
+            sync_period=1,
+            hysteresis=0.0,
+            initial_scores=[[0, 0, 0, 0], [0, 0, 5, 0], [0, 0, 0, 5]],
+        )
+        self.assertIsNone(policy.hot_slots)
+        self.assertEqual(policy.hot_slots_per_layer, (0, 1, 4))
+        self.assertEqual(policy.hot_to_expert, ((), (2,), (3, 0, 1, 2)))
+        self.assertEqual(policy.dwell_counts, ((), (0,), (0, 0, 0, 0)))
+        self.assert_partition(policy)
+
+        policy.observe_step([[[3]], [[3]], [[0]]], 1)
+        plan = policy.plan_resync()
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.swaps,
+            (Swap(layer=1, hot_slot=0, cold_slot=2, old_expert=2, new_expert=3),),
+        )
+        self.apply_physical_and_commit(policy, plan)
+        self.assertEqual(policy.hot_to_expert, ((), (3,), (3, 0, 1, 2)))
+
+    def test_uniform_vector_matches_scalar_through_snapshot_plan_and_commit(self):
+        config = dict(
+            num_layers=3,
+            num_experts=4,
+            decay=0.75,
+            sync_period=1,
+            hysteresis=0.0,
+            swaps_per_token=3.0,
+            initial_scores=[[2.0, 0.0, 0.0, 0.0]] * 3,
+        )
+        scalar = TierPolicy(hot_slots=2, **config)
+        vector = TierPolicy(hot_slots=[2, 2, 2], **config)
+        imported = TierPolicy(hot_slots=(2, 2, 2), **config)
+        self.assertEqual(vector.hot_slots, 2)
+        self.assertEqual(scalar.hot_slots_per_layer, vector.hot_slots_per_layer)
+        self.assertEqual(vector.hot_slots_per_layer, (2, 2, 2))
+
+        routes = [[[2]], [[2]], [[2]]]
+        scalar.observe_step(routes, 1)
+        vector.observe_step(routes, 1)
+        self.assertEqual(scalar.heat, vector.heat)
+        self.assertEqual(scalar.hot_to_expert, vector.hot_to_expert)
+        self.assertEqual(scalar.cold_to_expert, vector.cold_to_expert)
+
+        snapshot = SimpleNamespace(
+            heat=scalar.heat,
+            tokens_total=scalar.tokens_total,
+            last_step_tokens=scalar._last_step_tokens,
+            verified=True,
+            error=False,
+        )
+        imported.import_device_snapshot(snapshot)
+        self.assertEqual(imported.heat, scalar.heat)
+        self.assertEqual(imported.tokens_total, scalar.tokens_total)
+        self.assertEqual(imported._last_step_tokens, scalar._last_step_tokens)
+
+        scalar_plan = scalar.plan_resync()
+        vector_plan = vector.plan_resync()
+        imported_plan = imported.plan_resync()
+        self.assertEqual(scalar_plan, vector_plan)
+        self.assertEqual(scalar_plan, imported_plan)
+        for policy, plan in (
+            (scalar, scalar_plan),
+            (vector, vector_plan),
+            (imported, imported_plan),
+        ):
+            self.apply_physical_and_commit(policy, plan)
+        self.assertEqual(scalar.hot_to_expert, vector.hot_to_expert)
+        self.assertEqual(scalar.hot_to_expert, imported.hot_to_expert)
+        self.assertEqual(scalar.dwell_counts, vector.dwell_counts)
+        self.assertEqual(scalar.dwell_counts, imported.dwell_counts)
+
+    def test_per_layer_capacity_validation_rejects_invalid_vectors(self):
+        invalid = (
+            [1, 2],
+            [1, 2, 3, 4],
+            [1, -1, 1],
+            [1, 2, 5],
+            [1, 2.0, 1],
+            [1, True, 1],
+            1.0,
+            "111",
+        )
+        for hot_slots in invalid:
+            with self.subTest(hot_slots=hot_slots), self.assertRaises(ValueError):
+                TierPolicy(3, 4, hot_slots)
 
     def test_initial_scores_rank_descending_and_break_ties_by_id(self):
         policy = TierPolicy(1, 5, 2, initial_scores=[[0, 5, 1, 5, 0]])

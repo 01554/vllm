@@ -102,13 +102,17 @@ class TierPolicy:
     IDs outside that range are sentinels and ignored. Zero-weight lanes and
     masked rows add no heat; positive weights count once, regardless of size.
     Non-finite/negative weights on real rows are rejected, even for sentinel IDs.
+    ``hot_slots`` may be one capacity shared by every layer or a sequence with
+    one capacity per layer. ``hot_slots_per_layer`` is always the normalized
+    tuple; the legacy ``hot_slots`` attribute is that integer for uniform
+    capacities and ``None`` for nonuniform capacities.
     """
 
     def __init__(
         self,
         num_layers: int,
         num_experts: int,
-        hot_slots: int,
+        hot_slots: int | Sequence[int],
         *,
         decay: float = 0.999,
         sync_period: int = 50,
@@ -120,9 +124,24 @@ class TierPolicy:
     ) -> None:
         self.num_layers = _integer("num_layers", num_layers, 1)
         self.num_experts = _integer("num_experts", num_experts, 1)
-        self.hot_slots = _integer("hot_slots", hot_slots, 0)
-        if self.hot_slots > self.num_experts:
+        if isinstance(hot_slots, Integral) and not isinstance(hot_slots, bool):
+            scalar_hot_slots = _integer("hot_slots", int(hot_slots), 0)
+            hot_slots_per_layer = (scalar_hot_slots,) * self.num_layers
+        elif isinstance(hot_slots, Sequence):
+            if len(hot_slots) != self.num_layers:
+                raise ValueError("hot_slots sequence must have num_layers entries")
+            hot_slots_per_layer = tuple(
+                _integer(f"hot_slots[{layer}]", slots, 0)
+                for layer, slots in enumerate(hot_slots)
+            )
+        else:
+            raise ValueError("hot_slots must be an integer or a sequence of integers")
+        if any(slots > self.num_experts for slots in hot_slots_per_layer):
             raise ValueError("hot_slots cannot exceed num_experts")
+        self.hot_slots_per_layer = hot_slots_per_layer
+        self.hot_slots = (
+            hot_slots_per_layer[0] if len(set(hot_slots_per_layer)) == 1 else None
+        )
         self.decay = _finite("decay", decay)
         if self.decay > 1:
             raise ValueError("decay must be <= 1")
@@ -152,7 +171,10 @@ class TierPolicy:
             for hot in self._hot
         )
         # copy_top_s initializes incumbents as already eligible for displacement.
-        self._dwell = tuple((self.dwell_tokens,) * self.hot_slots for _ in self._hot)
+        self._dwell = tuple(
+            (self.dwell_tokens,) * self.hot_slots_per_layer[layer]
+            for layer in range(self.num_layers)
+        )
         self._expert_to_hot, self._expert_to_cold = self._inverse_maps(
             self._hot, self._cold
         )
@@ -198,7 +220,8 @@ class TierPolicy:
         return self._dwell
 
     def _top(self, layer: int) -> list[int]:
-        if not self.hot_slots:
+        hot_slots = self.hot_slots_per_layer[layer]
+        if not hot_slots:
             return []
         heat = self._heat[layer]
         if np.isnan(heat).any():
@@ -207,9 +230,9 @@ class TierPolicy:
             # the scalar sort preserves the historical Python ordering.
             values = heat.tolist()
             return sorted(range(self.num_experts), key=lambda e: (-values[e], e))[
-                : self.hot_slots
+                :hot_slots
             ]
-        return np.lexsort((self._expert_ids, -heat))[: self.hot_slots].tolist()
+        return np.lexsort((self._expert_ids, -heat))[:hot_slots].tolist()
 
     def _inverse_maps(self, hot, cold):
         all_hot, all_cold = [], []
@@ -377,13 +400,9 @@ class TierPolicy:
             # one-token boundary; a legacy snapshot is treated as one step.
             last_step_tokens = 1 if tokens_total > self.tokens_total else 0
         else:
-            last_step_tokens = _integer(
-                "snapshot last_step_tokens", last_step_value, 0
-            )
+            last_step_tokens = _integer("snapshot last_step_tokens", last_step_value, 0)
         if last_step_tokens > tokens_total:
-            raise ValueError(
-                "device snapshot last_step_tokens exceeds its token total"
-            )
+            raise ValueError("device snapshot last_step_tokens exceeds its token total")
 
         base_names = (
             "base_tokens_total",
@@ -398,8 +417,7 @@ class TierPolicy:
             raise ValueError("device snapshot base metadata must be complete")
         if has_base:
             base_tokens, base_version, base_last_sync = (
-                _integer(name, value, 0)
-                for name, value in zip(base_names, base_values)
+                _integer(name, value, 0) for name, value in zip(base_names, base_values)
             )
             if (base_tokens, base_version, base_last_sync) != (
                 self.tokens_total,
@@ -440,13 +458,8 @@ class TierPolicy:
 
         if tokens_total < self.tokens_total:
             raise RuntimeError("device snapshot token total is stale")
-        if (
-            tokens_total == self.tokens_total
-            and (
-                not has_sequence
-                or forwards is None
-                or forwards <= self._device_forwards
-            )
+        if tokens_total == self.tokens_total and (
+            not has_sequence or forwards is None or forwards <= self._device_forwards
         ):
             raise RuntimeError("device snapshot contains no new observation")
 
@@ -463,6 +476,7 @@ class TierPolicy:
         if has_sequence:
             self._device_session = session
             self._device_session_set = True
+            assert sequence is not None
             self._device_sequence = sequence
             if forwards is not None:
                 self._device_forwards = forwards
@@ -483,7 +497,11 @@ class TierPolicy:
         """
         if self._pending is not None:
             return self._pending.plan
-        if self._last_step_tokens != 1 or self.sync_period <= 0 or self.hot_slots <= 0:
+        if (
+            self._last_step_tokens != 1
+            or self.sync_period <= 0
+            or not any(self.hot_slots_per_layer)
+        ):
             return None
         if (
             self.tokens_total // self.sync_period
