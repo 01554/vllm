@@ -1119,8 +1119,14 @@ class TierLayer:
         total = None
         for _experts, tensors, expert_map, _rows in partitions:
             if len(partitions) > 1:
-                present = (ids >= 0) & (expert_map[ids.clamp(min=0).long()] >= 0)
-                routed = torch.where(present, ids, torch.full_like(ids, -1))
+                # Only valid routes owned by another partition become
+                # padding; invalid ids reach the adapter unchanged so its
+                # sticky error still records them. The map is indexed with
+                # valid ids only.
+                valid = (ids >= 0) & (ids < self.num_experts)
+                safe = torch.where(valid, ids, torch.zeros_like(ids)).long()
+                foreign = valid & (expert_map[safe] < 0)
+                routed = torch.where(foreign, torch.full_like(ids, -1), ids)
             else:
                 routed = ids
             out = gemv(
