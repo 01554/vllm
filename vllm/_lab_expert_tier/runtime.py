@@ -1521,12 +1521,14 @@ class TierCoordinator:
         # before the migration stream reads the old rows.
         _stream_wait_event(stream, _record_event(_current_stream(self.device)))
         transaction = MigrationTransaction(plan, verdict, enqueued_at=started)
+        # Tracked from the first copy: a failure mid-enqueue leaves the
+        # transaction visible (and the tier poisoned), never half-forgotten.
+        self.pending = transaction
         for swap in plan.swaps:
             layer = self.layers[swap.layer]
             vram_spare, ram_spare = layer.enqueue_swap(swap, stream)
             transaction.entries.append((swap.layer, swap, vram_spare, ram_spare))
         transaction.transfer_event = _record_event(stream)
-        self.pending = transaction
         self.stats["async_plans"] += 1
         self.stats["async_swaps_enqueued"] += len(plan.swaps)
         self.stats["async_enqueue_seconds"] += time.perf_counter() - started
