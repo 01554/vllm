@@ -726,8 +726,10 @@ def _copy_kernel():
         count = tl.load(count_ptr)
         if lane >= count:
             return
-        src_row = tl.load(src_rows_ptr + lane)
-        dst_row = tl.load(dst_rows_ptr + lane)
+        # Row times byte stride exceeds int32 for large banks (a shared
+        # staging row near 12000 times a 1.6 MB row): keep rows in int64.
+        src_row = tl.load(src_rows_ptr + lane).to(tl.int64)
+        dst_row = tl.load(dst_rows_ptr + lane).to(tl.int64)
         offsets = chunk * BLOCK + tl.arange(0, BLOCK)
         if which == 0:
             mask = offsets < bytes0
