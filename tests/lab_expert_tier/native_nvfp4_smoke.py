@@ -6,6 +6,7 @@ Run from the repository root: python tests/lab_expert_tier/native_nvfp4_smoke.py
 This checks arithmetic against an independent dense CPU oracle, not performance.
 """
 
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
@@ -57,7 +58,9 @@ def oracle(x, weights, ids, bank, mapping):
     return output
 
 
-def run_case(tokens, hidden, intermediate):
+def run_case(
+    tokens, hidden, intermediate, *, grouped=False, physical_rows=4, uva=False
+):
     generator = torch.Generator().manual_seed(513)
     bank = {}
     for prefix, n, k in (
@@ -67,26 +70,52 @@ def run_case(tokens, hidden, intermediate):
         bank[f"{prefix}_weight"] = torch.randint(
             0,
             256,
-            (4, n, k // 2),
+            (physical_rows, n, k // 2),
             dtype=torch.uint8,
             generator=generator,
         ).cuda()
         bank[f"{prefix}_weight_scale"] = (
-            (torch.randint(1, 4, (4, n, k // 16), generator=generator).float() / 8)
+            (
+                torch.randint(
+                    1, 4, (physical_rows, n, k // 16), generator=generator
+                ).float()
+                / 8
+            )
             .to(torch.float8_e4m3fn)
             .cuda()
         )
         bank[f"{prefix}_weight_scale_2"] = (
-            (torch.rand((4, n), generator=generator) / 8 + 0.03125).half().cuda()
+            (torch.rand((physical_rows, n), generator=generator) / 8 + 0.03125)
+            .half()
+            .cuda()
         )
+    if uva:
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        # Keep the owning pinned tensors alive through every eager/graph launch.
+        backing = {name: tensor.cpu().pin_memory() for name, tensor in bank.items()}
+        bank = {
+            name: get_accelerator_view_from_cpu_tensor(tensor)
+            for name, tensor in backing.items()
+        }
     x = (torch.randn(tokens, hidden, generator=generator) / 8).bfloat16().cuda()
     ids = torch.tensor([[0, 2, 0, -1]] * tokens, dtype=torch.int32, device="cuda")
     weights = torch.tensor([[0.125, 0.5, 0.25, 99.0]] * tokens, device="cuda")
-    mapping = torch.tensor([2, 0, 3, 1, -1], dtype=torch.int32, device="cuda")
-    workspace = native.allocate_workspace(bank, tokens, 4, num_experts=4)
+    base_row = physical_rows - 4
+    mapping = torch.tensor(
+        [base_row + 2, base_row, base_row + 3, base_row + 1, -1],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    operation, allocator = native.gemv, native.allocate_workspace
+    if grouped:
+        from lab_expert_tier.native_prefill import allocate_workspace, prefill
+
+        operation, allocator = prefill, allocate_workspace
+    workspace = allocator(bank, tokens, 4, num_experts=4)
 
     def forward():
-        return native.gemv(x, weights, ids, bank, mapping, workspace)
+        return operation(x, weights, ids, bank, mapping, workspace)
 
     forward()  # Compile and initialize all kernels before capture.
     torch.accelerator.synchronize()
@@ -96,10 +125,14 @@ def run_case(tokens, hidden, intermediate):
     for step in range(3):
         if step == 1:
             ids[:, 0] = -1  # Formerly valid lanes must overwrite stale scratch.
-            mapping[:4].copy_(torch.tensor([1, 3, 0, 2], device="cuda"))
+            mapping[:4].copy_(
+                torch.tensor(
+                    [base_row + 1, base_row + 3, base_row, base_row + 2], device="cuda"
+                )
+            )
         elif step == 2:
             ids[:, 0] = 1
-            bank["w2_weight"][3].zero_()  # Replay must read live bank bytes.
+            bank["w2_weight"][base_row + 3].zero_()  # Replay must read live bank bytes.
         graph.replay()
         actual = captured.cpu()
         expected = oracle(x, weights, ids.cpu(), bank, mapping.cpu())
@@ -117,10 +150,28 @@ def run_case(tokens, hidden, intermediate):
     graph.replay()
     assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
     assert workspace.error.item() == 1
-    print(f"PASS M={tokens}, H={hidden}, I={intermediate}: eager/graph/oracle")
+    # A valid logical expert with no bank row must also zero NaN-valued routes.
+    ids[:, 0] = 1
+    mapping[1] = -1
+    graph.replay()
+    assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+    assert workspace.error.item() == 1
+    print(
+        f"PASS M={tokens}, H={hidden}, I={intermediate}, "
+        f"rows={physical_rows}, UVA={uva}: eager/graph/oracle"
+    )
 
 
 if __name__ == "__main__":
-    run_case(1, 32, 16)
-    run_case(3, 32, 16)
-    run_case(1, 2064, 32)  # Exercise FreeToken's deep-K launch configuration.
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--grouped", action="store_true")
+    args = parser.parse_args()
+    if args.grouped:
+        # Both FT prefill tile configurations, partial tiles, and pool row > E.
+        run_case(17, 32, 16, grouped=True)
+        run_case(65, 128, 32, grouped=True, physical_rows=560)
+        run_case(17, 64, 32, grouped=True, uva=True)
+    else:
+        run_case(1, 32, 16)
+        run_case(3, 32, 16)
+        run_case(1, 2064, 32)  # FreeToken deep-K launch configuration.

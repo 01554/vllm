@@ -1890,15 +1890,15 @@ class TensorTests(unittest.TestCase):
         layer.layer = SimpleNamespace(activation=SimpleNamespace(value="silu"))
         layer.native_workspace = lambda tensors: ("ws", tensors[rt.TENSORS[0]].shape[0])
         calls: list[Any] = []
-        output = torch.ones(2, 3, dtype=torch.bfloat16)
+        output = torch.ones(4, 3, dtype=torch.bfloat16)
 
         def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
             calls.append((ids.clone(), step_map, workspace, activation))
             return output
 
-        x = torch.ones(2, 3, dtype=torch.bfloat16)
-        weights = torch.ones(2, 2)
-        ids = torch.tensor([[0, 4], [-1, 1]], dtype=torch.int32)
+        x = torch.ones(4, 3, dtype=torch.bfloat16)
+        weights = torch.ones(4, 2)
+        ids = torch.tensor([[0, 4], [-1, 1], [6, 7], [-2, 2]], dtype=torch.int32)
         hot_map = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
         cold_map = torch.tensor([-1, -1, 2, 3, 4, 5], dtype=torch.int32)
         with patch.object(native_nvfp4, "gemv", fake_gemv):
@@ -1914,17 +1914,81 @@ class TensorTests(unittest.TestCase):
             single = layer._run_marlin_chains(
                 x, weights, ids, ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),)
             )
-        self.assertEqual(calls[0][0].tolist(), [[0, -1], [-1, 1]])
-        self.assertEqual(calls[1][0].tolist(), [[-1, 4], [-1, -1]])
+        # Invalid ids (>= E, < -1) pass through to both partitions so the
+        # adapter records them; only foreign valid routes become padding.
+        self.assertEqual(calls[0][0].tolist(), [[0, -1], [-1, 1], [6, 7], [-2, -1]])
+        self.assertEqual(calls[1][0].tolist(), [[-1, 4], [-1, -1], [6, 7], [-2, 2]])
         self.assertEqual(calls[2][0].tolist(), ids.tolist())
         self.assertEqual(calls[0][2], ("ws", layer.bank_rows))
         self.assertEqual(calls[1][2], ("ws", 6))
         self.assertEqual(calls[0][3], "silu")
         self.assertTrue(
-            torch.equal(total, torch.full((2, 3), 2.0, dtype=torch.bfloat16))
+            torch.equal(total, torch.full((4, 3), 2.0, dtype=torch.bfloat16))
         )
         self.assertIsNot(single, output)
         self.assertTrue(torch.equal(single, output))
+
+    def test_grouped_native_prefill_is_used_for_multi_token_rows_only(self):
+        """NATIVE_PREFILL=grouped routes rows > 1 to native_prefill.prefill
+        with the same arguments as gemv; batch-1 decode still uses gemv."""
+        import types
+
+        from lab_expert_tier import native_nvfp4
+
+        layer = self.make_promote_layer(backing=True)
+        layer.native = True
+        layer.settings = rt.Settings(
+            32 * 2**30,
+            staging=True,
+            promote=True,
+            planner="reference",
+            ram_backing=True,
+            moe_kernel="native",
+            native_prefill="grouped",
+        )
+        layer.layer = SimpleNamespace(activation="silu")
+        layer.native_workspace = lambda tensors: "ws"
+        layer.native_prefill_workspace = lambda tensors: "prefill-ws"
+        calls: list[Any] = []
+        stub: Any = types.ModuleType("lab_expert_tier.native_prefill")
+
+        def fake_prefill(x, weights, ids, bank, step_map, workspace, *, activation):
+            calls.append(("prefill", tuple(ids.shape), workspace, activation))
+            return torch.ones(x.shape[0], 3, dtype=torch.bfloat16)
+
+        def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
+            calls.append(("gemv", tuple(ids.shape), workspace, activation))
+            return torch.ones(x.shape[0], 3, dtype=torch.bfloat16)
+
+        stub.prefill = fake_prefill
+        hot_map = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
+        parts = ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),)
+        with (
+            patch.dict(sys.modules, {"lab_expert_tier.native_prefill": stub}),
+            patch.object(native_nvfp4, "gemv", fake_gemv),
+        ):
+            layer._run_marlin_chains(
+                torch.ones(3, 3, dtype=torch.bfloat16),
+                torch.ones(3, 2),
+                torch.tensor([[0, 1]] * 3, dtype=torch.int32),
+                parts,
+            )
+            layer._run_marlin_chains(
+                torch.ones(1, 3, dtype=torch.bfloat16),
+                torch.ones(1, 2),
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                parts,
+            )
+        self.assertEqual(
+            calls,
+            [
+                ("prefill", (3, 2), "prefill-ws", "silu"),
+                ("gemv", (1, 2), "ws", "silu"),
+            ],
+        )
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_PREFILL": "grouped"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
 
     def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
         settings = rt.Settings(

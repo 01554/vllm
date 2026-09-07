@@ -126,5 +126,35 @@ class NativeNVFP4Tests(unittest.TestCase):
             )
 
 
+class NativePrefillTests(NativeNVFP4Tests):
+    """The prefill entrypoint preserves native layout/routing contracts.
+
+    CPU arithmetic is a fallback; the --grouped GPU smoke checks the new kernel.
+    """
+
+    def setUp(self):
+        from lab_expert_tier.native_prefill import allocate_workspace
+
+        super().setUp()
+        self.workspace = allocate_workspace(self.bank, 3, 4, num_experts=3)
+
+    def run_native(self):
+        from lab_expert_tier.native_prefill import prefill
+
+        return prefill(
+            self.x, self.weights, self.ids, self.bank, self.mapping, self.workspace
+        )
+
+    def test_prefill_matches_decode_and_reuses_own_output(self):
+        expected = self.run_native().clone()
+        decode_workspace = native.allocate_workspace(self.bank, 3, 4, num_experts=3)
+        actual = native.gemv(
+            self.x, self.weights, self.ids, self.bank, self.mapping, decode_workspace
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.ids.fill_(-1)
+        self.assertTrue(torch.equal(self.run_native(), torch.zeros_like(self.x)))
+
+
 if __name__ == "__main__":
     unittest.main()
