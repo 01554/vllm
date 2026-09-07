@@ -415,6 +415,9 @@ def _step_kernel():
                         tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
                         tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
                         staged += 1
+            # The scalar table stores above must be visible to the next
+            # miss's vector scan, which reads hot_phys across all lanes.
+            tl.debug_barrier()
         tl.store(promoted_count_ptr, promoted)
         tl.store(staged_count_ptr, staged)
         tl.store(gather_count_ptr, promoted + staged)
