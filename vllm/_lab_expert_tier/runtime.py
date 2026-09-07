@@ -86,7 +86,8 @@ class Settings:
     # Decode-time VRAM staging of the selected cold experts: top_k spare rows
     # per layer at the end of the hot bank, charged to the capacity budget.
     # Off by default: correct on the GPU but 7.7% slower than the fused
-    # two-partition path in its first measurement (plan launch overhead).
+    # two-partition path in its first measurement; launch volume and the
+    # lower resident hit rate are both candidate causes, not yet separated.
     staging: bool = False
 
     def policy_kwargs(self):
