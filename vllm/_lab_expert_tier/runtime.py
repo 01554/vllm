@@ -37,6 +37,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
 
+from .async_migration import SpareRing
 from .tier_policy import TierPolicy
 
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +84,10 @@ class Settings:
     # "records": static routing records read back once per forward. Other
     # names resolve through OBSERVERS (device-side observers register there).
     observer: str = "records"
+    # Exchange rows on a migration stream overlapped with the next forward,
+    # flipping logical-to-physical row tables at the following boundary.
+    # temp_slots spare VRAM and RAM rows per layer, charged to the budget.
+    async_migration: bool = False
     # Decode-time VRAM staging of the selected cold experts: top_k spare rows
     # per layer at the end of the hot bank, charged to the capacity budget.
     # Off by default: correct on the GPU but 7.7% slower than the fused
@@ -118,6 +123,7 @@ class Settings:
             "SPLIT",
             "OBSERVER",
             "STAGING",
+            "ASYNC_MIGRATION",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -132,9 +138,12 @@ class Settings:
         stats = int(os.environ.get(PREFIX + "STATS_EVERY", "256"))
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
         staging = os.environ.get(PREFIX + "STAGING", "0")
-        if stats < 1 or verify not in ("0", "1") or staging not in ("0", "1"):
+        asynchronous = os.environ.get(PREFIX + "ASYNC_MIGRATION", "0")
+        flags = (verify, staging, asynchronous)
+        if stats < 1 or any(flag not in ("0", "1") for flag in flags):
             raise ValueError(
-                "STATS_EVERY must be positive; VERIFY_INIT and STAGING must be 0 or 1"
+                "STATS_EVERY must be positive; VERIFY_INIT, STAGING, and "
+                "ASYNC_MIGRATION must be 0 or 1"
             )
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
@@ -184,6 +193,7 @@ class Settings:
             integers["TEMP_SLOTS"],
             split,
             observer,
+            asynchronous == "1",
             staging == "1",
         )
 
@@ -400,6 +410,13 @@ class TierLayer:
         # map can address both; they hold transient copies of selected cold
         # experts during batch-1 decode and are outside the swap slot range.
         self.staging_slots = method.moe.experts_per_token if settings.staging else 0
+        # Spare rows for asynchronous exchanges follow the staging rows in
+        # VRAM and the cold rows in RAM; logical slots map to physical rows
+        # through hot_rows / cold_rows, which flip when a transfer commits.
+        self.spare_slots = settings.temp_slots if settings.async_migration else 0
+        staging_end = slots + self.staging_slots
+        self.bank_rows = staging_end + self.spare_slots
+        self.cold_rows_total = self.cold_slots + self.spare_slots
         self.bank = {}
         self.hot = {}
         self.staging = {}
@@ -407,36 +424,53 @@ class TierLayer:
         # Slicing without an independent allocation would retain the full bank.
         for name, source in sources.items():
             self.bank[name] = torch.zeros(
-                (slots + self.staging_slots, *source.shape[1:]),
+                (self.bank_rows, *source.shape[1:]),
                 dtype=source.dtype,
                 device=self.device,
             )
             self.hot[name] = self.bank[name][:slots]
-            self.staging[name] = self.bank[name][slots:]
+            self.staging[name] = self.bank[name][slots:staging_end]
             self.cold_cpu[name] = torch.empty(
-                (self.cold_slots, *source.shape[1:]),
+                (self.cold_rows_total, *source.shape[1:]),
                 dtype=source.dtype,
                 device="cpu",
                 pin_memory=True,
             )
-            self.cold_cpu[name].copy_(source[slots:])
+            self.cold_cpu[name][: self.cold_slots].copy_(source[slots:])
             self.hot[name].copy_(source[:slots], non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
         self.cold = {
             name: get_accelerator_view_from_cpu_tensor(t)
             for name, t in self.cold_cpu.items()
         }
+        self.hot_rows = list(range(slots))
+        self.cold_rows = list(range(self.cold_slots))
+        self.vram_spares = SpareRing(range(staging_end, self.bank_rows))
+        self.ram_spares = SpareRing(range(self.cold_slots, self.cold_rows_total))
         self.hot_map_host = tuple(range(slots)) + (-1,) * self.cold_slots
         self.cold_map_host = (-1,) * slots + tuple(range(self.cold_slots))
         self.hot_map = self.cold_map = None
         self.publish_maps()
-        self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
-        self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
+        # With spare rows a logical hot slot can live anywhere in the bank,
+        # so the kernels address the whole bank / whole cold bank.
+        if self.spare_slots:
+            self.hot_tensors, self.hot_local = self.bank, self.bank_rows
+            self.cold_local = self.cold_rows_total
+        else:
+            self.hot_tensors, self.hot_local = self.hot, slots
+            self.cold_local = self.cold_slots
+        self.hot_kernel, self.hot_quant = self.make_kernel(
+            self.hot_tensors, self.hot_local
+        )
+        self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_local)
         self.bank_kernel = self.bank_quant = None
         if self.staging_slots:
-            self.bank_kernel, self.bank_quant = self.make_kernel(
-                self.bank, slots + self.staging_slots
-            )
+            if self.spare_slots:
+                self.bank_kernel, self.bank_quant = self.hot_kernel, self.hot_quant
+            else:
+                self.bank_kernel, self.bank_quant = self.make_kernel(
+                    self.bank, self.bank_rows
+                )
         self.marlin_workspace = None
         if settings.split == "fused":
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -449,9 +483,9 @@ class TierLayer:
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
         self.staging_bytes = self.row_bytes * self.staging_slots
-        self.cold_bytes = sum(
-            t.numel() * t.element_size() for t in self.cold_cpu.values()
-        )
+        self.spare_bytes = self.row_bytes * self.spare_slots
+        self.cold_bytes = self.row_bytes * self.cold_slots
+        self.cold_spare_bytes = self.row_bytes * self.spare_slots
         if self.hot_bytes + self.cold_bytes != self.row_bytes * self.num_experts:
             raise AssertionError("Exclusive partition lost or duplicated source bytes")
         self.coordinator = None
@@ -492,9 +526,24 @@ class TierLayer:
             self.hot_map_host, self.cold_map_host, self.hot_slots, self.cold_slots
         )
         # Pageable staging: the runtime finishes reading it before returning,
-        # so no pinned host buffer can be overwritten during DMA.
-        hot = torch.tensor(self.hot_map_host, dtype=torch.int32)
-        cold = torch.tensor(self.cold_map_host, dtype=torch.int32)
+        # so no pinned host buffer can be overwritten during DMA. Device maps
+        # hold physical rows; the host maps stay logical for the policy.
+        hot_rows = getattr(self, "hot_rows", None)
+        cold_rows = getattr(self, "cold_rows", None)
+        hot = torch.tensor(
+            [
+                (hot_rows[v] if hot_rows is not None else v) if v >= 0 else -1
+                for v in self.hot_map_host
+            ],
+            dtype=torch.int32,
+        )
+        cold = torch.tensor(
+            [
+                (cold_rows[v] if cold_rows is not None else v) if v >= 0 else -1
+                for v in self.cold_map_host
+            ],
+            dtype=torch.int32,
+        )
         if self.hot_map is None or self.cold_map is None:
             self.hot_map, self.cold_map = hot.to(self.device), cold.to(self.device)
             return
@@ -529,7 +578,12 @@ class TierLayer:
         # runs, and keep the two calls on one stream. Neither prepare mutates x
         # on this verified BF16 NoDPEP path (router-on-input is rejected).
         hot = self.call(
-            self.hot_kernel, self.hot, self.hot_map, x, weights, ids
+            self.hot_kernel,
+            getattr(self, "hot_tensors", self.hot),
+            self.hot_map,
+            x,
+            weights,
+            ids,
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
@@ -547,6 +601,8 @@ class TierLayer:
 
         if self.bank_kernel is None:
             raise RuntimeError("Staging requires the bank kernel")
+        # Staging rows start right after the logical hot region; spare rows
+        # (if any) lie beyond them, so staged and spare rows never collide.
         gather, expert_map, count = plan_staging(
             ids, self.cold_map, self.hot_map, self.hot_slots, self.staging_slots
         )
@@ -560,7 +616,7 @@ class TierLayer:
                     self.bank_kernel.fused_experts,
                     self.bank,
                     expert_map,
-                    self.hot_slots + self.staging_slots,
+                    getattr(self, "bank_rows", self.hot_slots + self.staging_slots),
                 ),
             ),
         )
@@ -578,12 +634,17 @@ class TierLayer:
         by init verification.
         """
         partitions = (
-            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
+            (
+                self.hot_kernel.fused_experts,
+                getattr(self, "hot_tensors", self.hot),
+                self.hot_map,
+                getattr(self, "hot_local", self.hot_slots),
+            ),
             (
                 self.cold_kernel.fused_experts,
                 self.cold,
                 self.cold_map,
-                self.cold_slots,
+                getattr(self, "cold_local", self.cold_slots),
             ),
         )
         return self._run_marlin_chains(x, weights, ids, partitions)
@@ -677,18 +738,68 @@ class TierLayer:
             cold_slot,
         )
 
+    def resolve_hot_row(self, hot_slot):
+        rows = getattr(self, "hot_rows", None)
+        return hot_slot if rows is None else rows[hot_slot]
+
+    def resolve_cold_row(self, cold_slot):
+        rows = getattr(self, "cold_rows", None)
+        return cold_slot if rows is None else rows[cold_slot]
+
     def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
         """One sequential swap with its own waits; used by init verification."""
         self.stage_swap(old_expert, new_expert, hot_slot, cold_slot)
         swap_tensor_rows(
-            self.hot,
+            getattr(self, "bank", self.hot),
             self.cold_cpu,
             temporary,
-            hot_slot,
-            cold_slot,
+            self.resolve_hot_row(hot_slot),
+            self.resolve_cold_row(cold_slot),
             _current_stream(self.device).synchronize,
         )
         self.publish_maps()
+
+    def enqueue_swap(self, swap, stream):
+        """Queue one exchange on the migration stream; nothing is published.
+
+        The promoted cold expert is copied into a spare VRAM row and the
+        evicted hot expert into a spare RAM row. The rows currently backing
+        the two logical slots are only read, so the next forward may keep
+        using the old placement. Each spare row's fence (the last reader of
+        its previous content) is waited for before it is written.
+        """
+        from .async_migration import _on_stream, _stream_wait_event
+
+        vram_spare = self.vram_spares.pop()
+        ram_spare = self.ram_spares.pop()
+        _stream_wait_event(stream, vram_spare.fence)
+        _stream_wait_event(stream, ram_spare.fence)
+        hot_row = self.resolve_hot_row(swap.hot_slot)
+        cold_row = self.resolve_cold_row(swap.cold_slot)
+        with _on_stream(stream):
+            for name in TENSORS:
+                self.bank[name][vram_spare.row].copy_(
+                    self.cold[name][cold_row], non_blocking=True
+                )
+                self.cold_cpu[name][ram_spare.row].copy_(
+                    self.bank[name][hot_row], non_blocking=True
+                )
+        return vram_spare, ram_spare
+
+    def flip_swap(self, swap, vram_spare, ram_spare, retire_fence):
+        """Point the logical slots at the transferred rows; retire the old.
+
+        Called at a boundary after the transfer completed. The retired rows
+        go back to their rings behind `retire_fence`, recorded on the
+        compute stream after the last forward that read them.
+        """
+        old_row = self.hot_rows[swap.hot_slot]
+        old_ram = self.cold_rows[swap.cold_slot]
+        self.hot_rows[swap.hot_slot] = vram_spare.row
+        self.cold_rows[swap.cold_slot] = ram_spare.row
+        self.vram_spares.push(old_row, retire_fence)
+        self.ram_spares.push(old_ram, retire_fence)
+        self.stage_swap(swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot)
 
     def verify_initial(self, original_kernel, original, temporary):
         """Controlled nonzero BF16 routes exercise both partitions and a swap."""
@@ -1033,6 +1144,8 @@ class TierCoordinator:
         self.snapshot_session: Any = None
         # Whether the last device snapshot counted hot hits from real maps.
         self.route_hot_measured = False
+        # One asynchronous exchange plan in flight, at most.
+        self.pending: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
@@ -1203,6 +1316,9 @@ class TierCoordinator:
                 raise
 
     def _flush_locked(self, plan):
+        # A started transaction is decided before any import, whatever
+        # `plan` says; `plan` only controls whether a new plan may be made.
+        self.settle_pending(wait=True)
         result = self.observer.flush()
         if result is not None:
             self._consume(result, plan)
@@ -1229,6 +1345,9 @@ class TierCoordinator:
             self.stats["recorded_forwards"] += 1
         stream = _current_stream(self.device)
         self.adopt_stream(stream, True)
+        # A pending exchange decides here, before this forward is observed:
+        # the flip and the policy commit precede any new observation or plan.
+        self.settle_pending(wait=True)
         result = self.observer.finish(
             rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
         )
@@ -1344,6 +1463,21 @@ class TierCoordinator:
             plan = self.policy.plan_resync()
             self.stats["policy_plan_seconds"] += time.perf_counter() - started
             if plan is not None:
+                if plan.swaps and self.settings.async_migration:
+                    from .async_migration import preflight
+
+                    if self.pending is not None:
+                        raise RuntimeError("An exchange plan is already pending")
+                    budgets = {
+                        i: min(layer.vram_spares.free, layer.ram_spares.free)
+                        for i, layer in enumerate(self.layers)
+                    }
+                    verdict = preflight(plan.swaps, budgets)
+                    if verdict.eligible:
+                        self._begin_async(plan, verdict)
+                        return
+                    self.stats["sync_fallbacks"] += 1
+                    self.stats["fallback_" + str(verdict.reason)] += 1
                 migration_started = time.perf_counter() if plan.swaps else None
                 self.migrate(plan.swaps)
                 if plan.swaps:
@@ -1372,6 +1506,92 @@ class TierCoordinator:
                         raise AssertionError("Policy and physical tier maps diverged")
                 self.stats["policy_commit_seconds"] += time.perf_counter() - started
 
+    def _begin_async(self, plan, verdict):
+        """Queue a whole eligible plan on the migration stream; commit later."""
+        from .async_migration import (
+            MigrationTransaction,
+            _migration_stream,
+            _record_event,
+            _stream_wait_event,
+        )
+
+        started = time.perf_counter()
+        stream = _migration_stream(self.device)
+        # Everything this forward queued on the compute stream finishes
+        # before the migration stream reads the old rows.
+        _stream_wait_event(stream, _record_event(_current_stream(self.device)))
+        transaction = MigrationTransaction(plan, verdict, enqueued_at=started)
+        for swap in plan.swaps:
+            layer = self.layers[swap.layer]
+            vram_spare, ram_spare = layer.enqueue_swap(swap, stream)
+            transaction.entries.append((swap.layer, swap, vram_spare, ram_spare))
+        transaction.transfer_event = _record_event(stream)
+        self.pending = transaction
+        self.stats["async_plans"] += 1
+        self.stats["async_swaps_enqueued"] += len(plan.swaps)
+        self.stats["async_enqueue_seconds"] += time.perf_counter() - started
+
+    def settle_pending(self, wait):
+        """Flip and commit the pending plan once its transfers completed.
+
+        Returns True when a plan was committed. With `wait=False` an
+        incomplete transfer leaves the old placement in force.
+        """
+        from .async_migration import _record_event, _stream_wait_event
+
+        transaction = self.pending
+        if transaction is None:
+            return False
+        event = transaction.transfer_event
+        if not event.query():
+            if not wait:
+                self.stats["async_pending_boundaries"] += 1
+                return False
+            started = time.perf_counter()
+            event.synchronize()
+            self.stats["async_wait_seconds"] += time.perf_counter() - started
+        compute = _current_stream(self.device)
+        # Later compute reads the new rows only after the transfers, and the
+        # retired rows may be rewritten only after this forward's reads.
+        _stream_wait_event(compute, event)
+        retire_fence = _record_event(compute)
+        touched = []
+        for layer_index, swap, vram_spare, ram_spare in transaction.entries:
+            layer = self.layers[layer_index]
+            layer.flip_swap(swap, vram_spare, ram_spare, retire_fence)
+            self.stats["swaps"] += 1
+            self.per_layer_swaps[layer_index] += 1
+            self.stats["h2d_bytes"] += layer.row_bytes
+            self.stats["d2h_bytes"] += layer.row_bytes
+            if layer not in touched:
+                touched.append(layer)
+        for layer in touched:
+            layer.publish_maps()
+        started = time.perf_counter()
+        self.policy.commit(transaction.plan)
+        self.stats["resyncs"] += 1
+        self.stats["async_commits"] += 1
+        for i, layer in enumerate(self.layers):
+            if (
+                tuple(self.policy.expert_to_hot[i]) != layer.hot_map_host
+                or tuple(self.policy.expert_to_cold[i]) != layer.cold_map_host
+            ):
+                raise AssertionError("Policy and physical tier maps diverged")
+        self.stats["policy_commit_seconds"] += time.perf_counter() - started
+        self.stats["async_flip_delay_seconds"] += (
+            time.perf_counter() - transaction.enqueued_at
+        )
+        rebase = getattr(self.observer, "rebase", None)
+        if rebase is not None:
+            rebase(
+                tokens_total=self.policy.tokens_total,
+                version=self.policy.version,
+                last_sync_tokens=self.policy.last_sync_tokens,
+            )
+        transaction.state = "committed"
+        self.pending = None
+        return True
+
     def migrate(self, swaps):
         """Move a plan's rows in slot-independent waves, in plan order.
 
@@ -1388,13 +1608,15 @@ class TierCoordinator:
                 layer.stage_swap(
                     swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot
                 )
+                resolve_hot = getattr(layer, "resolve_hot_row", lambda slot: slot)
+                resolve_cold = getattr(layer, "resolve_cold_row", lambda slot: slot)
                 items.append(
                     (
-                        layer.hot,
+                        getattr(layer, "bank", layer.hot),
                         layer.cold_cpu,
                         temporary_row(self.temporary, index),
-                        swap.hot_slot,
-                        swap.cold_slot,
+                        resolve_hot(swap.hot_slot),
+                        resolve_cold(swap.cold_slot),
                     )
                 )
                 if layer not in touched:
@@ -1426,6 +1648,14 @@ class TierCoordinator:
             "resyncs",
             "migration_waves",
             "max_wave_swaps",
+            "async_plans",
+            "async_commits",
+            "async_swaps_enqueued",
+            "async_pending_boundaries",
+            "async_wait_seconds",
+            "async_enqueue_seconds",
+            "async_flip_delay_seconds",
+            "sync_fallbacks",
             "recorded_forwards",
             "replayed_forwards",
             "captured_forwards",
@@ -1458,6 +1688,7 @@ class TierCoordinator:
                 "heat_enabled": self.heat_enabled,
                 "pending_layers": self.recorded,
                 "unfinished_forward_rows": self.forward_rows,
+                "async_pending": self.pending is not None,
                 "per_layer_swaps": list(self.per_layer_swaps),
                 "policy_cpu_seconds": sum(
                     self.stats[key]
@@ -1487,6 +1718,7 @@ class TierCoordinator:
             if self.forward_rows is not None:
                 # The last direct warmup/capture forward is startup work.
                 self.discard_unconsumed("heat enabled")
+            self.settle_pending(wait=True)
             if self.stream is not None:
                 self.stream.synchronize()
             startup = dict(self.stats)
@@ -1707,8 +1939,9 @@ def initialize_model(model, model_config):
             f"Expected all 48 FlashNext MoE layers, found {len(candidates)}"
         )
     staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
+    spare_rows = settings.temp_slots if settings.async_migration else 0
     slots, expected_bytes = uniform_slots(
-        settings.capacity_bytes, row_sizes, 512, reserve=staging_rows
+        settings.capacity_bytes, row_sizes, 512, reserve=staging_rows + spare_rows
     )
     if not 0 < slots < 512:
         raise ValueError("Expert tier requires both a hot and cold partition")
@@ -1770,7 +2003,7 @@ def initialize_model(model, model_config):
     model._lab_expert_tier_coordinator = coordinator
     atexit.register(coordinator.report)
     atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
-    actual_bytes = sum(t.hot_bytes + t.staging_bytes for t in tiers)
+    actual_bytes = sum(t.hot_bytes + t.staging_bytes + t.spare_bytes for t in tiers)
     if actual_bytes != expected_bytes or actual_bytes > settings.capacity_bytes:
         raise AssertionError("Tier exceeds exact six-tensor GPU budget")
     LOGGER.warning(
@@ -1785,7 +2018,11 @@ def initialize_model(model, model_config):
                 "gpu_weight_bytes": actual_bytes,
                 "staging_slots_per_layer": staging_rows,
                 "staging_bytes": sum(t.staging_bytes for t in tiers),
+                "spare_rows_per_layer": spare_rows,
+                "spare_bytes": sum(t.spare_bytes for t in tiers),
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
+                "host_cold_spare_bytes": sum(t.cold_spare_bytes for t in tiers),
+                "async_migration": settings.async_migration,
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
