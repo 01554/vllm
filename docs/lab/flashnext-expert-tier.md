@@ -207,13 +207,18 @@ boundaries:
   the torch semantics for tests) decides each layer step which selected
   cold experts are promoted, which unselected hot experts are evicted
   (least recent, tie by logical hot slot), and which misses are staged only;
-  the flip (`promote.py`) updates the device tables (logical owner maps,
-  logical-to-physical rows, a free VRAM ring of `TEMP_SLOTS` rows, a RAM
-  pool of `TEMP_SLOTS` unreferenced rows with shadow tags) and writes the
-  copy lists and the step map; one launch gathers promoted and staged rows
-  from RAM, one evicts victims to RAM, then the bank kernel runs through the
-  step map. Everything is on the compute stream with fixed shapes and no
-  host sync per step. Ownership: hot and cold owner maps stay exclusive; a
+  the flip (`promote.py`) updates the device tables first (logical owner
+  maps, logical-to-physical rows, a free VRAM ring of `TEMP_SLOTS` rows, a
+  RAM pool of `TEMP_SLOTS` unreferenced rows with shadow tags) and writes
+  the copy lists and the step map; then one launch gathers promoted and
+  staged rows from RAM, one evicts victims to RAM, and the bank kernel runs
+  through the step map. The actual order is flip → gather → evict → MoE:
+  the tables describe the placement the rest of the step will produce, and
+  nothing reads them in between because all of it is queued on the compute
+  stream and the host only reads the tables at forward boundaries (stats
+  reports). Map publication is therefore not "after transfer completion"
+  in a host sense; correctness rests on stream order, and any failure
+  poisons the tier. Ownership: hot and cold owner maps stay exclusive; a
   hot expert may keep a valid RAM copy (its shadow), reclaimed without a
   copy if it is evicted while the shadow is intact. The heat policy only
   observes; the host maps are refreshed from the device at each stats

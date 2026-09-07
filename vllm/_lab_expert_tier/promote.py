@@ -9,16 +9,19 @@ graph and on the compute stream, each layer:
 1. plans (planner module): which selected cold experts are promoted this
    step, which unselected hot experts are evicted to make room, and which
    remaining misses are only staged for this step;
-2. gathers the promoted and staged experts' rows from RAM into VRAM;
-3. evicts the victims' rows from VRAM into RAM;
-4. flips the device tables so the promoted experts are hot and the victims
-   are cold, and builds the step's expert map;
+2. flips the device tables so the promoted experts are hot and the victims
+   are cold, and writes the copy lists and the step's expert map;
+3. gathers the promoted and staged experts' rows from RAM into VRAM;
+4. evicts the victims' rows from VRAM into RAM;
 5. runs the MoE kernels on the bank through that map.
 
-All of it runs on one stream with fixed shapes, so ordering is by stream
-order alone: reads of a row always precede the write that recycles it, and
-no host synchronization is needed per step. The host learns the placement
-only from periodic snapshots and never treats its own maps as the truth.
+The tables are updated before the copies: they describe the placement the
+rest of the step produces. All of it is queued on one stream with fixed
+shapes, so ordering is by stream order alone: nothing reads the tables
+between the flip and the MoE kernel, reads of a row precede the write that
+recycles it, and no host synchronization is needed per step. The host reads
+the tables only at forward boundaries (stats reports) and never treats its
+own maps as the truth; a failure anywhere poisons the tier.
 
 Ownership contract (a deliberate relaxation of the exclusive placement):
 - A hot expert's previous RAM row keeps its bytes, recorded in
