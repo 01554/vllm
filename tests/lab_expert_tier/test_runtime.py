@@ -1816,15 +1816,20 @@ class TensorTests(unittest.TestCase):
         """Pool rows exceed the align op's expert limit: routes outside the
         partition become padding and only used blocks index the map."""
         expert_map = torch.tensor([550, -1, 7, -1, 1200, -1], dtype=torch.int32)
-        ids = torch.tensor([[0, 1], [-1, 4]], dtype=torch.int32)
-        self.assertEqual(rt.mask_routes(ids, expert_map).tolist(), [[0, -1], [-1, 4]])
+        ids = torch.tensor([[0, 1], [-1, 4], [6, 2]], dtype=torch.int32)
+        self.assertEqual(
+            rt.mask_routes(ids, expert_map).tolist(), [[0, -1], [-1, 4], [-1, 2]]
+        )
         # Three used blocks (12 padded tokens / block 4) then garbage.
         logical = torch.tensor([0, 4, 2, 99999, -7], dtype=torch.int32)
         post_padded = torch.tensor([12], dtype=torch.int32)
         physical = rt.physical_block_experts(logical, post_padded, 4, expert_map, 6)
         self.assertEqual(physical.tolist(), [550, 1200, 7, -1, -1])
-        self.assertLess(258, rt.ALIGN_ROW_LIMIT)
-        self.assertGreaterEqual(11520, rt.ALIGN_ROW_LIMIT)
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PROMOTE": "1"}
+        env.update({rt.PREFIX + "STAGING": "1", rt.PREFIX + "RAM_BACKING": "1"})
+        env.update({rt.PREFIX + "GLOBAL_POOL": "1", rt.PREFIX + "SPLIT": "modular"})
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
 
     def test_pool_host_swap_while_gated_copies_in_and_restores(self):
         pool, (first, second) = self.make_pool_layers()

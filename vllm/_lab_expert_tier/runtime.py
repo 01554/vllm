@@ -58,11 +58,10 @@ SCALE_PROPERTIES = {
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
 SPLIT_MODES = ("fused", "modular")
-# moe_align_block_size histograms by *mapped* id in a buffer sized by its
-# num_experts argument, which must stay below 1024 after warp padding, so a
-# bank with this many physical rows or more is aligned by logical id and
-# its blocks are mapped to rows afterwards.
-ALIGN_ROW_LIMIT = 992
+# moe_align_block_size histograms by *mapped* id in a buffer of its
+# num_experts argument (+1) entries, so a mapped row must stay below the
+# logical expert count; a bank with more physical rows than experts is
+# aligned by logical id and its blocks are mapped to rows afterwards.
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -185,6 +184,8 @@ class Settings:
             raise ValueError("RAM_BACKING requires PROMOTE=1")
         if global_pool == "1" and ram_backing != "1":
             raise ValueError("GLOBAL_POOL requires RAM_BACKING=1")
+        if global_pool == "1" and os.environ.get(PREFIX + "SPLIT", "fused") != "fused":
+            raise ValueError("GLOBAL_POOL requires SPLIT=fused")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -468,7 +469,9 @@ def mask_routes(ids, expert_map):
     """Routes whose expert is absent from `expert_map` become padding (-1)."""
     import torch
 
-    present = (ids >= 0) & (expert_map[ids.clamp(min=0).long()] >= 0)
+    num_experts = expert_map.shape[0]
+    safe = ids.clamp(0, num_experts - 1).long()
+    present = (ids >= 0) & (ids < num_experts) & (expert_map[safe] >= 0)
     return torch.where(present, ids, torch.full_like(ids, -1))
 
 
@@ -1064,7 +1067,7 @@ class TierLayer:
                 tokens, top_k, slots, self.num_experts, experts.input_dtype
             )
             routed = ids
-            if slots >= ALIGN_ROW_LIMIT:
+            if slots > self.num_experts:
                 # Align by logical id (absent experts already padding), then
                 # map the blocks to rows; the align op never sees a row id.
                 routed = mask_routes(ids, expert_map)
@@ -2545,8 +2548,12 @@ def initialize_model(model, model_config):
                 "capacity_bytes": settings.capacity_bytes,
                 "gpu_weight_bytes": actual_bytes,
                 "staging_slots_per_layer": staging_rows,
-                "staging_bytes": sum(t.staging_bytes for t in tiers),
-                "spare_rows_per_layer": spare_rows,
+                "staging_bytes": (
+                    pool.staging_bytes
+                    if pool is not None
+                    else sum(t.staging_bytes for t in tiers)
+                ),
+                "spare_rows_per_layer": 0 if pool is not None else spare_rows,
                 "spare_bytes": sum(t.spare_bytes for t in tiers),
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
                 "host_cold_spare_bytes": sum(t.cold_spare_bytes for t in tiers),
