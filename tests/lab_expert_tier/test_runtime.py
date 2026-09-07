@@ -1803,10 +1803,12 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(second.hot_map.tolist(), [-1, -1, -1, 3, 2, -1])
         first.split(x, weights, torch.tensor([[0, 5]]))
         first.split(x, weights, torch.tensor([[2, 0]]))
+        # Recency ties (rows 2 and 3 both stamped at clock 4) break toward
+        # the lower pool row, as FreeToken's usage-per-slot argmin does.
         self.assertEqual(pool.snapshot(), [3, 1])
-        self.assertEqual(second.hot_map.tolist(), [-1, -1, -1, -1, 2, -1])
+        self.assertEqual(second.hot_map.tolist(), [-1, -1, -1, 3, -1, -1])
         first.promote_snapshot()
-        self.assertEqual(first.hot_map_host, (0, -1, 3, -1, -1, 1))
+        self.assertEqual(first.hot_map_host, (0, -1, 2, -1, -1, 1))
         for name in rt.TENSORS:
             self.assertTrue(torch.equal(second.cold_cpu[name], ram_before[name]))
 

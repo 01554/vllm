@@ -60,7 +60,7 @@ def run_case(gp, graph_mode, cpu_only):
             cpu.bank[name][layer * 250 : (layer + 1) * 250].copy_(
                 sources[layer][name][:250]
             )
-    cpu.tables.last_use[:1074] = 1
+    cpu.tables.row_use[:550] = 1
     cpu.tables.clock.fill_(1)
     cb = [gp.allocate_step_buffers(torch.device("cpu"), 512, 16) for _ in range(3)]
     original = [{n: t.clone() for n, t in s.items()} for s in sources]
@@ -142,6 +142,7 @@ def run_case(gp, graph_mode, cpu_only):
                     )
                 for name in (
                     "step_map",
+                    "routes",
                     "gather_count",
                     "promoted_count",
                     "staged_count",

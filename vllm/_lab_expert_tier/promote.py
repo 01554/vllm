@@ -401,7 +401,6 @@ def check_tables(tables, hot_slots, cold_slots):
 # ----------------------------------------------------------------------------
 
 PLAN_WIDTH = 16
-COPY_BLOCK = 4096
 _KERNELS: dict[str, Any] = {}
 
 
@@ -501,18 +500,30 @@ def flip_step(tables, plan, buffers, staging_rows):
     )
 
 
+COPY_PROGRAMS_PER_BANK = 32
+COPY_WORDS = 4096  # int32 words (16 KiB) per program iteration
+
+
 def copy_rows(source, destination, src_rows, dst_rows, count):
-    """Copy `count` (src, dst) row pairs of every bank tensor; device count."""
+    """Copy `count` (src, dst) row pairs of every bank tensor; device count.
+
+    One launch of a fixed small grid (banks x COPY_PROGRAMS_PER_BANK): each
+    program streams its stripe of every row, reading `count` on the device
+    (the FreeToken multi-bank copy shape), so an empty step costs a few
+    programs instead of one per row chunk.
+    """
     src_device = source[TENSORS[0]].device
     if src_device.type != "cuda":
         n = int(count.reshape(-1)[0].item())
         pairs = [(int(src_rows[i]), int(dst_rows[i])) for i in range(n)]
         copy_rows_reference(source, destination, pairs)
         return
-    srcs = [_byte_rows(source[name]) for name in TENSORS]
-    dsts = [_byte_rows(destination[name]) for name in TENSORS]
-    widest = max(dst.shape[1] for dst in dsts)
-    grid = (src_rows.shape[0], (widest + COPY_BLOCK - 1) // COPY_BLOCK, len(TENSORS))
+    srcs = [_word_rows(source[name]) for name in TENSORS]
+    dsts = [_word_rows(destination[name]) for name in TENSORS]
+    for name, src, dst in zip(TENSORS, srcs, dsts):
+        if src.shape[1] != dst.shape[1]:
+            raise ValueError(f"{name}: destination row size differs from the source")
+    grid = (len(TENSORS) * COPY_PROGRAMS_PER_BANK,)
     _copy_kernel()[grid](
         *srcs,
         *dsts,
@@ -522,8 +533,20 @@ def copy_rows(source, destination, src_rows, dst_rows, count):
         *(dst.shape[1] for dst in dsts),
         *(src.stride(0) for src in srcs),
         *(dst.stride(0) for dst in dsts),
-        BLOCK=COPY_BLOCK,
+        PROGRAMS=COPY_PROGRAMS_PER_BANK,
+        BLOCK=COPY_WORDS,
+        num_warps=4,
     )
+
+
+def _word_rows(tensor):
+    """View a [rows, ...] contiguous tensor as [rows, int32 words]."""
+    import torch
+
+    if not tensor.is_contiguous():
+        raise ValueError("Copies require contiguous bank rows")
+    rows = tensor.shape[0]
+    return tensor.view(torch.uint8).reshape(rows, -1).view(torch.int32)
 
 
 def _byte_rows(tensor):
@@ -678,10 +701,35 @@ def _flip_kernel():
 
 
 def _copy_kernel():
-    """One launch for six bank tensors, (src row, dst row) pairs, device count."""
+    """Fixed grid: program (bank, stripe) streams its columns of every row."""
     if "copy" in _KERNELS:
         return _KERNELS["copy"]
     from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _stripe(
+        src,
+        dst,
+        src_rows_ptr,
+        dst_rows_ptr,
+        count,
+        words,
+        sstride,
+        dstride,
+        stripe,
+        PROGRAMS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        for lane in range(0, count):
+            src_row = tl.load(src_rows_ptr + lane).to(tl.int64)
+            dst_row = tl.load(dst_rows_ptr + lane).to(tl.int64)
+            src_base = src + src_row * sstride
+            dst_base = dst + dst_row * dstride
+            for start in range(stripe * BLOCK, words, PROGRAMS * BLOCK):
+                offsets = start + tl.arange(0, BLOCK)
+                mask = offsets < words
+                values = tl.load(src_base + offsets, mask=mask)
+                tl.store(dst_base + offsets, values, mask=mask)
 
     @triton.jit
     def promote_copy(
@@ -700,12 +748,12 @@ def _copy_kernel():
         src_rows_ptr,
         dst_rows_ptr,
         count_ptr,
-        bytes0,
-        bytes1,
-        bytes2,
-        bytes3,
-        bytes4,
-        bytes5,
+        words0,
+        words1,
+        words2,
+        words3,
+        words4,
+        words5,
         sstride0,
         sstride1,
         sstride2,
@@ -718,43 +766,96 @@ def _copy_kernel():
         dstride3,
         dstride4,
         dstride5,
+        PROGRAMS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        lane = tl.program_id(0)
-        chunk = tl.program_id(1)
-        which = tl.program_id(2)
+        which = tl.program_id(0) // PROGRAMS
+        stripe = tl.program_id(0) % PROGRAMS
         count = tl.load(count_ptr)
-        if lane >= count:
-            return
-        # Row times byte stride exceeds int32 for large banks (a shared
-        # staging row near 12000 times a 1.6 MB row): keep rows in int64.
-        src_row = tl.load(src_rows_ptr + lane).to(tl.int64)
-        dst_row = tl.load(dst_rows_ptr + lane).to(tl.int64)
-        offsets = chunk * BLOCK + tl.arange(0, BLOCK)
         if which == 0:
-            mask = offsets < bytes0
-            values = tl.load(src0 + src_row * sstride0 + offsets, mask=mask)
-            tl.store(dst0 + dst_row * dstride0 + offsets, values, mask=mask)
+            _stripe(
+                src0,
+                dst0,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words0,
+                sstride0,
+                dstride0,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
         elif which == 1:
-            mask = offsets < bytes1
-            values = tl.load(src1 + src_row * sstride1 + offsets, mask=mask)
-            tl.store(dst1 + dst_row * dstride1 + offsets, values, mask=mask)
+            _stripe(
+                src1,
+                dst1,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words1,
+                sstride1,
+                dstride1,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
         elif which == 2:
-            mask = offsets < bytes2
-            values = tl.load(src2 + src_row * sstride2 + offsets, mask=mask)
-            tl.store(dst2 + dst_row * dstride2 + offsets, values, mask=mask)
+            _stripe(
+                src2,
+                dst2,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words2,
+                sstride2,
+                dstride2,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
         elif which == 3:
-            mask = offsets < bytes3
-            values = tl.load(src3 + src_row * sstride3 + offsets, mask=mask)
-            tl.store(dst3 + dst_row * dstride3 + offsets, values, mask=mask)
+            _stripe(
+                src3,
+                dst3,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words3,
+                sstride3,
+                dstride3,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
         elif which == 4:
-            mask = offsets < bytes4
-            values = tl.load(src4 + src_row * sstride4 + offsets, mask=mask)
-            tl.store(dst4 + dst_row * dstride4 + offsets, values, mask=mask)
+            _stripe(
+                src4,
+                dst4,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words4,
+                sstride4,
+                dstride4,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
         else:
-            mask = offsets < bytes5
-            values = tl.load(src5 + src_row * sstride5 + offsets, mask=mask)
-            tl.store(dst5 + dst_row * dstride5 + offsets, values, mask=mask)
+            _stripe(
+                src5,
+                dst5,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words5,
+                sstride5,
+                dstride5,
+                stripe,
+                PROGRAMS,
+                BLOCK,
+            )
 
     _KERNELS["copy"] = promote_copy
     return promote_copy
