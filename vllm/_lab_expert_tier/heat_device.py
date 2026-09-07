@@ -542,7 +542,9 @@ class DeviceHeatAccumulator:
             self._set_gate(heat_enabled)
 
         self._error_flag.logical_or_(self._expected_layer.ne(self.num_layers))
-        self._error_flag.logical_or_(self._step_valid_tokens.ne(num_tokens))
+        self._error_flag.logical_or_(
+            self._enabled & self._step_valid_tokens.ne(num_tokens)
+        )
 
         # Counts are cast once into persistent float64 scratch storage.  The
         # heat update remains a separate multiply and add, never a fused or
