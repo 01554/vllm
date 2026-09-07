@@ -117,6 +117,9 @@ _MAX_HEADER_BYTES = 100 << 20  # 100 MB
 _PREWARM_HEADROOM_BYTES = 8 << 30  # 8 GiB
 _LOG_INTERVAL_S = 60.0
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
+# Bound this path by raw requested rows so duplicate-heavy prefill stays on
+# the deduplicating path; this is for small decode batches only.
+_SMALL_GATHER_MAX_ROWS = 128
 
 _SHARD_RE = re.compile(
     r"layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$"
@@ -138,6 +141,28 @@ def _itemsize(dtype_str: str) -> int:
     if torch_dtype is None:
         raise ValueError(f"PLE mmap: unrecognized safetensors dtype {dtype_str!r}")
     return get_dtype_size(torch_dtype)
+
+
+def _has_noncontiguous_shard_runs(shard: np.ndarray) -> bool:
+    """Return whether a shard appears again after a different shard.
+
+    The bounded gather can copy each contiguous shard run directly.  If a
+    shard is interleaved with another one, the existing deduplicating path is
+    safer for page-cache traffic and repeated rows.  This small Python pass
+    avoids paying ``np.unique`` just to decide whether the fast path applies.
+    """
+    seen: set[int] = set()
+    previous = int(shard[0])
+    seen.add(previous)
+    for value in shard[1:]:
+        current = int(value)
+        if current == previous:
+            continue
+        if current in seen:
+            return True
+        seen.add(current)
+        previous = current
+    return False
 
 
 def enabled() -> bool:
@@ -609,6 +634,21 @@ class MmapPleTable:
         ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
         if ids.size == 0:
             return np.empty((0, self.row_bytes), dtype=np.uint8)
+
+        # SERIAL remains opt-in; for bounded small calls, direct copies avoid
+        # unique/inverse allocation while preserving order and duplicates.
+        # Use raw row count to bound repeated reads, and keep readahead on its
+        # existing segmented path because its pre-pass needs sorted uniques.
+        if (
+            self.serial > 0
+            and ids.size <= self.serial
+            and ids.size <= _SMALL_GATHER_MAX_ROWS
+            and self.readahead == 0
+        ):
+            shard = ids // self.shard_size
+            if not _has_noncontiguous_shard_runs(shard):
+                return self._gather_small(ids, shard, start_t)
+
         uniq, inverse = np.unique(ids, return_inverse=True)
         if uniq[0] < 0 or uniq[-1] >= self.rows_total:
             self._errors += 1
@@ -704,6 +744,66 @@ class MmapPleTable:
             serial,
         )
         return gathered
+
+    def _gather_small(
+        self, ids: np.ndarray, shard: np.ndarray, start_t: float
+    ) -> np.ndarray:
+        """Gather a bounded request directly into its final output buffer.
+
+        This opt-in ``SERIAL`` path avoids unique/inverse work for bounded
+        raw requests. Assignments copy bytes out of the memmap, so no view
+        survives the call or depends on table lifetime.
+        """
+        lowest = ids.min()
+        highest = ids.max()
+        if lowest < 0 or highest >= self.rows_total:
+            self._errors += 1
+            raise IndexError(
+                f"PLE mmap: row id out of range [{lowest}, {highest}] "
+                f"for {self.rows_total} rows"
+            )
+
+        local = ids - shard * self.shard_size
+        out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
+        copy_t = time.monotonic()
+        try:
+            # Group adjacent rows in one shard; use scalar copies for scatter.
+            if np.all(shard[1:] != shard[:-1]):
+                for row, (shard_idx, local_idx) in enumerate(zip(shard, local)):
+                    mm = self.mm[int(shard_idx)]
+                    if mm is None:
+                        raise IndexError(f"PLE mmap: shard {int(shard_idx)} missing")
+                    out[row] = mm[int(local_idx)]
+            else:
+                start = 0
+                while start < ids.size:
+                    shard_idx = int(shard[start])
+                    end = start + 1
+                    while end < ids.size and shard[end] == shard_idx:
+                        end += 1
+                    mm = self.mm[shard_idx]
+                    if mm is None:
+                        raise IndexError(f"PLE mmap: shard {shard_idx} missing")
+                    if end - start == 1:
+                        out[start] = mm[int(local[start])]
+                    else:
+                        out[start:end] = mm[local[start:end]]
+                    start = end
+        except Exception:
+            self._errors += 1
+            raise
+
+        copy_ms = (time.monotonic() - copy_t) * 1000.0
+        self._record(
+            int(ids.size),
+            0,
+            (time.monotonic() - start_t) * 1000.0,
+            0.0,
+            copy_ms,
+            0,
+            True,
+        )
+        return out
 
     def _record(
         self,
