@@ -94,6 +94,7 @@ class InvariantTests(unittest.TestCase):
             ("GIB", "-1"),
             ("VERIFY_INIT", "2"),
             ("STATS_EVERY", "0"),
+            ("TEMP_SLOTS", "0"),
         ):
             env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
@@ -109,6 +110,7 @@ class InvariantTests(unittest.TestCase):
             "DWELL_TOKENS": "12",
             "MAX_SWAPS_PER_RESYNC": "3",
             "STATS_EVERY": "1",
+            "TEMP_SLOTS": "4",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -117,7 +119,7 @@ class InvariantTests(unittest.TestCase):
         coordinator = rt.TierCoordinator(
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
-        self.assertEqual(settings.stats_every, 1)
+        self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,
@@ -466,14 +468,16 @@ class TensorTests(unittest.TestCase):
         )
         coordinator = self.make_coordinator(settings=settings)
         coordinator.enable_heat()
-        events: list[str | tuple[int, int, int]] = []
+        events: list[Any] = []
         stream = SimpleNamespace(
             cuda_stream=7, synchronize=lambda: events.append("synchronized")
         )
         for layer in coordinator.layers:
             layer.row_bytes = 12
+            layer.hot, layer.cold_cpu = {"h": layer.index}, {"c": layer.index}
+            layer.publish_maps = Mock(side_effect=lambda: events.append("published"))
 
-            def swap(old, new, hot_slot, cold_slot, temporary, layer=layer):
+            def stage_swap(old, new, hot_slot, cold_slot, layer=layer):
                 # Accounting must reflect where the just-completed forward ran.
                 self.assertEqual(coordinator.stats["route_hot"], 0)
                 self.assertEqual(coordinator.stats["route_total"], 4)
@@ -487,17 +491,40 @@ class TensorTests(unittest.TestCase):
                 )
                 events.append((layer.index, old, new))
 
-            layer.swap = swap
+            layer.stage_swap = stage_swap
+
+        def wave(items, synchronize):
+            events.append(
+                ("wave", [(h["h"], c["c"], hs, cs) for h, c, _, hs, cs in items])
+            )
+            synchronize()
+
         record = torch.tensor([[2, 2, 1, 1, 1]], dtype=torch.int32)
         with (
             patch.object(rt, "_current_stream", return_value=stream),
+            patch.object(rt, "swap_tensor_rows_wave", wave),
             patch.object(
                 rt.time, "perf_counter", side_effect=[10, 11, 20, 22, 30, 35, 40, 43]
             ),
         ):
             self.replay(coordinator, record)
-        # The boundary D2H wait, then the completed-migration wait.
-        self.assertEqual(events, ["synchronized", (0, 0, 2), "synchronized"])
+        # Boundary D2H wait, staged maps, the wave's wait, publication, then
+        # the completed-migration wait.
+        self.assertEqual(
+            events,
+            [
+                "synchronized",
+                (0, 0, 2),
+                ("wave", [(0, 0, 0, 0)]),
+                "synchronized",
+                "published",
+                "synchronized",
+            ],
+        )
+        self.assertEqual(
+            (coordinator.stats["migration_waves"], coordinator.stats["max_wave_swaps"]),
+            (1, 1),
+        )
         self.assertEqual(coordinator.per_layer_swaps, [1, 0])
         self.assertEqual(
             (
@@ -720,6 +747,117 @@ class TensorTests(unittest.TestCase):
             )
             with self.assertRaises(RuntimeError):
                 unallocated.begin_layer(coordinator.layers[0], x, weights, ids)
+
+    def test_waves_split_on_slot_reuse_and_temp_budget_only(self):
+        from lab_expert_tier.tier_policy import Swap
+
+        reuse = (Swap(0, 0, 0, 2, 0), Swap(0, 0, 1, 0, 1))
+        self.assertEqual(rt.plan_waves(reuse, 8), [[reuse[0]], [reuse[1]]])
+        spread = (Swap(0, 0, 0, 2, 0), Swap(1, 0, 0, 2, 0), Swap(0, 1, 1, 3, 1))
+        self.assertEqual(rt.plan_waves(spread, 8), [list(spread)])
+        self.assertEqual(rt.plan_waves(spread, 2), [list(spread[:2]), [spread[2]]])
+        cold_reuse = (Swap(0, 0, 0, 2, 0), Swap(0, 1, 0, 3, 2))
+        self.assertEqual(
+            rt.plan_waves(cold_reuse, 8), [[cold_reuse[0]], [cold_reuse[1]]]
+        )
+        self.assertEqual(rt.plan_waves((), 8), [])
+        with self.assertRaises(ValueError):
+            rt.plan_waves(spread, 0)
+
+    def test_wave_phases_wait_between_all_d2h_all_h2d_and_host_writes(self):
+        events: list[Any] = []
+
+        class Row:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def copy_(self, other, non_blocking=False):
+                events.append((self.tag, other.tag))
+
+        def bank(tag, rows):
+            return {
+                name: [Row(f"{tag}{i}") for i in range(rows)] for name in rt.TENSORS
+            }
+
+        temporary = {name: [Row("t0"), Row("t1")] for name in rt.TENSORS}
+        items = [
+            (bank("h", 2), bank("c", 2), rt.temporary_row(temporary, 0), 0, 1),
+            (bank("H", 2), bank("C", 2), rt.temporary_row(temporary, 1), 1, 0),
+        ]
+        rt.swap_tensor_rows_wave(items, lambda: events.append("wait"))
+        per_phase = len(rt.TENSORS)
+        self.assertEqual(events[:per_phase], [("t0", "h0")] * per_phase)
+        self.assertEqual(events[per_phase : 2 * per_phase], [("t1", "H1")] * per_phase)
+        self.assertEqual(events[2 * per_phase], "wait")
+        h2d = events[2 * per_phase + 1 : 4 * per_phase + 1]
+        self.assertEqual(h2d, [("h0", "c1")] * per_phase + [("H1", "C0")] * per_phase)
+        self.assertEqual(events[4 * per_phase + 1], "wait")
+        host = events[4 * per_phase + 2 :]
+        self.assertEqual(host, [("c1", "t0")] * per_phase + [("C0", "t1")] * per_phase)
+
+    def test_wave_migration_matches_sequential_swaps_byte_for_byte(self):
+        from lab_expert_tier.tier_policy import Swap
+
+        def make_layer(index, seed):
+            layer = object.__new__(rt.TierLayer)
+            layer.index, layer.device = index, torch.device("cpu")
+            layer.num_experts, layer.hot_slots, layer.cold_slots = 5, 2, 3
+            layer.row_bytes = 6
+            layer.hot = {
+                name: (torch.arange(2 * 3) + 100 * seed + 10 * i)
+                .reshape(2, 3)
+                .to(torch.int32)
+                for i, name in enumerate(rt.TENSORS)
+            }
+            layer.cold_cpu = {
+                name: (torch.arange(3 * 3) + 100 * seed + 10 * i + 50)
+                .reshape(3, 3)
+                .to(torch.int32)
+                for i, name in enumerate(rt.TENSORS)
+            }
+            layer.hot_map_host = (0, 1, -1, -1, -1)
+            layer.cold_map_host = (-1, -1, 0, 1, 2)
+            layer.hot_map = layer.cold_map = None
+            layer.publish_maps()
+            return layer
+
+        # Plan order matters: the third swap reuses hot slot 0 of layer 0 and
+        # must follow the first physically, so it opens a second wave; the
+        # fourth reuses cold slot 0 from the first wave only and joins the
+        # second. Layer 1's independent swap shares the first wave.
+        plan = (
+            Swap(0, 0, 0, 0, 2),
+            Swap(1, 1, 2, 1, 4),
+            Swap(0, 0, 1, 2, 3),
+            Swap(0, 1, 0, 1, 0),
+        )
+        sequential = [make_layer(i, i + 1) for i in range(2)]
+        temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
+        for swap in plan:
+            sequential[swap.layer].swap(
+                swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot, temp
+            )
+        waved = [make_layer(i, i + 1) for i in range(2)]
+        pool = {name: torch.zeros(8, 3, dtype=torch.int32) for name in rt.TENSORS}
+        coordinator = rt.TierCoordinator(waved, rt.Settings(32 * 2**30), pool)
+        coordinator.device = torch.device("cpu")
+        coordinator.migrate(plan)
+        self.assertEqual(coordinator.stats["migration_waves"], 2)
+        self.assertEqual(coordinator.stats["max_wave_swaps"], 2)
+        self.assertEqual(coordinator.stats["swaps"], 4)
+        self.assertEqual(coordinator.per_layer_swaps, [3, 1])
+        for a, b in zip(sequential, waved):
+            self.assertEqual(
+                (a.hot_map_host, a.cold_map_host), (b.hot_map_host, b.cold_map_host)
+            )
+            self.assertEqual(a.hot_map.tolist(), b.hot_map.tolist())
+            self.assertEqual(a.cold_map.tolist(), b.cold_map.tolist())
+            for name in rt.TENSORS:
+                self.assertTrue(torch.equal(a.hot[name], b.hot[name]), name)
+                self.assertTrue(torch.equal(a.cold_cpu[name], b.cold_cpu[name]), name)
+        self.assertEqual(waved[0].hot_map_host, (1, -1, -1, 0, -1))
+        with self.assertRaises(AssertionError):
+            coordinator.migrate((Swap(0, 0, 0, 0, 2),))
 
     def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
         rt.finish_model_forward(SimpleNamespace(), 8)

@@ -72,6 +72,9 @@ class Settings:
     hysteresis: float = 1.3
     dwell_tokens: int = 0
     max_swaps_per_resync: int = 0
+    # Pinned RAM TEMP rows: the largest wave of slot-independent swaps that
+    # one resync moves with two stream waits instead of two per swap.
+    temp_slots: int = 8
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -97,6 +100,7 @@ class Settings:
             "HYSTERESIS",
             "DWELL_TOKENS",
             "MAX_SWAPS_PER_RESYNC",
+            "TEMP_SLOTS",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -118,10 +122,11 @@ class Settings:
                 ("SYNC_TOKENS", "50"),
                 ("DWELL_TOKENS", "0"),
                 ("MAX_SWAPS_PER_RESYNC", "0"),
+                ("TEMP_SLOTS", "8"),
             )
         }
         for key, integer in integers.items():
-            if integer < 0:
+            if integer < 0 or (key == "TEMP_SLOTS" and integer < 1):
                 raise ValueError(f"{key} must be a nonnegative integer")
         numbers = {
             key: float(os.environ.get(PREFIX + key, default))
@@ -150,6 +155,7 @@ class Settings:
             numbers["HYSTERESIS"],
             integers["DWELL_TOKENS"],
             integers["MAX_SWAPS_PER_RESYNC"],
+            integers["TEMP_SLOTS"],
         )
 
 
@@ -288,20 +294,63 @@ def maps_after_swap(hot_map, cold_map, old_expert, new_expert, hot_slot, cold_sl
     return tuple(hot), tuple(cold)
 
 
-def swap_tensor_rows(hot, cold, temporary, hot_slot, cold_slot, synchronize):
-    """Original RAM TEMP order; caller poisons on any partial-copy failure.
+def swap_tensor_rows_wave(items, synchronize):
+    """Original RAM TEMP order for a wave of slot-independent swaps.
 
-    D2H hot->TEMP completes before H2D cold->hot; the H2D must complete
-    before cold's CPU storage is overwritten with TEMP. All six tensors move.
+    Each item is (hot, cold, temporary_row, hot_slot, cold_slot) and every
+    item must own a distinct TEMP row and distinct slots. All D2H hot->TEMP
+    copies complete before any H2D cold->hot; all H2D complete before any
+    cold CPU storage is overwritten with TEMP. All six tensors move. The
+    caller poisons on any partial-copy failure.
     """
-    for name in TENSORS:
-        temporary[name].copy_(hot[name][hot_slot], non_blocking=True)
+    for hot, _, temporary, hot_slot, _ in items:
+        for name in TENSORS:
+            temporary[name].copy_(hot[name][hot_slot], non_blocking=True)
     synchronize()
-    for name in TENSORS:
-        hot[name][hot_slot].copy_(cold[name][cold_slot], non_blocking=True)
+    for hot, cold, _, hot_slot, cold_slot in items:
+        for name in TENSORS:
+            hot[name][hot_slot].copy_(cold[name][cold_slot], non_blocking=True)
     synchronize()
-    for name in TENSORS:
-        cold[name][cold_slot].copy_(temporary[name])
+    for _, cold, temporary, _, cold_slot in items:
+        for name in TENSORS:
+            cold[name][cold_slot].copy_(temporary[name])
+
+
+def swap_tensor_rows(hot, cold, temporary, hot_slot, cold_slot, synchronize):
+    swap_tensor_rows_wave(((hot, cold, temporary, hot_slot, cold_slot),), synchronize)
+
+
+def plan_waves(swaps, temp_slots):
+    """Split an ordered plan into waves that may move concurrently.
+
+    The policy may reuse a hot or cold slot later in the same plan; such a
+    swap depends on the previous physical result and starts a new wave.
+    Within a wave no (layer, slot) repeats, so the sequential and the wave
+    execution leave identical weights and maps. Waves never exceed the TEMP
+    row budget.
+    """
+    if temp_slots < 1:
+        raise ValueError("Swap waves need at least one TEMP row")
+    waves: list[list[Any]] = []
+    wave: list[Any] = []
+    used: set[tuple[int, str, int]] = set()
+    for swap in swaps:
+        keys = (
+            (swap.layer, "hot", swap.hot_slot),
+            (swap.layer, "cold", swap.cold_slot),
+        )
+        if wave and (len(wave) >= temp_slots or any(key in used for key in keys)):
+            waves.append(wave)
+            wave, used = [], set()
+        wave.append(swap)
+        used.update(keys)
+    if wave:
+        waves.append(wave)
+    return waves
+
+
+def temporary_row(temporary, index):
+    return {name: tensor[index] for name, tensor in temporary.items()}
 
 
 def replace_full_source_references(layer, method, hot, hot_kernel, hot_quant):
@@ -440,10 +489,13 @@ class TierLayer:
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
 
-    def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
-        import torch
+    def stage_swap(self, old_expert, new_expert, hot_slot, cold_slot):
+        """Validate against the current placement and advance the host maps.
 
-        maps = maps_after_swap(
+        Physical rows move afterwards (`swap_tensor_rows_wave`) and the device
+        maps are republished by the caller once the copies completed.
+        """
+        self.hot_map_host, self.cold_map_host = maps_after_swap(
             self.hot_map_host,
             self.cold_map_host,
             old_expert,
@@ -451,15 +503,18 @@ class TierLayer:
             hot_slot,
             cold_slot,
         )
+
+    def swap(self, old_expert, new_expert, hot_slot, cold_slot, temporary):
+        """One sequential swap with its own waits; used by init verification."""
+        self.stage_swap(old_expert, new_expert, hot_slot, cold_slot)
         swap_tensor_rows(
             self.hot,
             self.cold_cpu,
             temporary,
             hot_slot,
             cold_slot,
-            torch.cuda.current_stream(self.device).synchronize,
+            _current_stream(self.device).synchronize,
         )
-        self.hot_map_host, self.cold_map_host = maps
         self.publish_maps()
 
     def verify_initial(self, original_kernel, original, temporary):
@@ -837,20 +892,7 @@ class TierCoordinator:
             self.stats["policy_plan_seconds"] += time.perf_counter() - started
             if plan is not None:
                 migration_started = time.perf_counter() if plan.swaps else None
-                for swap in plan.swaps:
-                    layer = self.layers[swap.layer]
-                    layer.swap(
-                        swap.old_expert,
-                        swap.new_expert,
-                        swap.hot_slot,
-                        swap.cold_slot,
-                        self.temporary,
-                    )
-                    self.stats["swaps"] += 1
-                    self.per_layer_swaps[swap.layer] += 1
-                    self.stats["h2d_bytes"] += layer.row_bytes
-                    self.stats["d2h_bytes"] += layer.row_bytes
-                    self.stats["host_copy_bytes"] += layer.row_bytes
+                self.migrate(plan.swaps)
                 if plan.swaps:
                     # RAM TEMP already waits for its two DMA phases. Include
                     # the final in-place map publication too: this is
@@ -881,6 +923,46 @@ class TierCoordinator:
         if self.stats["model_forwards"] % self.settings.stats_every == 0:
             self.report()
 
+    def migrate(self, swaps):
+        """Move a plan's rows in slot-independent waves, in plan order.
+
+        Each wave takes two stream waits instead of two per swap; the host
+        maps advance per swap in plan order, and each touched layer's device
+        maps are republished once after its last wave completed.
+        """
+        synchronize = _current_stream(self.device).synchronize
+        touched = []
+        for wave in plan_waves(swaps, self.settings.temp_slots):
+            items = []
+            for index, swap in enumerate(wave):
+                layer = self.layers[swap.layer]
+                layer.stage_swap(
+                    swap.old_expert, swap.new_expert, swap.hot_slot, swap.cold_slot
+                )
+                items.append(
+                    (
+                        layer.hot,
+                        layer.cold_cpu,
+                        temporary_row(self.temporary, index),
+                        swap.hot_slot,
+                        swap.cold_slot,
+                    )
+                )
+                if layer not in touched:
+                    touched.append(layer)
+            swap_tensor_rows_wave(items, synchronize)
+            for swap in wave:
+                layer = self.layers[swap.layer]
+                self.stats["swaps"] += 1
+                self.per_layer_swaps[swap.layer] += 1
+                self.stats["h2d_bytes"] += layer.row_bytes
+                self.stats["d2h_bytes"] += layer.row_bytes
+                self.stats["host_copy_bytes"] += layer.row_bytes
+            self.stats["migration_waves"] += 1
+            self.stats["max_wave_swaps"] = max(self.stats["max_wave_swaps"], len(wave))
+        for layer in touched:
+            layer.publish_maps()
+
     def report(self):
         # Defaults make snapshots/deltas stable even before the first swap.
         fields = (
@@ -893,6 +975,8 @@ class TierCoordinator:
             "d2h_bytes",
             "host_copy_bytes",
             "resyncs",
+            "migration_waves",
+            "max_wave_swaps",
             "recorded_forwards",
             "replayed_forwards",
             "captured_forwards",
@@ -1154,7 +1238,7 @@ def initialize_model(model, model_config):
     first = candidates[0][1]
     temporary = {
         name: torch.empty(
-            tuple(getattr(first, name).shape[1:]),
+            (settings.temp_slots, *getattr(first, name).shape[1:]),
             dtype=getattr(first, name).dtype,
             device="cpu",
             pin_memory=True,
@@ -1164,7 +1248,7 @@ def initialize_model(model, model_config):
     tiers = []
     for index, (name, layer, method) in enumerate(candidates):
         tier, raw_refs = _compact_one(
-            index, name, layer, method, slots, settings, temporary
+            index, name, layer, method, slots, settings, temporary_row(temporary, 0)
         )
         gc.collect()
         if any(ref() is not None for ref in raw_refs):
@@ -1213,6 +1297,7 @@ def initialize_model(model, model_config):
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
+                "temporary_rows": settings.temp_slots,
                 "host_source_bytes": sum(row_sizes) * 512,
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,

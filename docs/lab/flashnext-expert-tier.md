@@ -124,6 +124,14 @@ boundaries:
   counted as `dropped_startup_records`. After heat is enabled an unfinished
   forward is an error. `captured_forwards`, `recorded_forwards`, and
   `replayed_forwards` are reported in `LAB_EXPERT_TIER_STATS`.
+- **Batched exchanges.** A resync plan is executed in waves of
+  slot-independent swaps (`plan_waves`): a wave issues every D2H hot→TEMP
+  copy, waits once, every H2D cold→hot copy, waits once, then the host
+  TEMP→cold writes. A swap that reuses a hot or cold slot touched earlier in
+  the same plan starts a new wave, so the result is byte-identical to the
+  sequential order the policy assumes. The pinned TEMP pool holds
+  `VLLM_LAB_EXPERT_TIER_TEMP_SLOTS` rows (default 8), which also caps the
+  wave size. `migration_waves` and `max_wave_swaps` are reported.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
