@@ -848,11 +848,20 @@ def unpack_routes(packed, num_experts):
             raise ValueError("Invalid model routing valid-mask value")
         if [bool(row[-1]) for row in layer] != mask:
             raise ValueError("Layer padding masks differ within model forward")
-        ids = [row[:k] for row in layer]
-        weights = [row[k : 2 * k] for row in layer]
-        routing_requirements(
-            [e for row in ids for e in row], num_experts, k, [not v for v in mask]
-        )
+        ids, weights = [], []
+        for row_index, row in enumerate(layer):
+            row_ids = row[:k]
+            for expert in row_ids:
+                if 0 <= expert < num_experts:
+                    continue
+                if expert == -1 and not mask[row_index]:
+                    continue
+                raise ValueError(
+                    f"Invalid expert ID {expert} on routing row {row_index}; "
+                    "only validated padding rows may contain -1"
+                )
+            ids.append(row_ids)
+            weights.append(row[k : 2 * k])
         if any(value not in (0, 1) for row in weights for value in row):
             raise ValueError("Invalid routing activity flag")
         routes.append(ids)
