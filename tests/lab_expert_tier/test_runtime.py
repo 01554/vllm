@@ -97,6 +97,72 @@ class InvariantTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Layer 2: 503 hot slots"):
             rt.check_verify_capacity([240, 10, 503], 512, 10)
 
+    def test_nonuniform_layers_plan_and_migrate_within_each_layer(self):
+        """Real policy with per-layer capacity: swaps respect each layer's slots."""
+        layers = [
+            SimpleNamespace(
+                index=0,
+                num_experts=4,
+                hot_slots=2,
+                cold_slots=2,
+                hot_map_host=(0, 1, -1, -1),
+                cold_map_host=(-1, -1, 0, 1),
+                row_bytes=1,
+                hot={},
+                cold_cpu={},
+                publish_maps=Mock(),
+            ),
+            SimpleNamespace(
+                index=1,
+                num_experts=4,
+                hot_slots=1,
+                cold_slots=3,
+                hot_map_host=(0, -1, -1, -1),
+                cold_map_host=(-1, 0, 1, 2),
+                row_bytes=1,
+                hot={},
+                cold_cpu={},
+                publish_maps=Mock(),
+            ),
+        ]
+        for layer in layers:
+
+            def stage_swap(old, new, hs, cs, layer=layer):
+                layer.hot_map_host, layer.cold_map_host = rt.maps_after_swap(
+                    layer.hot_map_host, layer.cold_map_host, old, new, hs, cs
+                )
+
+            layer.stage_swap = stage_swap
+        settings = rt.Settings(
+            32 * 2**30, sync_tokens=1, swaps_per_token=4, decay=1, hysteresis=1
+        )
+        coordinator = rt.TierCoordinator(layers, settings, {})
+        self.assertEqual(coordinator.policy.hot_slots_per_layer, (2, 1))
+        self.assertIsNone(coordinator.policy.hot_slots)
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
+        coordinator.enable_heat()
+        # Every step selects cold experts 2 and 3 in both layers.
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        with patch.object(rt, "swap_tensor_rows_wave", lambda items, sync: None):
+            for _ in range(2):
+                coordinator.records[:1] = record[:, None, :]
+                coordinator.finish_forward(1)
+        self.assertGreater(coordinator.stats["swaps"], 0)
+        self.assertEqual(layers[0].hot_map_host[2:], (0, 1))
+        # Layer 1 has one hot slot: exactly one of the two can be resident.
+        self.assertEqual(sum(v >= 0 for v in layers[1].hot_map_host), 1)
+        self.assertEqual(sum(v >= 0 for v in layers[1].cold_map_host), 3)
+        for i, layer in enumerate(layers):
+            self.assertEqual(
+                tuple(coordinator.policy.expert_to_hot[i]), layer.hot_map_host
+            )
+            rt.validate_partition(
+                layer.hot_map_host,
+                layer.cold_map_host,
+                layer.hot_slots,
+                layer.cold_slots,
+            )
+
     def test_coordinator_hands_the_policy_one_count_or_a_per_layer_tuple(self):
         layers = [SimpleNamespace(num_experts=4, hot_slots=2) for _ in range(2)]
         coordinator = rt.TierCoordinator(layers, rt.Settings(32 * 2**30), {})
