@@ -234,6 +234,119 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(imported._last_step_tokens, 1)
         self.assertEqual(imported.plan_resync(), baseline.plan_resync())
 
+    def test_observation_only_consumes_due_boundaries_with_frozen_policy_clock(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=4,
+            top_k=1,
+            max_rows=1,
+            observation_only=True,
+            session_id="observation-only-cadence",
+        )
+        snapshots = []
+        for token in range(1, 13):
+            _record(accumulator, [[[token % 2]]], [[[True]]], [True], 1)
+            snapshot = accumulator.snapshot()
+            if snapshot is None:
+                self.assertFalse(accumulator.resync_due)
+                continue
+            snapshots.append(snapshot)
+            self.assertEqual(snapshot.tokens, token)
+            self.assertTrue(snapshot.resync_due)
+            accumulator.acknowledge_snapshot(snapshot)
+            accumulator.rebase(
+                tokens_total=token,
+                version=7,
+                last_sync_tokens=0,
+            )
+
+        self.assertEqual([snapshot.tokens for snapshot in snapshots], [4, 8, 12])
+        self.assertEqual(accumulator.base_tokens_total, 12)
+        self.assertEqual(accumulator.base_version, 7)
+        self.assertEqual(accumulator.base_last_sync_tokens, 0)
+        self.assertFalse(accumulator.resync_due)
+
+    def test_observation_only_prefill_flush_defers_due_until_first_decode(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=5,
+            top_k=1,
+            max_rows=5,
+            observation_only=True,
+            session_id="observation-only-prefill",
+        )
+        _record(
+            accumulator,
+            [[[1] for _ in range(5)]],
+            [[[True] for _ in range(5)]],
+            [True] * 5,
+            5,
+        )
+        prefill = accumulator.flush()
+        self.assertIsNotNone(prefill)
+        self.assertEqual(prefill.last_step_tokens, 5)
+        self.assertTrue(prefill.resync_due)
+        accumulator.acknowledge_snapshot(prefill)
+        accumulator.rebase(tokens_total=5, version=3, last_sync_tokens=0)
+        self.assertTrue(accumulator.resync_due)
+
+        _record(accumulator, [[[1]]], [[[True]]], [True], 1)
+        decode = accumulator.snapshot()
+        self.assertIsNotNone(decode)
+        self.assertEqual(decode.tokens, 6)
+        self.assertEqual(decode.last_step_tokens, 1)
+        accumulator.acknowledge_snapshot(decode)
+        accumulator.rebase(tokens_total=6, version=3, last_sync_tokens=0)
+        self.assertFalse(accumulator.resync_due)
+
+    def test_observation_only_delayed_ack_keeps_newer_boundary_due(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=4,
+            top_k=1,
+            max_rows=1,
+            observation_only=True,
+            session_id="observation-only-delayed-ack",
+        )
+        for _ in range(4):
+            _record(accumulator, [[[0]]], [[[True]]], [True], 1)
+        first = accumulator.snapshot()
+        self.assertIsNotNone(first)
+        self.assertEqual(first.tokens, 4)
+
+        for _ in range(4):
+            _record(accumulator, [[[1]]], [[[True]]], [True], 1)
+        # The first pending snapshot was superseded before it was delivered;
+        # acknowledging it must not consume the boundary crossed at token 8.
+        accumulator.acknowledge_snapshot(first)
+        self.assertTrue(accumulator.resync_due)
+        second = accumulator.snapshot()
+        self.assertIsNotNone(second)
+        self.assertEqual(second.tokens, 8)
+        self.assertGreater(second.sequence, first.sequence)
+        accumulator.acknowledge_snapshot(second)
+        self.assertFalse(accumulator.resync_due)
+
+    def test_observation_only_setter_propagates_to_existing_accumulator(self):
+        observer = DeviceObserver(
+            num_layers=1,
+            num_experts=2,
+            sync_period=4,
+            session_id="observation-only-setter",
+        )
+        observer.allocate("cpu", layers=1, top_k=1, max_tokens=1)
+        self.assertFalse(observer.observation_only)
+        self.assertFalse(observer.accumulator.observation_only)
+        observer.set_observation_only()
+        self.assertTrue(observer.observation_only)
+        self.assertTrue(observer.accumulator.observation_only)
+        observer.set_observation_only(False)
+        self.assertFalse(observer.observation_only)
+        self.assertFalse(observer.accumulator.observation_only)
+
     def test_import_preserves_dwell_pending_and_version_and_rejects_replay(self):
         policy = TierPolicy(
             1,

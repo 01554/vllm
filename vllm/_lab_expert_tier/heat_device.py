@@ -154,6 +154,8 @@ class DeviceHeatAccumulator:
         max_rows: Optional fixed row capacity.
         enabled: Initial heat gate.  ``DeviceObserver`` starts disabled and
             opens it only at the coordinator's named heat-enable boundary.
+        observation_only: Whether snapshot acknowledgements consume device
+            cadence opportunities independently of policy placement commits.
         base_tokens_total: Policy token total when this accumulator starts.
         base_version: Policy LUT version when this accumulator starts.
         base_last_sync_tokens: Policy cadence cursor when this accumulator
@@ -184,6 +186,7 @@ class DeviceHeatAccumulator:
         top_k: int | None = None,
         max_rows: int | None = None,
         enabled: bool = True,
+        observation_only: bool = False,
         base_tokens_total: int = 0,
         base_version: int = 0,
         base_last_sync_tokens: int = 0,
@@ -199,6 +202,9 @@ class DeviceHeatAccumulator:
         self.max_rows = None if max_rows is None else _integer("max_rows", max_rows, 1)
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a bool")
+        if not isinstance(observation_only, bool):
+            raise ValueError("observation_only must be a bool")
+        self._observation_only = observation_only
         self._base_tokens_total = _integer("base_tokens_total", base_tokens_total, 0)
         self._base_version = _integer("base_version", base_version, 0)
         self._base_last_sync_tokens = _integer(
@@ -339,6 +345,17 @@ class DeviceHeatAccumulator:
     def resync_due(self) -> bool:
         """Whether a cadence boundary has been crossed since the last sync."""
         return self._host_due
+
+    @property
+    def observation_only(self) -> bool:
+        """Whether acknowledgement owns the observation cadence clock."""
+        return self._observation_only
+
+    def set_observation_only(self, enabled: bool = True) -> None:
+        """Decouple observation cadence from policy placement commits."""
+        if not isinstance(enabled, bool):
+            raise ValueError("observation_only must be a bool")
+        self._observation_only = enabled
 
     @property
     def base_tokens_total(self) -> int:
@@ -595,10 +612,10 @@ class DeviceHeatAccumulator:
             if num_tokens:
                 self._host_tokens_total += num_tokens
                 if self.sync_period > 0:
-                    self._host_due = self._host_due or (
-                        self._host_tokens_total // self.sync_period
-                        > previous_host // self.sync_period
-                    )
+                    previous_boundary = previous_host // self.sync_period
+                    current_boundary = self._host_tokens_total // self.sync_period
+                    if current_boundary > previous_boundary:
+                        self._host_due = True
             else:
                 self._host_last_step_tokens = 0
 
@@ -695,7 +712,14 @@ class DeviceHeatAccumulator:
         return self.snapshot(force=True)
 
     def acknowledge_snapshot(self, snapshot: DeviceSnapshot) -> None:
-        """Acknowledge delivery without changing policy-owned cadence state."""
+        """Acknowledge delivery and, optionally, consume its due boundary.
+
+        The default mode leaves cadence ownership with policy ``rebase`` for
+        compatibility with the exchange observer.  Promote has no placement
+        commit to advance that clock, so observation-only mode consumes a due
+        boundary only for an eligible single-token snapshot.  A later crossed
+        boundary remains due when acknowledgement is delayed.
+        """
         if snapshot.session_id != self.session_id:
             raise ValueError("snapshot belongs to a different accumulator session")
         if snapshot.sequence is None or snapshot.sequence != self._sequence:
@@ -703,6 +727,18 @@ class DeviceHeatAccumulator:
         if self._pending_snapshot is not None and snapshot != self._pending_snapshot:
             raise ValueError("snapshot is not the pending accumulator snapshot")
         self._pending_snapshot = None
+        if (
+            self._observation_only
+            and snapshot.resync_due is True
+            and snapshot.last_step_tokens == 1
+            and self._host_due
+            and self.sync_period > 0
+        ):
+            snapshot_boundary = snapshot.tokens // self.sync_period
+            current_boundary = self._host_tokens_total // self.sync_period
+            if current_boundary <= snapshot_boundary:
+                self._host_due = False
+                self._resync_due.zero_()
 
     def rebase(
         self,
@@ -728,7 +764,10 @@ class DeviceHeatAccumulator:
         self._base_last_sync_tokens = last_sync_tokens
         self._host_last_sync_tokens = last_sync_tokens
         self._last_sync_tokens.fill_(last_sync_tokens)
-        self._host_due = self._host_due and last_sync_tokens < self._host_tokens_total
+        if not self._observation_only:
+            self._host_due = self._host_due and (
+                last_sync_tokens < self._host_tokens_total
+            )
         self._resync_due.fill_(self._host_due)
         self._pending_snapshot = None
 
@@ -753,6 +792,7 @@ class DeviceObserver:
         sync_period: int = 50,
         initial_scores: Sequence[Sequence[float]] | torch.Tensor | None = None,
         session_id: str | int | None = None,
+        observation_only: bool = False,
     ) -> None:
         self._num_layers = (
             None if num_layers is None else _integer("num_layers", num_layers, 1)
@@ -764,6 +804,9 @@ class DeviceObserver:
         self._sync_period = _integer("sync_period", sync_period, 0)
         self._initial_scores = initial_scores
         self._session_id = session_id
+        if not isinstance(observation_only, bool):
+            raise ValueError("observation_only must be a bool")
+        self._observation_only = observation_only
         self._accumulator: DeviceHeatAccumulator | None = None
         self._ids_record: torch.Tensor | None = None
         self._activity_record: torch.Tensor | None = None
@@ -817,11 +860,25 @@ class DeviceObserver:
                 top_k=top_k,
                 max_rows=max_rows,
                 enabled=False,
+                observation_only=self._observation_only,
                 session_id=self._session_id,
             )
         elif self._accumulator.device != device:
             raise ValueError("observer device changed after allocation")
         return self._accumulator
+
+    @property
+    def observation_only(self) -> bool:
+        """Whether snapshot acknowledgement owns observation cadence."""
+        return self._observation_only
+
+    def set_observation_only(self, enabled: bool = True) -> None:
+        """Decouple observation cadence from policy placement commits."""
+        if not isinstance(enabled, bool):
+            raise ValueError("observation_only must be a bool")
+        self._observation_only = enabled
+        if self._accumulator is not None:
+            self._accumulator.set_observation_only(enabled)
 
     def allocate(
         self,
