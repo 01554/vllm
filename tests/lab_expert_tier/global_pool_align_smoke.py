@@ -39,7 +39,7 @@ def run_case(rows, graph_mode):
     with torch.cuda.stream(warm):
         forward()
     torch.cuda.current_stream().wait_stream(warm)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = None
     if graph_mode:
         graph = torch.cuda.CUDAGraph()
@@ -60,7 +60,7 @@ def run_case(rows, graph_mode):
                 forward()
             else:
                 graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             sorted_ids, physical, padded = result["value"]
             sorted_cpu = sorted_ids.cpu()
             physical_cpu = physical.cpu()
