@@ -2,8 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exclusive GPU-hot / pinned-CPU-cold NVFP4 Marlin tier adapter.
 
-Pinned to vLLM 1970f3ed4; eager, unsharded FlashNext only. Policy is the
-existing expert-tier heat/periodic migration policy, not demand caching.
+Pinned to vLLM 1970f3ed4; unsharded FlashNext only, without torch.compile.
+Policy is the existing expert-tier heat/periodic migration policy, not demand
+caching.
+
+CUDA Graph contract (FULL decode graphs, eager prefill):
+
+- Everything a captured graph reads or writes lives at a fixed address: hot
+  weights, pinned cold banks (through UVA), the two expert maps, and the
+  per-layer routing record buffer. All of these are updated in place.
+- The forward only records routing into that buffer; no host copy, policy
+  decision, or migration happens inside a layer. A replay executes none of
+  this Python, so the runner's post-forward hook (`finish_model_forward`)
+  performs the single D2H copy, heat update, RAM TEMP swaps, and map
+  publication after every forward, replayed or eager.
+- Migration runs on the runner's stream and waits for completion before the
+  next forward is issued, so weights and maps never change under a replay.
 """
 
 from __future__ import annotations
@@ -340,6 +354,7 @@ class TierLayer:
         }
         self.hot_map_host = tuple(range(slots)) + (-1,) * self.cold_slots
         self.cold_map_host = (-1,) * slots + tuple(range(self.cold_slots))
+        self.hot_map = self.cold_map = None
         self.publish_maps()
         self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
@@ -387,13 +402,17 @@ class TierLayer:
         validate_partition(
             self.hot_map_host, self.cold_map_host, self.hot_slots, self.cold_slots
         )
-        # Fresh staging storage: no pinned map can be overwritten during DMA.
-        self.hot_map = torch.tensor(
-            self.hot_map_host, dtype=torch.int32, device=self.device
-        )
-        self.cold_map = torch.tensor(
-            self.cold_map_host, dtype=torch.int32, device=self.device
-        )
+        # Pageable staging: the runtime finishes reading it before returning,
+        # so no pinned host buffer can be overwritten during DMA.
+        hot = torch.tensor(self.hot_map_host, dtype=torch.int32)
+        cold = torch.tensor(self.cold_map_host, dtype=torch.int32)
+        if self.hot_map is None or self.cold_map is None:
+            self.hot_map, self.cold_map = hot.to(self.device), cold.to(self.device)
+            return
+        # Captured graphs read these addresses: update them in place, on the
+        # current stream, after the caller completed every previous use.
+        self.hot_map.copy_(hot)
+        self.cold_map.copy_(cold)
 
     def call(self, kernel, tensors, expert_map, x, weights, ids):
         return kernel.apply(
@@ -576,6 +595,20 @@ def compare_outputs(actual, reference, name, stage):
     return metrics
 
 
+def _current_stream(device):
+    import torch
+
+    if device.type != "cuda":
+        return SimpleNamespace(cuda_stream=0, synchronize=lambda: None)
+    return torch.cuda.current_stream(device)
+
+
+def _is_capturing(device):
+    import torch
+
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
 class TierCoordinator:
     def __init__(self, layers, settings, temporary):
         self.layers, self.settings, self.temporary = layers, settings, temporary
@@ -588,27 +621,60 @@ class TierCoordinator:
         self.lock = threading.Lock()
         self.poisoned, self.stream_id = False, None
         self.stream: Any = None
-        self.pending = []
+        # Static routing records: one [tokens, layers, 2k+1] int32 device
+        # buffer written inside the (possibly captured) forward, and a pinned
+        # host mirror read once after it. Replays rewrite the same addresses.
+        # Token-major so a forward's rows are one contiguous prefix.
+        self.records: Any = None
+        self.records_host: Any = None
+        self.device: Any = None
+        self.recorded = 0  # layers recorded by the forward in progress
+        self.forward_rows: int | None = None  # recorded, not yet finished
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
         # Only the successful compile_or_warm_up_model tail enables heat.
         self.heat_enabled = False
 
-    def adopt_stream(self, stream, layer_index):
+    def allocate_records(self, device, top_k, max_tokens):
+        import torch
+
+        if self.records is not None:
+            raise RuntimeError("Tier routing records are already allocated")
+        if top_k < 1 or max_tokens < 1:
+            raise ValueError("Routing records need positive top-k and token capacity")
+        shape = (max_tokens, len(self.layers), 2 * top_k + 1)
+        self.device = device
+        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
+        self.records_host = torch.zeros(
+            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
+        )
+
+    def adopt_stream(self, stream, boundary):
         if self.stream_id == stream.cuda_stream:
             return  # The common path adds no event, wait, or synchronization.
         if self.stream_id is not None:
-            if layer_index != 0 or self.pending:
+            if not boundary or self.recorded:
                 raise NotImplementedError(
                     "Tier cannot change CUDA stream within a model forward"
                 )
-            # Model warmup and real execution can use different streams. At a
-            # complete-model boundary, finish previous workspace/weight/map
-            # uses before handing ownership to the new stream. Keep the old
-            # stream alive and do not publish the new one if this wait fails.
+            # Warmup, graph capture, and real execution use different
+            # streams. At a complete-model boundary, finish previous
+            # workspace/weight/map uses before handing ownership to the new
+            # stream. Keep the old stream alive and do not publish the new
+            # one if this wait fails.
             self.stream.synchronize()
         self.stream, self.stream_id = stream, stream.cuda_stream
+
+    def discard_unconsumed(self, reason):
+        # Startup warmup and graph capture call the model directly, so they
+        # legitimately leave a recorded forward that no runner hook finishes.
+        # After heat is enabled every forward must be finished, or heat and
+        # migration would silently skip real tokens.
+        if self.heat_enabled:
+            raise RuntimeError(f"Recorded tier forward was never finished: {reason}")
+        self.stats["dropped_startup_records"] += 1
+        self.forward_rows = None
 
     def begin_layer(self, tier, x, weights, ids):
         import torch
@@ -617,10 +683,30 @@ class TierCoordinator:
 
         if self.poisoned:
             raise RuntimeError("Expert tier is poisoned by a previous failure")
-        if tier.index != len(self.pending):
+        if self.records is None:
+            raise RuntimeError("Tier routing records are not allocated")
+        if tier.index != self.recorded:
             raise RuntimeError("Tier requires one sequential full-model forward")
-        stream = torch.cuda.current_stream(tier.device)
-        self.adopt_stream(stream, tier.index)
+        rows = x.shape[0]
+        stream = _current_stream(tier.device)
+        if tier.index == 0:
+            if self.forward_rows is not None:
+                self.discard_unconsumed("next forward started")
+            if not 0 < rows <= self.records.shape[0]:
+                raise ValueError("Forward exceeds the tier routing record capacity")
+            if (
+                self.stream_id is not None
+                and self.stream_id != stream.cuda_stream
+                and _is_capturing(tier.device)
+            ):
+                # Adopting waits on the previous stream, which is illegal
+                # inside a capture. vLLM warms up on the capture stream
+                # first, so this only guards a changed capture protocol.
+                raise RuntimeError("Tier cannot adopt a stream during graph capture")
+            self.forward_rows = rows
+        elif rows != self.forward_rows:
+            raise ValueError("Token count changed within a model forward")
+        self.adopt_stream(stream, tier.index == 0)
         if (
             x.ndim != 2
             or ids.ndim != 2
@@ -664,17 +750,62 @@ class TierCoordinator:
             ),
             dim=1,
         )
-        self.pending.append(packed)
+        if packed.shape[1] != self.records.shape[2]:
+            raise ValueError("Routing record width does not match the allocation")
+        # Graph-safe: a fixed destination written on the forward's stream.
+        self.records[:rows, tier.index].copy_(packed)
+        self.recorded += 1
 
     def end_layer(self, tier):
-        import torch
-
         if tier.index + 1 != len(self.layers):
             return
+        self.recorded = 0
+        if _is_capturing(tier.device):
+            # Capture-time rows are dummy padding and nobody finishes them.
+            self.stats["captured_forwards"] += 1
+            self.forward_rows = None
+
+    def finish_forward(self, rows):
+        """Runner-side model boundary: the one host copy per forward.
+
+        Called after eager forwards and CUDA Graph replays alike. A replay
+        executes no Python in the layers, so the runner supplies the padded
+        row count and the static records carry this forward's routing/mask.
+        """
+        with self.lock:
+            if self.poisoned:
+                raise RuntimeError("Expert tier is poisoned by a previous failure")
+            try:
+                self._finish_forward(rows)
+            except Exception:
+                self.poisoned = True
+                raise
+
+    def _finish_forward(self, rows):
+        if self.records is None:
+            raise RuntimeError("Tier routing records are not allocated")
+        if self.recorded:
+            raise RuntimeError("Model forward finished with incomplete tier layers")
+        if _is_capturing(self.device):
+            raise RuntimeError("Tier forward cannot be finished during graph capture")
+        if not 0 < rows <= self.records.shape[0]:
+            raise ValueError("Finished forward exceeds the routing record capacity")
+        if self.forward_rows is None:
+            self.stats["replayed_forwards"] += 1
+        else:
+            if self.forward_rows != rows:
+                raise ValueError(
+                    "Runner token count disagrees with the recorded forward"
+                )
+            self.forward_rows = None
+            self.stats["recorded_forwards"] += 1
+        stream = _current_stream(self.device)
+        self.adopt_stream(stream, True)
         # One batched D2H at the model boundary, matching update_from_graph.
         # This also completes all hot/cold uses before any RAM TEMP migration.
-        packed = torch.stack(self.pending).to(device="cpu").tolist()
-        self.pending.clear()
+        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
+        stream.synchronize()
+        packed = self.records_host[:rows].transpose(0, 1).tolist()
         routes, activity, mask, tokens = unpack_routes(
             packed, self.layers[0].num_experts
         )
@@ -722,8 +853,10 @@ class TierCoordinator:
                     self.stats["host_copy_bytes"] += layer.row_bytes
                 if plan.swaps:
                     # RAM TEMP already waits for its two DMA phases. Include
-                    # the final map publication too: this is completed wall
-                    # time, not the time needed merely to enqueue CUDA work.
+                    # the final in-place map publication too: this is
+                    # completed wall time, not merely enqueue time, and it
+                    # guarantees the next forward (or replay) sees the new
+                    # weights and maps.
                     if self.stream is None:
                         raise RuntimeError(
                             "Migration requires an adopted execution stream"
@@ -760,6 +893,10 @@ class TierCoordinator:
             "d2h_bytes",
             "host_copy_bytes",
             "resyncs",
+            "recorded_forwards",
+            "replayed_forwards",
+            "captured_forwards",
+            "dropped_startup_records",
             "policy_observe_seconds",
             "policy_plan_seconds",
             "policy_commit_seconds",
@@ -773,7 +910,8 @@ class TierCoordinator:
                 "tokens_total": self.policy.tokens_total,
                 "version": self.policy.version,
                 "heat_enabled": self.heat_enabled,
-                "pending_layers": len(self.pending),
+                "pending_layers": self.recorded,
+                "unfinished_forward_rows": self.forward_rows,
                 "per_layer_swaps": list(self.per_layer_swaps),
                 "policy_cpu_seconds": sum(
                     self.stats[key]
@@ -792,7 +930,7 @@ class TierCoordinator:
 
     def enable_heat(self):
         with self.lock:
-            if self.poisoned or self.pending:
+            if self.poisoned or self.recorded:
                 raise RuntimeError(
                     "Cannot enable tier heat with failed or incomplete startup work"
                 )
@@ -800,6 +938,9 @@ class TierCoordinator:
                 raise RuntimeError("Tier heat cannot be enabled twice")
             if self.policy.tokens_total or self.policy.swaps_total:
                 raise AssertionError("Startup polluted tier heat/migration accounting")
+            if self.forward_rows is not None:
+                # The last direct warmup/capture forward is startup work.
+                self.discard_unconsumed("heat enabled")
             if self.stream is not None:
                 self.stream.synchronize()
             startup = dict(self.stats)
@@ -813,7 +954,7 @@ class TierCoordinator:
                         "heat_enabled": True,
                         "tokens_total": self.policy.tokens_total,
                         "swaps_total": self.policy.swaps_total,
-                        "pending_layers": len(self.pending),
+                        "pending_layers": self.recorded,
                         "startup_stats": startup,
                     },
                     sort_keys=True,
@@ -829,6 +970,16 @@ def enable_model_heat(model):
     if coordinator is None:
         raise RuntimeError("Enabled tier model has no coordinator after startup")
     coordinator.enable_heat()
+
+
+def finish_model_forward(model, rows):
+    """Runner hook after every model forward: eager, dummy, or graph replay.
+
+    Cheap when the tier is disabled; never reads the environment.
+    """
+    coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
+    if coordinator is not None:
+        coordinator.finish_forward(rows)
 
 
 def unpack_routes(packed, num_experts):
@@ -917,7 +1068,7 @@ def initialize_model(model, model_config):
     import torch
 
     from vllm import envs
-    from vllm.config import get_current_vllm_config
+    from vllm.config import CompilationMode, get_current_vllm_config
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
     from vllm.v1.worker.workspace import (
@@ -932,8 +1083,24 @@ def initialize_model(model, model_config):
         )
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
         raise NotImplementedError("Tier requires VLLM_USE_V2_MODEL_RUNNER=1")
-    if not model_config.enforce_eager:
-        raise NotImplementedError("Expert tier requires --enforce-eager")
+    compilation = config.compilation_config
+    graph_mode = compilation.cudagraph_mode
+    if compilation.mode != CompilationMode.NONE:
+        raise NotImplementedError(
+            "Expert tier requires compilation mode NONE (no torch.compile); use "
+            "--enforce-eager, or -cc.mode=none with cudagraph_mode=FULL_DECODE_ONLY"
+        )
+    if envs.VLLM_USE_BREAKABLE_CUDAGRAPH or (
+        graph_mode is not None and graph_mode.has_piecewise_cudagraphs()
+    ):
+        raise NotImplementedError(
+            "Expert tier supports only NONE, FULL_DECODE_ONLY, or FULL CUDA graphs"
+        )
+    # Graph padding never exceeds the capture size; eager prefill never
+    # exceeds the scheduler budget. Size the static routing records for both.
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    if compilation.max_cudagraph_capture_size:
+        max_tokens = max(max_tokens, compilation.max_cudagraph_capture_size)
     if settings.verify_init and (
         not is_workspace_manager_initialized()
         or current_workspace_manager().is_locked()
@@ -1020,6 +1187,9 @@ def initialize_model(model, model_config):
             ),
         )
     coordinator = TierCoordinator(tiers, settings, temporary)
+    coordinator.allocate_records(
+        tiers[0].device, candidates[0][2].moe.experts_per_token, max_tokens
+    )
     for tier in tiers:
         tier.coordinator = coordinator
         tier.method._lab_expert_tier = tier
@@ -1047,7 +1217,11 @@ def initialize_model(model, model_config):
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,
                 "policy": "expert_tier_heat_periodic_ram_temp",
-                "cuda_graphs": False,
+                "cuda_graphs": None if graph_mode is None else graph_mode.name,
+                "compilation_mode": CompilationMode(compilation.mode).name,
+                "routing_record_tokens": max_tokens,
+                "routing_record_bytes": coordinator.records.numel() * 4,
+                "static_maps_and_records": True,
                 "settings": asdict(settings),
                 "policy_config": settings.policy_kwargs(),
                 "static_partition": settings.sync_tokens == 0,

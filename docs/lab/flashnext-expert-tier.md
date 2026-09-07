@@ -3,8 +3,10 @@
 This is an experimental baseline for one draft PR in `01554/vllm`.
 The objective is to serve FlashNext NVFP4 through vLLM within a 48 GiB VRAM
 budget, reusing the existing RAM TEMP exchange and heat-based expert placement
-policy. CUDA Graph support is **not implemented** in this baseline. It currently
-requires eager execution and is awaiting human review.
+policy. The adapter now follows a CUDA Graph contract (below) so decode can run
+as FULL graph replays without torch.compile. **This has only been checked with
+CPU unit tests; no GPU capture, replay, output, or speed result exists yet.**
+It is awaiting human review.
 
 ## Baseline and provenance
 
@@ -95,12 +97,61 @@ This command does not establish model correctness or GPU performance. Record
 its actual result with the integration revision; do not carry historical test
 passes forward as evidence for changed code.
 
-The first implementation task is graph compatibility. Removing
-`--enforce-eager` alone is insufficient: the current adapter collects routing
-on the CPU, updates policy in Python, performs conditional exchanges, and
-recreates device mapping tensors. Graph work must define persistent buffers,
-replay-external policy updates, and ordering that keeps weights and maps
-consistent while preserving the existing RAM TEMP storage contract.
+## CUDA Graph contract
+
+Removing `--enforce-eager` alone was insufficient: the eager adapter collected
+routing on the CPU inside the last MoE layer, updated policy in Python,
+performed conditional exchanges, and recreated device mapping tensors. The
+graph-compatible adapter keeps the RAM TEMP storage contract and changes the
+boundaries:
+
+- **Fixed addresses.** Hot weights, pinned cold banks (read through UVA), both
+  expert maps, and a static routing record buffer
+  (`[max_tokens, 48 layers, 2k+1]` int32) are allocated once. Maps are
+  republished in place after every exchange instead of being reallocated.
+- **Inside the forward, layers only record.** Each MoE layer validates routing
+  on the device and writes IDs, activity flags, and the padding mask into its
+  row of the record buffer. No host copy, policy step, or exchange happens
+  inside a layer, so the whole decode forward is capturable.
+- **The runner finishes every forward.** `GPUModelRunner.execute_model` calls
+  `finish_model_forward(model, num_tokens_after_padding)` after eager forwards
+  and FULL replays alike. That hook performs the single D2H copy of the record
+  prefix, the heat update, `plan_resync`, RAM TEMP swaps, in-place map
+  publication, and waits for completion before the next forward is issued. A
+  replay runs no Python in the layers, so the runner supplies the row count.
+- **Startup bookkeeping.** Warmup and capture call the model directly and
+  leave recorded forwards nobody finishes; before heat is enabled those are
+  counted as `dropped_startup_records`. After heat is enabled an unfinished
+  forward is an error. `captured_forwards`, `recorded_forwards`, and
+  `replayed_forwards` are reported in `LAB_EXPERT_TIER_STATS`.
+- **Supported modes.** Compilation mode must be NONE (no torch.compile), and
+  the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
+  cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
+
+To enable decode graphs, replace `--enforce-eager` in the lab launcher with:
+
+```bash
+--compilation-config '{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}'
+```
+
+`--enforce-eager` still works and reproduces the eager path through the same
+hook. vLLM may downgrade FULL_DECODE_ONLY to NONE if the attention backend
+lacks full-graph support; the `LAB_EXPERT_TIER_READY` line reports the
+resolved `cuda_graphs` mode and the routing record size.
+
+GPU validation that remains to be done, in order:
+
+1. Startup with the flag above: capture succeeds, `LAB_EXPERT_TIER_READY` shows
+   `cuda_graphs: FULL_DECODE_ONLY`, init verification passes, and the 48 GiB
+   capacity audit holds with the graph pool allocated.
+2. A→B with heat enabled: `replayed_forwards` grows with decode, `swaps` and
+   `resyncs` are nonzero, and no poisoned-tier error appears. Compare the B
+   output with the eager run of the same source revision; the graph path
+   should not change routing or expert arithmetic, but this is unverified.
+3. Decode tokens/s versus the eager tier (11.1117) and the fixed baseline
+   (7.4182), measured without the profiler.
+4. A profile run to confirm per-decode CPU launch count drops from ~3,300 and
+   to attribute what remains (host unpack, policy loops, exchange copies).
 
 The comparison role should identify remaining host and kernel differences
 without assuming that all of the gap is CPU computation. GPU validation must
