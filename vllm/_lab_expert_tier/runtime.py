@@ -80,6 +80,14 @@ class Settings:
     # per-slot buffer that is reduced once. "modular": two stock modular
     # kernel calls, clone, and add (the original path, kept for fallback).
     split: str = "fused"
+    # "records": static routing records read back once per forward. Other
+    # names resolve through OBSERVERS (device-side observers register there).
+    observer: str = "records"
+    # Decode-time VRAM staging of the selected cold experts: top_k spare rows
+    # per layer at the end of the hot bank, charged to the capacity budget.
+    # Off by default: correct on the GPU but 7.7% slower than the fused
+    # two-partition path in its first measurement (plan launch overhead).
+    staging: bool = False
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -107,6 +115,8 @@ class Settings:
             "MAX_SWAPS_PER_RESYNC",
             "TEMP_SLOTS",
             "SPLIT",
+            "OBSERVER",
+            "STAGING",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -120,11 +130,17 @@ class Settings:
             return None
         stats = int(os.environ.get(PREFIX + "STATS_EVERY", "256"))
         verify = os.environ.get(PREFIX + "VERIFY_INIT", "1")
-        if stats < 1 or verify not in ("0", "1"):
-            raise ValueError("STATS_EVERY must be positive; VERIFY_INIT must be 0 or 1")
+        staging = os.environ.get(PREFIX + "STAGING", "0")
+        if stats < 1 or verify not in ("0", "1") or staging not in ("0", "1"):
+            raise ValueError(
+                "STATS_EVERY must be positive; VERIFY_INIT and STAGING must be 0 or 1"
+            )
         split = os.environ.get(PREFIX + "SPLIT", SPLIT_MODES[0])
         if split not in SPLIT_MODES:
             raise ValueError(f"SPLIT must be one of {SPLIT_MODES}")
+        observer = os.environ.get(PREFIX + "OBSERVER", "records")
+        if not observer.isidentifier():
+            raise ValueError("OBSERVER must be an observer registry name")
         integers = {
             key: int(os.environ.get(PREFIX + key, default))
             for key, default in (
@@ -166,6 +182,8 @@ class Settings:
             integers["MAX_SWAPS_PER_RESYNC"],
             integers["TEMP_SLOTS"],
             split,
+            observer,
+            staging == "1",
         )
 
 
@@ -226,13 +244,16 @@ def validate_mapping(mapping, required, slots):
             raise AssertionError(f"Required expert {expert} has no GPU cache slot")
 
 
-def uniform_slots(capacity_bytes, rows, num_experts):
+def uniform_slots(capacity_bytes, rows, num_experts, reserve=0):
+    """Hot slots per layer; `reserve` staging rows per layer come first."""
     if not rows or len(set(rows)) != 1 or rows[0] <= 0:
         raise ValueError("Only uniform positive expert row sizes are supported")
-    slots = min(num_experts, capacity_bytes // sum(rows))
+    if reserve < 0:
+        raise ValueError("Staging reserve must be nonnegative")
+    slots = min(num_experts, capacity_bytes // sum(rows) - reserve)
     if slots < 1:
         raise ValueError("Capacity cannot hold one expert in every layer")
-    return slots, slots * sum(rows)
+    return slots, (slots + reserve) * sum(rows)
 
 
 def _check_kernel_scales(kernel, tensors):
@@ -374,13 +395,23 @@ class TierLayer:
             raise ValueError(
                 "First tier version requires nonempty hot and cold partitions"
             )
+        # Staging rows follow the hot rows in one bank so a single expert
+        # map can address both; they hold transient copies of selected cold
+        # experts during batch-1 decode and are outside the swap slot range.
+        self.staging_slots = method.moe.experts_per_token if settings.staging else 0
+        self.bank = {}
         self.hot = {}
+        self.staging = {}
         self.cold_cpu = {}
         # Slicing without an independent allocation would retain the full bank.
         for name, source in sources.items():
-            self.hot[name] = torch.empty(
-                (slots, *source.shape[1:]), dtype=source.dtype, device=self.device
+            self.bank[name] = torch.zeros(
+                (slots + self.staging_slots, *source.shape[1:]),
+                dtype=source.dtype,
+                device=self.device,
             )
+            self.hot[name] = self.bank[name][:slots]
+            self.staging[name] = self.bank[name][slots:]
             self.cold_cpu[name] = torch.empty(
                 (self.cold_slots, *source.shape[1:]),
                 dtype=source.dtype,
@@ -400,6 +431,11 @@ class TierLayer:
         self.publish_maps()
         self.hot_kernel, self.hot_quant = self.make_kernel(self.hot, slots)
         self.cold_kernel, self.cold_quant = self.make_kernel(self.cold, self.cold_slots)
+        self.bank_kernel = self.bank_quant = None
+        if self.staging_slots:
+            self.bank_kernel, self.bank_quant = self.make_kernel(
+                self.bank, slots + self.staging_slots
+            )
         self.marlin_workspace = None
         if settings.split == "fused":
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -411,6 +447,7 @@ class TierLayer:
             self.marlin_workspace = marlin_make_workspace_new(self.device, 4)
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
         self.hot_bytes = sum(t.numel() * t.element_size() for t in self.hot.values())
+        self.staging_bytes = self.row_bytes * self.staging_slots
         self.cold_bytes = sum(
             t.numel() * t.element_size() for t in self.cold_cpu.values()
         )
@@ -482,6 +519,9 @@ class TierLayer:
         )
 
     def split(self, x, weights, ids):
+        staging = getattr(self, "staging_slots", 0)
+        if staging and x.shape[0] * ids.shape[1] <= staging:
+            return self.split_staged(x, weights, ids)
         if self.settings.split == "fused":
             return self.split_fused(x, weights, ids)
         # Marlin uses shared workspaces. Preserve the hot result before cold
@@ -492,6 +532,37 @@ class TierLayer:
         ).clone()
         cold = self.call(self.cold_kernel, self.cold, self.cold_map, x, weights, ids)
         return hot.add_(cold)
+
+    def split_staged(self, x, weights, ids):
+        """Batch-1 decode: stage the selected cold experts, then one chain.
+
+        `plan_staging` and `gather_staging` are fixed-shape and never touch
+        the host, so this whole path captures into the decode graph. The
+        bank kernel covers hot rows plus staging rows through the step's
+        expert map; the cold RAM bank stays the owner and nothing is written
+        back.
+        """
+        from .staging import gather_staging, plan_staging
+
+        if self.bank_kernel is None:
+            raise RuntimeError("Staging requires the bank kernel")
+        gather, expert_map, count = plan_staging(
+            ids, self.cold_map, self.hot_map, self.hot_slots, self.staging_slots
+        )
+        gather_staging(self.cold, self.staging, gather, count)
+        return self._run_marlin_chains(
+            x,
+            weights,
+            ids,
+            (
+                (
+                    self.bank_kernel.fused_experts,
+                    self.bank,
+                    expert_map,
+                    self.hot_slots + self.staging_slots,
+                ),
+            ),
+        )
 
     def split_fused(self, x, weights, ids):
         """Both partitions into one per-slot row buffer, reduced once.
@@ -505,6 +576,18 @@ class TierLayer:
         GEMMs per partition. Numerics are checked against the source kernel
         by init verification.
         """
+        partitions = (
+            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
+            (
+                self.cold_kernel.fused_experts,
+                self.cold,
+                self.cold_map,
+                self.cold_slots,
+            ),
+        )
+        return self._run_marlin_chains(x, weights, ids, partitions)
+
+    def _run_marlin_chains(self, x, weights, ids, partitions):
         import torch
 
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
@@ -530,15 +613,6 @@ class TierLayer:
             ((rows_count, hidden), x.dtype),
         )
         rows.zero_()
-        partitions = (
-            (self.hot_kernel.fused_experts, self.hot, self.hot_map, self.hot_slots),
-            (
-                self.cold_kernel.fused_experts,
-                self.cold,
-                self.cold_map,
-                self.cold_slots,
-            ),
-        )
         for experts, tensors, expert_map, slots in partitions:
             block = marlin_block_size(
                 tokens, top_k, slots, self.num_experts, experts.input_dtype
@@ -677,6 +751,27 @@ class TierLayer:
                     "mixed_padding_exact_zero": True,
                 }
             )
+        staged_checks = []
+        if self.staging_slots:
+            # Batch-1 rows take the staged path: hot only, cold only, mixed,
+            # and padding, each against the same source-kernel reference.
+            for row, label in enumerate(("hot", "cold", "mixed", "mixed_reversed")):
+                single = self.split(
+                    x[row : row + 1].clone(),
+                    weights[row : row + 1].clone(),
+                    ids[row : row + 1].clone(),
+                ).clone()
+                staged_checks.append(
+                    compare_outputs(
+                        single, reference[row : row + 1], self.name, "staged_" + label
+                    )
+                )
+            pad_ids = torch.full((1, k), -1, dtype=ids.dtype, device=self.device)
+            pad = self.split(x[:1].clone(), weights[:1].clone(), pad_ids).clone()
+            torch.testing.assert_close(
+                pad, torch.zeros_like(pad), rtol=0, atol=0, equal_nan=False
+            )
+            staged_checks.append({"stage": "staged_padding", "exact_zero": True})
         torch.cuda.current_stream(self.device).synchronize()
         LOGGER.warning(
             "LAB_EXPERT_TIER_VERIFY_INIT %s",
@@ -686,6 +781,7 @@ class TierLayer:
                     "layer_index": self.index,
                     "passed": True,
                     "stages": metrics,
+                    "staged_checks": staged_checks,
                     "input_nonzero": int(torch.count_nonzero(x).item()),
                     "input_tokens": 4,
                     "shared_experts_reexecuted": False,
@@ -762,8 +858,149 @@ def _is_capturing(device):
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
+@dataclass(frozen=True)
+class LegacyRoutes:
+    """Host routing lists for one forward; the coordinator observes them."""
+
+    routes: Any
+    activity: Any
+    mask: Any
+    tokens: int
+
+
+@dataclass(frozen=True)
+class DeviceSnapshot:
+    """Heat already advanced on the device; the coordinator only plans.
+
+    `heat` is a host float64 [layers, experts] array that the policy imports
+    verbatim (integer counts were accumulated per forward, decayed, then
+    added once, in the policy's order). `tokens`, `forwards`, `route_hot`,
+    and `route_total` are cumulative device totals; the coordinator turns
+    them into deltas against the previous snapshot it consumed and derives
+    the token delta from the policy's own total. Observers must not advance
+    device state while heat is disabled, so a snapshot may only arrive with
+    heat enabled.
+    """
+
+    heat: Any
+    tokens: int
+    forwards: int
+    route_hot: int
+    route_total: int
+    verified: bool = True
+
+
+@dataclass(frozen=True)
+class Deferred:
+    """No host readback this forward; `flush` delivers the snapshot later."""
+
+    forwards: int = 1
+
+
+class RecordObserver:
+    """Default observer: static device records, one D2H per forward.
+
+    Contract shared with device-side observers:
+    - `record_layer` runs inside the (possibly captured) forward and may only
+      touch fixed-address device state.
+    - `finish` runs on the runner's stream at the model boundary and returns
+      LegacyRoutes, DeviceSnapshot, or Deferred. It must raise on an invalid
+      device record, which poisons the coordinator.
+    - `flush` returns a pending snapshot or None; used at stats, forced
+      resync, and shutdown.
+    """
+
+    def __init__(self, **_config):
+        # Device observers take the policy configuration; this one needs none.
+        self.records: Any = None
+        self.records_host: Any = None
+        self.device: Any = None
+
+    @property
+    def capacity(self):
+        return 0 if self.records is None else self.records.shape[0]
+
+    def allocate(self, device, layers, top_k, max_tokens, num_experts=None):
+        import torch
+
+        if self.records is not None:
+            raise RuntimeError("Tier routing records are already allocated")
+        if top_k < 1 or max_tokens < 1:
+            raise ValueError("Routing records need positive top-k and token capacity")
+        # Token-major so a forward's rows are one contiguous prefix.
+        shape = (max_tokens, layers, 2 * top_k + 1)
+        self.device = device
+        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
+        self.records_host = torch.zeros(
+            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
+        )
+
+    def record_layer(self, layer_index, rows, ids, active, valid):
+        import torch
+
+        packed = torch.cat(
+            (
+                ids.to(torch.int32),
+                active.to(torch.int32),
+                valid[:, None].to(torch.int32),
+            ),
+            dim=1,
+        )
+        if packed.shape[1] != self.records.shape[2]:
+            raise ValueError("Routing record width does not match the allocation")
+        # Graph-safe: a fixed destination written on the forward's stream.
+        self.records[:rows, layer_index].copy_(packed)
+
+    def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+        # One batched D2H at the model boundary, matching update_from_graph.
+        # This also completes all hot/cold uses before any RAM TEMP migration.
+        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
+        stream.synchronize()
+        packed = self.records_host[:rows].transpose(0, 1).tolist()
+        return LegacyRoutes(*unpack_routes(packed, num_experts))
+
+    def flush(self):
+        return None
+
+    def on_heat_enabled(self):
+        """Open a persistent device gate; Python flags never reach a replay."""
+        return None
+
+
+# name -> class or "module:Class"; device observers register here.
+OBSERVERS: dict[str, Any] = {
+    "records": RecordObserver,
+    "device": "vllm._lab_expert_tier.heat_device:DeviceObserver",
+}
+
+
+def make_observer(name, **config):
+    """Instantiate a registered observer with the policy configuration."""
+    import importlib
+
+    target = OBSERVERS.get(name)
+    if target is None:
+        raise ValueError(f"Unknown expert tier observer {name!r}")
+    if isinstance(target, str):
+        module_name, _, class_name = target.partition(":")
+        target = getattr(importlib.import_module(module_name), class_name)
+    return target(**config)
+
+
+def _is_snapshot(result):
+    return hasattr(result, "heat")
+
+
+def _is_deferred(result):
+    return (
+        hasattr(result, "forwards")
+        and not hasattr(result, "heat")
+        and not hasattr(result, "routes")
+    )
+
+
 class TierCoordinator:
-    def __init__(self, layers, settings, temporary):
+    def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
         self.policy = TierPolicy(
             len(layers),
@@ -774,33 +1011,37 @@ class TierCoordinator:
         self.lock = threading.Lock()
         self.poisoned, self.stream_id = False, None
         self.stream: Any = None
-        # Static routing records: one [tokens, layers, 2k+1] int32 device
-        # buffer written inside the (possibly captured) forward, and a pinned
-        # host mirror read once after it. Replays rewrite the same addresses.
-        # Token-major so a forward's rows are one contiguous prefix.
-        self.records: Any = None
-        self.records_host: Any = None
+        # The observer owns every per-forward device record. The default
+        # keeps static routing records and reads them back once per forward.
+        self.observer = RecordObserver() if observer is None else observer
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
         self.forward_rows: int | None = None  # recorded, not yet finished
+        # Cumulative totals of the last consumed device snapshot, per session.
+        self.snapshot_totals: dict[str, int] = {}
+        self.snapshot_session: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
         # Only the successful compile_or_warm_up_model tail enables heat.
         self.heat_enabled = False
 
-    def allocate_records(self, device, top_k, max_tokens):
-        import torch
+    @property
+    def records(self):
+        return getattr(self.observer, "records", None)
 
-        if self.records is not None:
-            raise RuntimeError("Tier routing records are already allocated")
-        if top_k < 1 or max_tokens < 1:
-            raise ValueError("Routing records need positive top-k and token capacity")
-        shape = (max_tokens, len(self.layers), 2 * top_k + 1)
+    @property
+    def records_host(self):
+        return getattr(self.observer, "records_host", None)
+
+    def allocate_records(self, device, top_k, max_tokens):
         self.device = device
-        self.records = torch.zeros(shape, dtype=torch.int32, device=device)
-        self.records_host = torch.zeros(
-            shape, dtype=torch.int32, device="cpu", pin_memory=device.type == "cuda"
+        self.observer.allocate(
+            device,
+            len(self.layers),
+            top_k,
+            max_tokens,
+            num_experts=self.layers[0].num_experts,
         )
 
     def adopt_stream(self, stream, boundary):
@@ -836,7 +1077,7 @@ class TierCoordinator:
 
         if self.poisoned:
             raise RuntimeError("Expert tier is poisoned by a previous failure")
-        if self.records is None:
+        if self.device is None or not self.observer.capacity:
             raise RuntimeError("Tier routing records are not allocated")
         if tier.index != self.recorded:
             raise RuntimeError("Tier requires one sequential full-model forward")
@@ -845,7 +1086,7 @@ class TierCoordinator:
         if tier.index == 0:
             if self.forward_rows is not None:
                 self.discard_unconsumed("next forward started")
-            if not 0 < rows <= self.records.shape[0]:
+            if not 0 < rows <= self.observer.capacity:
                 raise ValueError("Forward exceeds the tier routing record capacity")
             if (
                 self.stream_id is not None
@@ -895,18 +1136,7 @@ class TierCoordinator:
             "Invalid routing: -1 requires padding; "
             "real weights must be finite/nonnegative",
         )
-        packed = torch.cat(
-            (
-                ids.to(torch.int32),
-                (weights != 0).to(torch.int32),
-                valid[:, None].to(torch.int32),
-            ),
-            dim=1,
-        )
-        if packed.shape[1] != self.records.shape[2]:
-            raise ValueError("Routing record width does not match the allocation")
-        # Graph-safe: a fixed destination written on the forward's stream.
-        self.records[:rows, tier.index].copy_(packed)
+        self.observer.record_layer(tier.index, rows, ids, weights != 0, valid)
         self.recorded += 1
 
     def end_layer(self, tier):
@@ -918,30 +1148,55 @@ class TierCoordinator:
             self.stats["captured_forwards"] += 1
             self.forward_rows = None
 
-    def finish_forward(self, rows):
+    def finish_forward(self, rows, valid_rows=None):
         """Runner-side model boundary: the one host copy per forward.
 
         Called after eager forwards and CUDA Graph replays alike. A replay
         executes no Python in the layers, so the runner supplies the padded
         row count and the static records carry this forward's routing/mask.
+        `valid_rows` is the runner's real token count (None when unknown); it
+        is an upper bound for observers that defer host readback, never a
+        substitute for the device padding mask.
         """
         with self.lock:
             if self.poisoned:
                 raise RuntimeError("Expert tier is poisoned by a previous failure")
             try:
-                self._finish_forward(rows)
+                self._finish_forward(rows, valid_rows)
             except Exception:
                 self.poisoned = True
                 raise
 
-    def _finish_forward(self, rows):
-        if self.records is None:
+    def flush(self, plan=False):
+        """Collect a deferred device observation outside a forward boundary.
+
+        Observation only by default (stats and shutdown); `plan=True` is the
+        forced-resync entry and may migrate.
+        """
+        with self.lock:
+            if self.poisoned:
+                raise RuntimeError("Expert tier is poisoned by a previous failure")
+            try:
+                self._flush_locked(plan)
+            except Exception:
+                self.poisoned = True
+                raise
+
+    def _flush_locked(self, plan):
+        result = self.observer.flush()
+        if result is not None:
+            self._consume(result, plan)
+
+    def _finish_forward(self, rows, valid_rows=None):
+        if valid_rows is not None and not 0 <= valid_rows <= rows:
+            raise ValueError("Runner valid token count exceeds the padded rows")
+        if self.device is None or not self.observer.capacity:
             raise RuntimeError("Tier routing records are not allocated")
         if self.recorded:
             raise RuntimeError("Model forward finished with incomplete tier layers")
         if _is_capturing(self.device):
             raise RuntimeError("Tier forward cannot be finished during graph capture")
-        if not 0 < rows <= self.records.shape[0]:
+        if not 0 < rows <= self.observer.capacity:
             raise ValueError("Finished forward exceeds the routing record capacity")
         if self.forward_rows is None:
             self.stats["replayed_forwards"] += 1
@@ -954,18 +1209,88 @@ class TierCoordinator:
             self.stats["recorded_forwards"] += 1
         stream = _current_stream(self.device)
         self.adopt_stream(stream, True)
-        # One batched D2H at the model boundary, matching update_from_graph.
-        # This also completes all hot/cold uses before any RAM TEMP migration.
-        self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
-        stream.synchronize()
-        packed = self.records_host[:rows].transpose(0, 1).tolist()
-        routes, activity, mask, tokens = unpack_routes(
-            packed, self.layers[0].num_experts
+        result = self.observer.finish(
+            rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
         )
+        # One real forward, counted exactly once whatever the observer returns.
         self.stats["model_forwards"] += 1
         if not self.heat_enabled:
             self.stats["ignored_startup_forwards"] += 1
-        elif tokens:
+        self._consume(result, plan=True)
+        if self.stats["model_forwards"] % self.settings.stats_every == 0:
+            self.report()
+
+    def _consume(self, result, plan):
+        """Apply one observer result. Forward counters are not touched here.
+
+        `plan` allows planning and migration; a flush at exit or before a
+        report collects the observation only, so no GPU work starts outside
+        a forward boundary.
+        """
+        # Device observers return their own result types without importing
+        # this module, so results are recognized by shape, not by class.
+        if _is_snapshot(result):
+            if not self.heat_enabled:
+                raise RuntimeError(
+                    "Device observers must not advance heat before it is enabled"
+                )
+            if not getattr(result, "verified", True) or getattr(result, "error", False):
+                raise RuntimeError(
+                    "Device routing validation failed (delayed device check)"
+                )
+            importer = getattr(self.policy, "import_snapshot", None)
+            if importer is None:
+                raise NotImplementedError("Policy cannot import device snapshots")
+            tokens_before = self.policy.tokens_total
+            started = time.perf_counter()
+            importer(result)
+            acknowledge = getattr(self.observer, "acknowledge_snapshot", None)
+            if acknowledge is not None:
+                acknowledge(result)
+            self.stats["policy_observe_seconds"] += time.perf_counter() - started
+            # Snapshot totals are cumulative per device session; account the
+            # increments only, and tokens from the policy's own total.
+            session = getattr(result, "session_id", None)
+            if session != self.snapshot_session:
+                self.snapshot_session, self.snapshot_totals = session, {}
+            for key in ("forwards", "route_hot", "route_total"):
+                total = getattr(result, key, 0)
+                delta = total - self.snapshot_totals.get(key, 0)
+                if delta < 0:
+                    raise RuntimeError(f"Device snapshot {key} went backwards")
+                self.snapshot_totals[key] = total
+                stat = "snapshot_forwards" if key == "forwards" else key
+                self.stats[stat] += delta
+            self.stats["model_tokens"] += self.policy.tokens_total - tokens_before
+            self.stats["device_snapshots"] += 1
+            if plan:
+                self._plan_and_migrate()
+            # The device restarts from the policy state that now holds,
+            # whether or not a plan was committed.
+            rebase = getattr(self.observer, "rebase", None)
+            if rebase is not None:
+                rebase(
+                    tokens_total=self.policy.tokens_total,
+                    version=self.policy.version,
+                    last_sync_tokens=self.policy.last_sync_tokens,
+                )
+            return
+        if _is_deferred(result):
+            # The observation arrives with a later snapshot; nothing may be
+            # planned against stale heat.
+            self.stats["deferred_forwards"] += getattr(result, "forwards", 1)
+            return
+        if not hasattr(result, "routes"):
+            raise TypeError("Observer returned an unknown result type")
+        routes, activity, mask, tokens = (
+            result.routes,
+            result.activity,
+            result.mask,
+            result.tokens,
+        )
+        if not self.heat_enabled:
+            return
+        if tokens:
             # Measure the routing placement used by this forward, before heat
             # observation or migration changes it. CPU records already exist.
             for layer, route_rows, active_rows in zip(self.layers, routes, activity):
@@ -985,6 +1310,13 @@ class TierCoordinator:
             )
             self.stats["policy_observe_seconds"] += time.perf_counter() - started
             self.stats["model_tokens"] += tokens
+            if plan:
+                self._plan_and_migrate()
+        else:
+            self.stats["ignored_synthetic_forwards"] += 1
+
+    def _plan_and_migrate(self):
+        if True:
             started = time.perf_counter()
             plan = self.policy.plan_resync()
             self.stats["policy_plan_seconds"] += time.perf_counter() - started
@@ -1016,10 +1348,6 @@ class TierCoordinator:
                     ):
                         raise AssertionError("Policy and physical tier maps diverged")
                 self.stats["policy_commit_seconds"] += time.perf_counter() - started
-        else:
-            self.stats["ignored_synthetic_forwards"] += 1
-        if self.stats["model_forwards"] % self.settings.stats_every == 0:
-            self.report()
 
     def migrate(self, swaps):
         """Move a plan's rows in slot-independent waves, in plan order.
@@ -1079,6 +1407,9 @@ class TierCoordinator:
             "replayed_forwards",
             "captured_forwards",
             "dropped_startup_records",
+            "deferred_forwards",
+            "snapshot_forwards",
+            "device_snapshots",
             "policy_observe_seconds",
             "policy_plan_seconds",
             "policy_commit_seconds",
@@ -1129,6 +1460,9 @@ class TierCoordinator:
             self.stats.clear()
             self.per_layer_swaps[:] = [0] * len(self.layers)
             self.heat_enabled = True
+            # Captured graphs cannot see this Python flag: the observer must
+            # flip its own in-place device gate now, after the startup wait.
+            self.observer.on_heat_enabled()
             LOGGER.warning(
                 "LAB_EXPERT_TIER_HEAT_ENABLED %s",
                 json.dumps(
@@ -1154,14 +1488,14 @@ def enable_model_heat(model):
     coordinator.enable_heat()
 
 
-def finish_model_forward(model, rows):
+def finish_model_forward(model, rows, valid_rows=None):
     """Runner hook after every model forward: eager, dummy, or graph replay.
 
     Cheap when the tier is disabled; never reads the environment.
     """
     coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
     if coordinator is not None:
-        coordinator.finish_forward(rows)
+        coordinator.finish_forward(rows, valid_rows)
 
 
 def unpack_routes(packed, num_experts):
@@ -1339,7 +1673,10 @@ def initialize_model(model, model_config):
         raise NotImplementedError(
             f"Expected all 48 FlashNext MoE layers, found {len(candidates)}"
         )
-    slots, expected_bytes = uniform_slots(settings.capacity_bytes, row_sizes, 512)
+    staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
+    slots, expected_bytes = uniform_slots(
+        settings.capacity_bytes, row_sizes, 512, reserve=staging_rows
+    )
     if not 0 < slots < 512:
         raise ValueError("Expert tier requires both a hot and cold partition")
     first = candidates[0][1]
@@ -1377,7 +1714,19 @@ def initialize_model(model, model_config):
                 sort_keys=True,
             ),
         )
-    coordinator = TierCoordinator(tiers, settings, temporary)
+    coordinator = TierCoordinator(
+        tiers,
+        settings,
+        temporary,
+        make_observer(
+            settings.observer,
+            num_layers=len(tiers),
+            num_experts=tiers[0].num_experts,
+            decay=settings.decay,
+            sync_period=settings.sync_tokens,
+            session_id=os.getpid(),
+        ),
+    )
     coordinator.allocate_records(
         tiers[0].device, candidates[0][2].moe.experts_per_token, max_tokens
     )
@@ -1387,7 +1736,8 @@ def initialize_model(model, model_config):
     model._lab_expert_tiers = tiers
     model._lab_expert_tier_coordinator = coordinator
     atexit.register(coordinator.report)
-    actual_bytes = sum(t.hot_bytes for t in tiers)
+    atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
+    actual_bytes = sum(t.hot_bytes + t.staging_bytes for t in tiers)
     if actual_bytes != expected_bytes or actual_bytes > settings.capacity_bytes:
         raise AssertionError("Tier exceeds exact six-tensor GPU budget")
     LOGGER.warning(
@@ -1400,12 +1750,15 @@ def initialize_model(model, model_config):
                 "cold_slots_per_layer": 512 - slots,
                 "capacity_bytes": settings.capacity_bytes,
                 "gpu_weight_bytes": actual_bytes,
+                "staging_slots_per_layer": staging_rows,
+                "staging_bytes": sum(t.staging_bytes for t in tiers),
                 "host_cold_bytes": sum(t.cold_bytes for t in tiers),
                 "temporary_host_bytes": sum(
                     t.numel() * t.element_size() for t in temporary.values()
                 ),
                 "temporary_rows": settings.temp_slots,
                 "split": settings.split,
+                "observer": settings.observer,
                 "host_source_bytes": sum(row_sizes) * 512,
                 "host_allocator": _host_allocator_stats(),
                 "verify_init": settings.verify_init,

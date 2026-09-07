@@ -43,6 +43,15 @@ class InvariantTests(unittest.TestCase):
     def test_exact_six_tensor_budget_and_complementary_partition(self):
         slots, size = rt.uniform_slots(32 * 2**30, [2764808] * 48, 512)
         self.assertEqual((slots, size), (258, 34239382272))
+        # Ten staging rows per layer come out of the same budget.
+        staged_slots, staged_size = rt.uniform_slots(
+            32 * 2**30, [2764808] * 48, 512, reserve=10
+        )
+        self.assertEqual((staged_slots, staged_size), (248, size))
+        with self.assertRaises(ValueError):
+            rt.uniform_slots(32 * 2**30, [2764808] * 48, 512, reserve=-1)
+        with self.assertRaises(ValueError):
+            rt.uniform_slots(10 * 2764808 * 48, [2764808] * 48, 512, reserve=10)
         h, c = tuple(range(258)) + (-1,) * 254, (-1,) * 258 + tuple(range(254))
         rt.validate_partition(h, c, 258, 254)
         self.assertEqual(size + 254 * 2764808 * 48, 67947921408)
@@ -108,6 +117,7 @@ class InvariantTests(unittest.TestCase):
             ("STATS_EVERY", "0"),
             ("TEMP_SLOTS", "0"),
             ("SPLIT", "single"),
+            ("STAGING", "2"),
         ):
             env = {rt.PREFIX + "GIB": "32", rt.PREFIX + suffix: value}
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
@@ -125,6 +135,7 @@ class InvariantTests(unittest.TestCase):
             "STATS_EVERY": "1",
             "TEMP_SLOTS": "4",
             "SPLIT": "modular",
+            "STAGING": "1",
         }
         with patch.dict(
             os.environ, {rt.PREFIX + k: v for k, v in controls.items()}, clear=True
@@ -134,9 +145,10 @@ class InvariantTests(unittest.TestCase):
             [SimpleNamespace(num_experts=4, hot_slots=2)], settings, {}
         )
         self.assertEqual((settings.stats_every, settings.temp_slots), (1, 4))
-        self.assertEqual(settings.split, "modular")
+        self.assertEqual((settings.split, settings.staging), ("modular", True))
         with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
-            self.assertEqual(rt.Settings.from_env().split, "fused")
+            defaults = rt.Settings.from_env()
+        self.assertEqual((defaults.split, defaults.staging), ("fused", False))
         expected = {
             "sync_period": 10,
             "swaps_per_token": 0.25,
@@ -1009,13 +1021,241 @@ class TensorTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out[2], torch.zeros_like(out[2])))
 
+    def test_observer_registry_builds_default_and_rejects_unknown(self):
+        observer = rt.make_observer(
+            "records", num_layers=2, num_experts=4, decay=0.5, sync_period=1
+        )
+        self.assertIsInstance(observer, rt.RecordObserver)
+        with self.assertRaises(ValueError):
+            rt.make_observer("missing")
+        with (
+            patch.dict(
+                os.environ,
+                {rt.PREFIX + "GIB": "32", rt.PREFIX + "OBSERVER": "x y"},
+                clear=True,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            rt.Settings.from_env()
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().observer, "records")
+
+    def test_split_routes_batch_one_through_staging_and_one_chain(self):
+        from lab_expert_tier import staging as st
+
+        tier = object.__new__(rt.TierLayer)
+        tier.settings = rt.Settings(32 * 2**30)
+        tier.device = torch.device("cpu")
+        tier.num_experts, tier.hot_slots, tier.cold_slots = 4, 2, 2
+        tier.staging_slots = 2
+        tier.hot_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+        tier.cold_map = torch.tensor([-1, -1, 0, 1], dtype=torch.int32)
+        tier.bank = {"w13_weight": "bank13", "w2_weight": "bank2"}
+        tier.hot = {"w13_weight": "hot13", "w2_weight": "hot2"}
+        tier.cold = {"w13_weight": "cold13", "w2_weight": "cold2"}
+        tier.staging = {"w13_weight": "stage13", "w2_weight": "stage2"}
+        tier.bank_kernel = SimpleNamespace(fused_experts="bank-experts")
+        tier.hot_kernel = SimpleNamespace(fused_experts="hot-experts")
+        tier.cold_kernel = SimpleNamespace(fused_experts="cold-experts")
+        calls: list[Any] = []
+        planned = (torch.tensor([1, 0]), torch.tensor([0, 1, -1, 2]), torch.tensor(1))
+
+        def plan(ids, cold_map, hot_map, hot_slots, staging_slots):
+            calls.append(("plan", ids.tolist(), hot_slots, staging_slots))
+            self.assertIs(cold_map, tier.cold_map)
+            self.assertIs(hot_map, tier.hot_map)
+            return planned
+
+        def gather(source, staging, gather_index, count):
+            calls.append(("gather", source, staging, gather_index.tolist()))
+
+        def chains(x, weights, ids, partitions):
+            calls.append(("chains", partitions))
+            return "output"
+
+        x = torch.ones(1, 3, dtype=torch.bfloat16)
+        weights = torch.ones(1, 2)
+        ids = torch.tensor([[3, 0]])
+        with (
+            patch.object(st, "plan_staging", plan),
+            patch.object(st, "gather_staging", gather),
+            patch.object(tier, "_run_marlin_chains", chains),
+        ):
+            self.assertEqual(tier.split(x, weights, ids), "output")
+            # Two rows exceed the staging rows: the two-partition path runs.
+            tier.split(x.expand(2, -1), weights.expand(2, -1), ids.expand(2, -1))
+        self.assertEqual(calls[0], ("plan", [[3, 0]], 2, 2))
+        self.assertEqual(calls[1], ("gather", tier.cold, tier.staging, [1, 0]))
+        kind, partitions = calls[2]
+        self.assertEqual(kind, "chains")
+        self.assertEqual(len(partitions), 1)
+        experts, tensors, expert_map, slots = partitions[0]
+        self.assertEqual((experts, tensors, slots), ("bank-experts", tier.bank, 4))
+        self.assertIs(expert_map, planned[1])
+        kind, partitions = calls[3]
+        self.assertEqual(len(partitions), 2)
+        self.assertEqual(partitions[0][1], tier.hot)
+        self.assertEqual(partitions[1][1], tier.cold)
+
     def test_runner_hook_is_noop_without_tier_and_forwards_padded_rows(self):
         rt.finish_model_forward(SimpleNamespace(), 8)
         coordinator = SimpleNamespace(finish_forward=Mock())
         rt.finish_model_forward(
             SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8
         )
-        coordinator.finish_forward.assert_called_once_with(8)
+        coordinator.finish_forward.assert_called_once_with(8, None)
+        rt.finish_model_forward(
+            SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8, 1
+        )
+        coordinator.finish_forward.assert_called_with(8, 1)
+
+    def test_observer_seam_dispatches_legacy_deferred_and_device_snapshots(self):
+        class Observer(rt.RecordObserver):
+            def __init__(self):
+                super().__init__()
+                self.results: list[Any] = []
+                self.calls: list[Any] = []
+                self.gate_opened = 0
+                self.acknowledged: list[Any] = []
+                self.rebased: list[Any] = []
+
+            def acknowledge_snapshot(self, snapshot):
+                self.acknowledged.append(snapshot)
+
+            def rebase(self, **state):
+                self.rebased.append(state)
+
+            def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+                self.calls.append((rows, valid_rows, heat_enabled))
+                result = self.results.pop(0)
+                if result == "legacy":
+                    return super().finish(
+                        rows, valid_rows, heat_enabled, stream, num_experts
+                    )
+                return result
+
+            def flush(self):
+                return self.results.pop(0) if self.results else None
+
+            def on_heat_enabled(self):
+                self.gate_opened += 1
+
+        observer = Observer()
+        coordinator = self.make_coordinator(
+            settings=rt.Settings(32 * 2**30, sync_tokens=0)
+        )
+        coordinator.observer = observer
+        coordinator.allocate_records(torch.device("cpu"), 2, 4)
+        record = torch.tensor([[2, 3, 1, 1, 1]], dtype=torch.int32)
+        coordinator.records[:1] = record[:, None, :]
+        # Startup: a snapshot before heat is enabled is a contract violation.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        observer.results = [rt.Deferred()]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(coordinator.stats["ignored_startup_forwards"], 2)
+        self.assertEqual(coordinator.stats["model_forwards"], 2)
+        coordinator.enable_heat()
+        self.assertEqual(observer.gate_opened, 1)
+        # Legacy readback still observes and plans exactly as before.
+        observer.results = ["legacy"]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(observer.calls[-1], (1, 1, True))
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        # Deferred forwards count but never plan against stale heat.
+        observer.results = [rt.Deferred(), rt.Deferred(forwards=1)]
+        coordinator.finish_forward(1, 1)
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(coordinator.stats["deferred_forwards"], 2)
+        self.assertEqual(coordinator.stats["model_forwards"], 3)
+        self.assertEqual(coordinator.policy.tokens_total, 1)
+        # A snapshot needs a policy importer; without one it fails closed.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 2, 2, 1, 4)]
+        with self.assertRaises(NotImplementedError):
+            coordinator.finish_forward(1, 1)
+        self.assertTrue(coordinator.poisoned)
+        coordinator.poisoned = False
+        imported: list[Any] = []
+
+        def import_snapshot(snapshot):
+            imported.append(snapshot)
+            coordinator.policy.tokens_total = snapshot.tokens
+
+        coordinator.policy.import_snapshot = import_snapshot
+        # Cumulative totals: 3 tokens so far (1 legacy + 2 new), 2 forwards.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 3, 2, 1, 4)]
+        coordinator.finish_forward(1, 1)
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(coordinator.stats["device_snapshots"], 1)
+        self.assertEqual(coordinator.stats["model_tokens"], 3)
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (1, 8)
+        )
+        # Forwards are counted once per finish; a snapshot window covering
+        # two forwards is recorded separately and never re-added.
+        self.assertEqual(coordinator.stats["model_forwards"], 5)
+        self.assertEqual(coordinator.stats["snapshot_forwards"], 2)
+        # flush collects a pending snapshot without counting a forward and,
+        # by default, without planning.
+        # A second cumulative snapshot adds only its increments.
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 3, 1, 6)]
+        with patch.object(coordinator, "_plan_and_migrate") as planner:
+            coordinator.flush()
+            planner.assert_not_called()
+            observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 3, 1, 6)]
+            coordinator.flush(plan=True)
+            planner.assert_called_once_with()
+        self.assertEqual(len(imported), 3)
+        self.assertEqual(coordinator.stats["model_forwards"], 5)
+        self.assertEqual(coordinator.stats["model_tokens"], 4)
+        self.assertEqual(coordinator.stats["snapshot_forwards"], 3)
+        self.assertEqual(
+            (coordinator.stats["route_hot"], coordinator.stats["route_total"]), (1, 10)
+        )
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 4, 2, 1, 6)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        observer.results = [rt.DeviceSnapshot([[0.0] * 4] * 2, 1, 1, 0, 2, False)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        observer.results = ["unknown"]
+        with self.assertRaises(TypeError):
+            coordinator.finish_forward(1, 1)
+        coordinator.poisoned = False
+        with self.assertRaises(ValueError):
+            coordinator.finish_forward(1, 2)
+        coordinator.poisoned = False
+        # Foreign result objects are recognized by shape: a device module's
+        # own snapshot/deferred classes never import this module.
+        foreign = SimpleNamespace(
+            heat=[[0.0] * 4] * 2,
+            tokens=5,
+            forwards=1,
+            route_total=2,
+            error=False,
+            session_id="other",
+        )
+        observer.results = [foreign, SimpleNamespace(forwards=3)]
+        coordinator.finish_forward(1, 1)
+        coordinator.finish_forward(1, 1)
+        self.assertIs(observer.acknowledged[-1], foreign)
+        self.assertEqual(
+            observer.rebased[-1],
+            {
+                "tokens_total": coordinator.policy.tokens_total,
+                "version": coordinator.policy.version,
+                "last_sync_tokens": coordinator.policy.last_sync_tokens,
+            },
+        )
+        self.assertEqual(len(observer.rebased), 4)
+        self.assertEqual(coordinator.stats["deferred_forwards"], 5)
+        observer.results = [SimpleNamespace(heat=[], tokens=0, forwards=1, error=True)]
+        with self.assertRaises(RuntimeError):
+            coordinator.finish_forward(1, 1)
 
 
 if __name__ == "__main__":
