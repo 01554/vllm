@@ -1104,6 +1104,11 @@ class TierLayer:
         self.native_workspaces[rows] = workspace
         return workspace
 
+    def native_activation(self):
+        from .native_loader import require_silu
+
+        return require_silu(self.layer.activation)
+
     def _run_native_chains(self, x, weights, ids, partitions):
         """One adapter call per partition; routes outside a partition are
         masked to padding so the adapter never records them as missing."""
@@ -1125,7 +1130,7 @@ class TierLayer:
                 tensors,
                 expert_map,
                 self.native_workspace(tensors),
-                activation=self.layer.activation,
+                activation=self.native_activation(),
             )
             # The output aliases the workspace: own it before the next call.
             total = out.clone() if total is None else total.add_(out)
@@ -1363,7 +1368,7 @@ class TierLayer:
                 source,
                 identity,
                 self.native_workspace(source),
-                activation=self.layer.activation,
+                activation=self.native_activation(),
             ).clone()
         else:
             reference = self.call(
@@ -2516,8 +2521,9 @@ def initialize_model(model, model_config):
         if settings.moe_kernel == "native":
             if not getattr(method, "_lab_native", False):
                 raise RuntimeError(f"{name}: native backend layout was not loaded")
-            if getattr(layer, "activation", "silu") != "silu":
-                raise NotImplementedError("Native backend supports SiLU only")
+            from .native_loader import require_silu
+
+            require_silu(getattr(layer, "activation", "silu"))
         elif method.nvfp4_backend != NvFp4MoeBackend.MARLIN or method.is_monolithic:
             raise NotImplementedError("Only modular NVFP4 Marlin is supported")
         if layer.expert_map is not None or layer.global_num_experts != 512:
