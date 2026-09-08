@@ -2220,7 +2220,7 @@ class TierCoordinator:
     def poll_verify_file(self):
         """Run a pool verification when the trigger file's mtime changed
         (checked every 16 forwards; the check itself is one stat call)."""
-        path = self.settings.verify_file
+        path = getattr(self.settings, "verify_file", "")
         if not path or self.stats["model_forwards"] % 16:
             return None
         import os
