@@ -73,6 +73,12 @@ class UVAOffloader(BaseOffloader):
         if (params := next(module.parameters(), None)) is None:
             return module
 
+        from vllm._lab_expert_tier.draft_scope import is_draft_load_scope
+
+        if is_draft_load_scope():
+            # Draft models stay resident; the tier offloads target experts only.
+            return module
+
         device = params.device
 
         if device == torch.device("cpu"):

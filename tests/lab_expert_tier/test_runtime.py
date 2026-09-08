@@ -1844,14 +1844,45 @@ class TensorTests(unittest.TestCase):
         rt.check_speculation(
             SimpleNamespace(method="ngram_gpu", num_speculative_tokens=3), 4
         )
+        rt.check_speculation(SimpleNamespace(method="mtp", num_speculative_tokens=1), 8)
         with self.assertRaises(NotImplementedError):
             rt.check_speculation(
-                SimpleNamespace(method="mtp", num_speculative_tokens=1), 8
+                SimpleNamespace(method="eagle", num_speculative_tokens=1), 8
             )
         with self.assertRaises(NotImplementedError):
             rt.check_speculation(
                 SimpleNamespace(method="ngram", num_speculative_tokens=4), 4
             )
+
+    def test_draft_load_scope_bypasses_the_target_hooks(self):
+        """Inside `draft_load_scope` the tier registers nothing and the native
+        layout is not requested, and the scope resets on exit and on error."""
+        from lab_expert_tier import draft_scope, native_loader
+
+        env = {
+            rt.PREFIX + "GIB": "32",
+            rt.PREFIX + "PROMOTE": "1",
+            rt.PREFIX + "STAGING": "1",
+            rt.PREFIX + "RAM_BACKING": "1",
+            rt.PREFIX + "MOE_KERNEL": "native",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(draft_scope.is_draft_load_scope())
+            self.assertTrue(native_loader.native_requested())
+            with draft_scope.draft_load_scope():
+                self.assertTrue(draft_scope.is_draft_load_scope())
+                self.assertFalse(native_loader.native_requested())
+                with draft_scope.draft_load_scope():
+                    self.assertTrue(draft_scope.is_draft_load_scope())
+                self.assertTrue(draft_scope.is_draft_load_scope())
+                self.assertIsNone(rt.initialize_model(object(), None))
+                param = SimpleNamespace()
+                rt.capture_cpu_source(param, object())
+                self.assertIsNone(rt._get_cpu_source(param))
+            self.assertFalse(draft_scope.is_draft_load_scope())
+            with self.assertRaises(RuntimeError), draft_scope.draft_load_scope():
+                raise RuntimeError("load failed")
+            self.assertFalse(draft_scope.is_draft_load_scope())
 
     def test_pool_layers_serve_a_verify_step_on_the_decode_path(self):
         """rows x top_k <= staging keeps a multi-row step on split_global."""

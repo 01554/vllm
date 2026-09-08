@@ -405,7 +405,9 @@ class Settings:
 def capture_cpu_source(parameter, cpu_tensor):
     """Retain the *same* host allocation, never .cpu() a UVA tensor again."""
     global _CAPTURE_COUNT
-    if Settings.from_env() is not None:
+    from .draft_scope import is_draft_load_scope
+
+    if Settings.from_env() is not None and not is_draft_load_scope():
         identity = id(parameter)
 
         def release(dead_ref, identity=identity):
@@ -2650,20 +2652,25 @@ def _validate_sources(name, layer):
     return sources
 
 
+SPECULATION_METHODS = ("ngram", "ngram_gpu", "mtp")
+
+
 def check_speculation(speculative_config, spec_rows):
     """Admit vLLM speculation only in the agreed first form.
 
-    Draft-model methods (MTP, DFlash, EAGLE, ...) run their own MoE layers
-    and are rejected until their tier connection lands; n-gram has no draft
-    model. Every verify step has 1 + num_speculative_tokens rows per request
-    and must fit the pool decode path (`spec_rows`).
+    n-gram has no draft model; MTP loads its draft under `draft_load_scope`
+    so the draft's layers stay outside the tier. Other draft-model methods
+    (DFlash, EAGLE, ...) are rejected until their loaders do the same. Every
+    verify step has 1 + num_speculative_tokens rows per request and must fit
+    the pool decode path (`spec_rows`).
     """
     if speculative_config is None:
         return
     method = getattr(speculative_config, "method", None)
-    if method not in ("ngram", "ngram_gpu"):
+    if method not in SPECULATION_METHODS:
         raise NotImplementedError(
-            f"Expert tier admits speculation with method ngram only, got {method!r}"
+            f"Expert tier admits speculation with methods {SPECULATION_METHODS},"
+            f" got {method!r}"
         )
     tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
     if tokens < 1 or tokens + 1 > spec_rows:
@@ -2705,6 +2712,11 @@ def _compact_one(
 
 
 def initialize_model(model, model_config):
+    from .draft_scope import is_draft_load_scope
+
+    if is_draft_load_scope():
+        # Draft models (MTP, EAGLE) are never tier targets.
+        return
     settings = Settings.from_env()
     if settings is None:
         return
