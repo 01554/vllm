@@ -1134,15 +1134,20 @@ class TensorTests(unittest.TestCase):
                 )
             )
             layers.append(tier)
-        coordinator = SimpleNamespace(layers=layers, forward_serial=7)
+        coordinator = SimpleNamespace(
+            layers=layers, forward_serial=7, prefetch_states={}
+        )
         for tier in layers:
             tier.coordinator = coordinator
-        rt._PREFILL_PREFETCH.clear()
+        rt._PREFILL_SCRATCH.clear()
         ids = torch.tensor([[3, 5], [4, 0], [3, -1]], dtype=torch.int32)
         x, w = torch.ones(3, 4), torch.ones(3, 2)
         for tier in layers:
             tier.split_fused(x, w, ids)
         state = layers[0].prefetch_state()
+        # The single scratch is the first bank: two banks in total.
+        self.assertIs(state.buffers[0], layers[0].prefill_scratch())
+        self.assertEqual(len(coordinator.prefetch_states), 1)
         self.assertEqual([i for i, _, _ in seen], [0, 1, 2])
         for index, parts, snapshot in seen:
             hot, (kernel, bank, scratch_map, count), overflow = parts
@@ -1227,7 +1232,7 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(parts[1][2].tolist(), [-1, -1, -1, -1, -1, 0])
         self.assertEqual(parts[2][2].tolist(), [-1] * 6)
         self.assertEqual(snapshot[0].tolist(), (torch.arange(4, 8) + 100).tolist())
-        rt._PREFILL_PREFETCH.clear()
+        rt._PREFILL_SCRATCH.clear()
         base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PREFILL_STAGE_BUFFERS": "2"}
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()

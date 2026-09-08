@@ -67,7 +67,6 @@ NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
 _NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
 _NATIVE_PREFILL_WORKSPACES: dict[tuple[str, int], Any] = {}
 _PREFILL_SCRATCH: dict[tuple[Any, ...], Any] = {}
-_PREFILL_PREFETCH: dict[tuple[Any, ...], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -1277,35 +1276,35 @@ class TierLayer:
 
     def prefetch_state(self):
         """Two scratch banks, their ready/release events and the copy stream,
-        owned by this coordinator (re-initialising or a second model never
-        sees another's pending prefetch) and shared by its layers of this
-        bank signature on this device."""
+        owned by the coordinator (a second model or a re-initialisation
+        never sees another's pending prefetch) and shared by its layers of
+        this bank signature on this device. The single scratch that init
+        verification allocated is reused as the first bank, behind a fence
+        on the compute stream, so only one more bank is allocated."""
+        coordinator = self.coordinator
+        if coordinator is None:
+            raise RuntimeError("Staged prefill needs the coordinator")
         rows = self.settings.prefill_stage_rows
-        key = (id(self.coordinator), str(self.device), rows, self.bank_signature())
-        state = _PREFILL_PREFETCH.get(key)
+        key = (str(self.device), rows, self.bank_signature())
+        state = coordinator.prefetch_states.get(key)
         if state is None:
             import torch
 
-            from .async_migration import _migration_stream
+            from .async_migration import _migration_stream, _record_event
 
-            def bank():
-                return {
-                    name: torch.empty(
-                        (rows, *self.cold[name].shape[1:]),
-                        dtype=self.cold[name].dtype,
-                        device=self.device,
-                    )
-                    for name in TENSORS
-                }
-
+            first = self.prefill_scratch()
+            second = {name: torch.empty_like(first[name]) for name in TENSORS}
+            # Everything queued so far on the compute stream (init
+            # verification included) finishes before either bank is written.
+            fence = _record_event(_current_stream(self.device))
             state = SimpleNamespace(
-                buffers=(bank(), bank()),
+                buffers=(first, second),
                 ready=[None, None],
-                release=[None, None],
-                pending=None,  # (layer index, buffer) of an issued prefetch
+                release=[fence, fence],
+                pending=None,  # (serial, index, buffer, ...) of an issued prefetch
                 stream=_migration_stream(self.device),
             )
-            _PREFILL_PREFETCH[key] = state
+            coordinator.prefetch_states[key] = state
         return state
 
     def cold_set(self, rows):
@@ -2200,6 +2199,7 @@ class TierCoordinator:
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
         self.forward_serial = 0  # bumped at layer 0; tags prefetches
+        self.prefetch_states: dict[tuple[Any, ...], Any] = {}  # owned here
         self.forward_rows: int | None = None  # recorded, not yet finished
         # Cumulative totals of the last consumed device snapshot, per session.
         self.snapshot_totals: dict[str, int] = {}
