@@ -1269,15 +1269,19 @@ class TierLayer:
             _PREFILL_SCRATCH[key] = scratch
         return scratch
 
-    def prefetch_state(self):
-        """Two scratch banks, their ready/release events and the copy stream,
-        shared by every layer of this bank signature on this device."""
-        rows = self.settings.prefill_stage_rows
-        signature = tuple(
+    def bank_signature(self):
+        return tuple(
             (name, tuple(self.cold[name].shape[1:]), str(self.cold[name].dtype))
             for name in TENSORS
         )
-        key = (str(self.device), rows, signature)
+
+    def prefetch_state(self):
+        """Two scratch banks, their ready/release events and the copy stream,
+        owned by this coordinator (re-initialising or a second model never
+        sees another's pending prefetch) and shared by its layers of this
+        bank signature on this device."""
+        rows = self.settings.prefill_stage_rows
+        key = (id(self.coordinator), str(self.device), rows, self.bank_signature())
         state = _PREFILL_PREFETCH.get(key)
         if state is None:
             import torch
@@ -1356,7 +1360,18 @@ class TierLayer:
         with _on_stream(stream):
             copy_rows(tier.cold, bank, src_rows, dst_rows, count)
         state.ready[buffer] = _record_event(stream)
-        state.pending = (index, buffer, take, count, src_rows, dst_rows)
+        # Strong references until consumed: the index tensors and the source
+        # bank the copy stream is still reading.
+        state.pending = (
+            coordinator.forward_serial,
+            index,
+            buffer,
+            take,
+            count,
+            src_rows,
+            dst_rows,
+            tier.cold,
+        )
 
     def stage_prefetched_partition(self):
         """Double-buffered staging for this layer: consume the prefetch issued
@@ -1365,16 +1380,21 @@ class TierLayer:
 
         from .async_migration import _stream_wait_event
 
+        coordinator = self.coordinator
+        if coordinator is None:
+            raise RuntimeError("Staged prefill needs the coordinator")
         state = self.prefetch_state()
         buffer = self.index % 2
         pending = state.pending
-        if pending is None or pending[0] != self.index or pending[1] != buffer:
-            # No prefetch for this layer (first layer of a forward, or a stale
+        expected = (coordinator.forward_serial, self.index, buffer)
+        if pending is None or pending[:3] != expected:
+            # No prefetch for this forward and layer (first layer, or a stale
             # one left by an interrupted forward): copy now, in order after
             # any stale copy on the same stream.
+            state.pending = None
             self.issue_prefetch(state, self.index, buffer)
             pending = state.pending
-        _, _, take, count, _, _ = pending
+        take, count = pending[3], pending[4]
         state.pending = None
         compute = _current_stream(self.device)
         _stream_wait_event(compute, state.ready[buffer])
@@ -1407,7 +1427,12 @@ class TierLayer:
         if coordinator is None:
             raise RuntimeError("Staged prefill needs the coordinator")
         layers = coordinator.layers
-        if nxt < len(layers) and getattr(layers[nxt], "native", False):
+        if (
+            nxt < len(layers)
+            and getattr(layers[nxt], "native", False)
+            and layers[nxt].bank_signature() == self.bank_signature()
+        ):
+            # A layer with another bank signature stages for itself.
             self.issue_prefetch(state, nxt, nxt % 2)
 
     def stage_cold_partition(self, ids, scratch):
@@ -1489,13 +1514,26 @@ class TierLayer:
         )
         native = getattr(self, "native", False)
         prefill = x.shape[0] > self.settings.native_gemv_rows
-        if native and prefill and self.settings.prefill_stage_buffers == 2:
+        # Prefetching needs the coordinator (layer list, forward serial); init
+        # verification runs before it is wired and uses the single scratch.
+        if (
+            native
+            and prefill
+            and self.settings.prefill_stage_buffers == 2
+            and getattr(self, "coordinator", None) is not None
+        ):
             if _is_capturing(self.device):
                 raise RuntimeError("Staged prefill cannot run during graph capture")
-            state, buffer, staged, overflow = self.stage_prefetched_partition()
-            partitions = (partitions[0], staged, overflow)
-            result = self._run_marlin_chains(x, weights, ids, partitions)
-            self.finish_prefetched_partition(state, buffer, x.shape[0])
+            state = self.prefetch_state()
+            try:
+                state, buffer, staged, overflow = self.stage_prefetched_partition()
+                partitions = (partitions[0], staged, overflow)
+                result = self._run_marlin_chains(x, weights, ids, partitions)
+                self.finish_prefetched_partition(state, buffer, x.shape[0])
+            except Exception:
+                # Nothing issued here may be consumed later.
+                state.pending = None
+                raise
             return result
         scratch = self.prefill_scratch() if native else None
         if scratch is not None and prefill:
@@ -2161,6 +2199,7 @@ class TierCoordinator:
                 observation_only(True)
         self.device: Any = None
         self.recorded = 0  # layers recorded by the forward in progress
+        self.forward_serial = 0  # bumped at layer 0; tags prefetches
         self.forward_rows: int | None = None  # recorded, not yet finished
         # Cumulative totals of the last consumed device snapshot, per session.
         self.snapshot_totals: dict[str, int] = {}
@@ -2230,6 +2269,8 @@ class TierCoordinator:
             raise RuntimeError("Expert tier is poisoned by a previous failure")
         if self.device is None or not self.observer.capacity:
             raise RuntimeError("Tier routing records are not allocated")
+        if tier.index == 0:
+            self.forward_serial += 1
         if tier.index != self.recorded:
             raise RuntimeError("Tier requires one sequential full-model forward")
         rows = x.shape[0]

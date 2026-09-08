@@ -1134,7 +1134,7 @@ class TensorTests(unittest.TestCase):
                 )
             )
             layers.append(tier)
-        coordinator = SimpleNamespace(layers=layers)
+        coordinator = SimpleNamespace(layers=layers, forward_serial=7)
         for tier in layers:
             tier.coordinator = coordinator
         rt._PREFILL_PREFETCH.clear()
@@ -1163,17 +1163,59 @@ class TensorTests(unittest.TestCase):
         self.assertIsNone(state.pending)
         # A stale pending prefetch (e.g. left by an interrupted forward) is
         # not consumed by a different layer: layer 0 copies for itself.
-        state.pending = (2, 0, torch.tensor([3, 4]), 2)
+        state.pending = (7, 2, 0, torch.tensor([3, 4]), None, None, None, None)
         seen.clear()
         layers[0].split_fused(x, w, ids)
         _, parts, snapshot = seen[-1]
-        self.assertEqual(parts[1][1][rt.TENSORS[0]][0].tolist(), [8, 9, 10, 11])
-        self.assertEqual(state.pending[0], 1)
+        self.assertEqual(snapshot[0].tolist(), [8, 9, 10, 11])
+        self.assertEqual(state.pending[:2], (7, 1))
+        # A prefetch from an older forward serial is not consumed either.
+        coordinator.forward_serial = 8
+        seen.clear()
+        layers[1].split_fused(x, w, ids)
+        self.assertEqual(seen[-1][2][0].tolist(), (torch.arange(8, 12) + 100).tolist())
+        self.assertEqual(state.pending[:2], (8, 2))
+        # A failing layer leaves nothing pending.
+        layers[2]._run_marlin_chains = lambda *a: (_ for _ in ()).throw(
+            RuntimeError("x")
+        )
+        with self.assertRaises(RuntimeError):
+            layers[2].split_fused(x, w, ids)
+        self.assertIsNone(state.pending)
+        layers[2]._run_marlin_chains = lambda x, w, ids, parts, index=2: seen.append(
+            (
+                index,
+                parts,
+                parts[1][1][rt.TENSORS[0]].clone() if len(parts) == 3 else None,
+            )
+        )
+        # Before the coordinator is wired (init verification) the single
+        # scratch path runs instead of prefetching.
+        layers[0].coordinator = None
+        rt._PREFILL_SCRATCH.clear()
+        seen.clear()
+        layers[0].split_fused(x, w, ids)
+        self.assertIs(seen[-1][1][1][1], layers[0].prefill_scratch())
+        layers[0].coordinator = coordinator
+        rt._PREFILL_SCRATCH.clear()
+        # A different bank signature next layer is not prefetched for.
+        layers[1].cold = {
+            name: torch.zeros(3, 8, dtype=torch.int32) for name in rt.TENSORS
+        }
+        state.pending = None
+        seen.clear()
+        layers[0].split_fused(x, w, ids)
+        self.assertIsNone(state.pending)
+        layers[1].cold = {
+            name: (torch.arange(12, dtype=torch.int32).reshape(3, 4) + 100)
+            for name in rt.TENSORS
+        }
         # Decode rows: plain two-partition split, prefetch state untouched.
         seen.clear()
+        state.pending = (8, 1, 1, torch.tensor([3, 4]), None, None, None, None)
         layers[1].split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
         self.assertEqual(len(seen[-1][1]), 2)
-        self.assertEqual(state.pending[0], 1)
+        self.assertEqual(state.pending[:2], (8, 1))
         # The cold count follows the live map, not the static slot count:
         # after a promote leaves one cold expert, one slot is staged and the
         # clamped index rows past it are never used.
