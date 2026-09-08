@@ -126,7 +126,9 @@ def _cpu_coordinator(layer, events):
     class Observer:
         capacity = 1
 
-        def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+        def finish(
+            self, rows, valid_rows, heat_enabled, stream, num_experts, is_decode=None
+        ):
             events.append("finish")
             return rt.Deferred()
 

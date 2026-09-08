@@ -22,12 +22,12 @@ def _tensors(routes, activity, valid):
     return ids, flags, mask
 
 
-def _record(accumulator, routes, activity, valid, num_tokens):
+def _record(accumulator, routes, activity, valid, num_tokens, *, is_decode=None):
     ids, flags, mask = _tensors(routes[0], activity[0], valid)
     for layer, (layer_routes, layer_activity) in enumerate(zip(routes, activity)):
         ids, flags, mask = _tensors(layer_routes, layer_activity, valid)
         accumulator.record_layer(layer, ids, flags, mask, len(valid))
-    accumulator.finish_step(num_tokens)
+    accumulator.finish_step(num_tokens, is_decode=is_decode)
 
 
 class DeviceHeatTests(unittest.TestCase):
@@ -266,6 +266,84 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(accumulator.base_version, 7)
         self.assertEqual(accumulator.base_last_sync_tokens, 0)
         self.assertFalse(accumulator.resync_due)
+
+    def test_multirow_snapshot_cadence_consumes_only_eligible_boundaries(self):
+        for rows in (2, 3, 8):
+            with self.subTest(rows=rows):
+                accumulator = DeviceHeatAccumulator(
+                    1,
+                    2,
+                    sync_period=4,
+                    top_k=1,
+                    max_rows=8,
+                    max_step_tokens=rows,
+                    observation_only=True,
+                )
+                snapshots = []
+                for step in range(1, 13):
+                    _record(
+                        accumulator,
+                        [[[0]] * rows],
+                        [[[True]] * rows],
+                        [True] * rows,
+                        rows,
+                        is_decode=True,
+                    )
+                    snapshot = accumulator.snapshot()
+                    previous = (step - 1) * rows // 4
+                    current = step * rows // 4
+                    self.assertEqual(snapshot is not None, current > previous)
+                    if snapshot is not None:
+                        snapshots.append(snapshot.tokens)
+                        accumulator.acknowledge_snapshot(snapshot)
+                        accumulator.rebase(
+                            tokens_total=step * rows, version=7, last_sync_tokens=0
+                        )
+                        self.assertFalse(accumulator.resync_due)
+                self.assertTrue(snapshots)
+
+    def test_small_prefill_flush_keeps_due_until_real_decode(self):
+        accumulator = DeviceHeatAccumulator(
+            1,
+            2,
+            sync_period=2,
+            top_k=1,
+            max_rows=2,
+            max_step_tokens=2,
+            observation_only=True,
+        )
+        _record(
+            accumulator,
+            [[[0], [1]]],
+            [[[True], [True]]],
+            [True, True],
+            2,
+            is_decode=False,
+        )
+        self.assertIsNone(accumulator.snapshot())
+        snapshot = accumulator.flush()
+        accumulator.acknowledge_snapshot(snapshot)
+        self.assertTrue(accumulator.resync_due)
+        _record(
+            accumulator,
+            [[[0], [1]]],
+            [[[True], [True]]],
+            [True, True],
+            2,
+            is_decode=True,
+        )
+        snapshot = accumulator.snapshot()
+        self.assertIsNotNone(snapshot)
+        accumulator.acknowledge_snapshot(snapshot)
+        self.assertFalse(accumulator.resync_due)
+
+    def test_default_snapshot_bound_still_defers_multirow(self):
+        accumulator = DeviceHeatAccumulator(
+            1, 2, sync_period=2, top_k=1, max_rows=2, observation_only=True
+        )
+        _record(accumulator, [[[0], [1]]], [[[True], [True]]], [True, True], 2)
+        self.assertIsNone(accumulator.snapshot())
+        self.assertTrue(accumulator.resync_due)
 
     def test_observation_only_prefill_flush_defers_due_until_first_decode(self):
         accumulator = DeviceHeatAccumulator(
