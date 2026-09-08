@@ -184,6 +184,11 @@ class Settings:
     # (any subset of global_pool.CONTROL_FIELDS); validated whole, applied at
     # the forward boundary, invalid or partial content keeps the last values.
     control_file: str = ""
+    # Steady-state pool verification trigger: a file whose mtime change makes
+    # the next forward boundary compare every resident expert row in the pool
+    # bank with its host source row (bytes) and log the mismatches. Needs
+    # RAM_BACKING=1 (source row = expert id). "" = off (default).
+    verify_file: str = ""
     # Copy launch grid: programs per bank and int32 words per iteration.
     copy_programs: int = 0  # 0 = the shape's default (32 stripe / 8 chunks)
     copy_words: int = 4096
@@ -243,6 +248,7 @@ class Settings:
             "PROMOTE_MIN_MISSES",
             "PROTECT_RECENT",
             "CONTROL_FILE",
+            "VERIFY_FILE",
             "COPY_PROGRAMS",
             "COPY_WORDS",
             "VRAM_BUDGET_GIB",
@@ -308,6 +314,9 @@ class Settings:
 
         validate_control(controls)
         control_file = os.environ.get(PREFIX + "CONTROL_FILE", "").strip()
+        verify_file = os.environ.get(PREFIX + "VERIFY_FILE", "").strip()
+        if verify_file and ram_backing != "1":
+            raise ValueError("VERIFY_FILE requires RAM_BACKING=1")
         copy_programs = int(os.environ.get(PREFIX + "COPY_PROGRAMS", "0"))
         copy_words = int(os.environ.get(PREFIX + "COPY_WORDS", "4096"))
         if copy_programs < 0:
@@ -430,6 +439,7 @@ class Settings:
             controls["promote_min_misses"],
             controls["protect_recent"],
             control_file,
+            verify_file,
             copy_programs,
             copy_words,
             vram_budget_gib,
@@ -2004,6 +2014,7 @@ class TierCoordinator:
         # One asynchronous exchange plan in flight, at most.
         self.pending: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
+        self._verify_version = None
         self.draft_reserve: dict[str, Any] | None = None
         self.draft_resident: dict[str, Any] | None = None
         self.per_layer_swaps = [0] * len(layers)
@@ -2206,6 +2217,71 @@ class TierCoordinator:
         if result is not None:
             self._consume(result, plan)
 
+    def poll_verify_file(self):
+        """Run a pool verification when the trigger file's mtime changed
+        (checked every 16 forwards; the check itself is one stat call)."""
+        path = self.settings.verify_file
+        if not path or self.stats["model_forwards"] % 16:
+            return None
+        import os
+
+        try:
+            version = os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+        if version == self._verify_version:
+            return None
+        self._verify_version = version
+        return self.verify_pool()
+
+    def verify_pool(self):
+        """Compare every resident expert row of every layer's device bank with
+        the host source row (RAM backing: source row = expert id), bytewise,
+        on the current stream; log and return the per-layer mismatch counts.
+        Runs at a forward boundary only, never inside a capture."""
+        import torch
+
+        if _is_capturing(self.device):
+            raise RuntimeError("Pool verification cannot run during graph capture")
+        report: dict[str, Any] = {
+            "forwards": int(self.stats["model_forwards"]),
+            "layers": {},
+        }
+        total = checked = 0
+        for tier in self.layers:
+            hot_map = tier.hot_map
+            if hot_map is None:
+                continue
+            experts = torch.nonzero(hot_map >= 0).flatten()
+            if experts.numel() == 0:
+                continue
+            rows = hot_map[experts].long()
+            bank = getattr(tier, "hot_tensors", None)
+            if bank is None:
+                bank = tier.hot
+            bad = torch.zeros(experts.numel(), dtype=torch.bool, device=experts.device)
+            for name in TENSORS:
+                # Read-only: index_select copies; nothing in the bank or the
+                # maps is touched, and no mismatch is repaired here.
+                device_rows = bank[name].index_select(0, rows)
+                source_rows = tier.cold[name].index_select(0, experts.long())
+                bad |= (device_rows != source_rows).flatten(1).any(1)
+            count = int(bad.sum())
+            checked += int(experts.numel())
+            total += count
+            if count:
+                report["layers"][tier.index] = {
+                    "mismatched": count,
+                    "experts": experts[bad][:8].tolist(),
+                    "rows": rows[bad][:8].tolist(),
+                }
+        report["checked_rows"] = checked
+        report["mismatched_rows"] = total
+        LOGGER.warning("LAB_EXPERT_TIER_VERIFY_POOL %s", json.dumps(report))
+        self.stats["verify_pool_runs"] += 1
+        self.stats["verify_pool_mismatched_rows"] += total
+        return report
+
     def _finish_forward(self, rows, valid_rows=None, is_decode=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
             raise ValueError("Runner valid token count exceeds the padded rows")
@@ -2244,6 +2320,7 @@ class TierCoordinator:
         if not self.heat_enabled:
             self.stats["ignored_startup_forwards"] += 1
         self._consume(result, plan=True)
+        self.poll_verify_file()
         if self.stats["model_forwards"] % self.settings.stats_every == 0:
             self.report()
 
@@ -3212,6 +3289,7 @@ def initialize_model(model, model_config):
                 "draft_reserve": coordinator.draft_reserve,
                 "pool_control": None if pool is None else pool.control(),
                 "control_file": settings.control_file or None,
+                "verify_file": settings.verify_file or None,
                 "copy_programs": settings.copy_programs or None,
                 "copy_words": settings.copy_words,
                 "routing_host_copies_per_model_step": 1,

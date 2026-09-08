@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 import weakref
+from collections import Counter
 from importlib.abc import Loader
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -1091,6 +1092,59 @@ class TensorTests(unittest.TestCase):
             os.environ, {**marlin, rt.PREFIX + "MOE_KERNEL": "native"}, clear=True
         ):
             self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
+
+    def test_verify_pool_reports_rows_that_differ_from_the_source(self):
+        """VERIFY_FILE: a resident row that differs from its host source row is
+        counted and named; nothing is modified; the trigger fires on mtime."""
+        import tempfile
+
+        coordinator = object.__new__(rt.TierCoordinator)
+        coordinator.stats = Counter()
+        coordinator._verify_version = None
+        coordinator.device = torch.device("cpu")
+        layers = []
+        for index in range(2):
+            tier = object.__new__(rt.TierLayer)
+            tier.index, tier.device = index, torch.device("cpu")
+            tier.cold = {
+                name: torch.arange(24, dtype=torch.int32).reshape(6, 4) + 100 * index
+                for name in rt.TENSORS
+            }
+            # experts 1, 3, 4 resident at bank rows 2, 0, 1
+            tier.hot_map = torch.tensor([-1, 2, -1, 0, 1, -1], dtype=torch.int32)
+            bank = {name: torch.zeros(3, 4, dtype=torch.int32) for name in rt.TENSORS}
+            for name in rt.TENSORS:
+                bank[name][2] = tier.cold[name][1]
+                bank[name][0] = tier.cold[name][3]
+                bank[name][1] = tier.cold[name][4]
+            tier.hot_tensors = bank
+            layers.append(tier)
+        layers[1].hot_tensors[rt.TENSORS[3]][1, 2] += 1  # corrupt expert 4 of layer 1
+        coordinator.layers = layers
+        before = {n: layers[1].hot_tensors[n].clone() for n in rt.TENSORS}
+        report = coordinator.verify_pool()
+        self.assertEqual((report["checked_rows"], report["mismatched_rows"]), (6, 1))
+        self.assertEqual(
+            report["layers"], {1: {"mismatched": 1, "experts": [4], "rows": [1]}}
+        )
+        for n in rt.TENSORS:  # read-only: the corrupt row is still corrupt
+            self.assertTrue(torch.equal(layers[1].hot_tensors[n], before[n]))
+        self.assertEqual(coordinator.stats["verify_pool_mismatched_rows"], 1)
+        # Trigger file: fires once per mtime change, checked every 16 forwards.
+        with tempfile.NamedTemporaryFile() as f:
+            coordinator.settings = dataclasses.replace(
+                rt.Settings(1), verify_file=f.name
+            )
+            coordinator.stats["model_forwards"] = 15
+            self.assertIsNone(coordinator.poll_verify_file())
+            coordinator.stats["model_forwards"] = 16
+            self.assertIsNotNone(coordinator.poll_verify_file())
+            self.assertIsNone(coordinator.poll_verify_file())  # same mtime
+            os.utime(f.name, (1, 2))
+            self.assertIsNotNone(coordinator.poll_verify_file())
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "VERIFY_FILE": "/tmp/x"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
 
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
