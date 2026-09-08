@@ -1174,6 +1174,17 @@ class TensorTests(unittest.TestCase):
         layers[1].split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
         self.assertEqual(len(seen[-1][1]), 2)
         self.assertEqual(state.pending[0], 1)
+        # The cold count follows the live map, not the static slot count:
+        # after a promote leaves one cold expert, one slot is staged and the
+        # clamped index rows past it are never used.
+        state.pending = None
+        layers[1].cold_map = torch.tensor([-1, -1, -1, -1, -1, 1], dtype=torch.int32)
+        seen.clear()
+        layers[1].split_fused(x, w, ids)
+        _, parts, snapshot = seen[-1]
+        self.assertEqual(parts[1][2].tolist(), [-1, -1, -1, -1, -1, 0])
+        self.assertEqual(parts[2][2].tolist(), [-1] * 6)
+        self.assertEqual(snapshot[0].tolist(), (torch.arange(4, 8) + 100).tolist())
         rt._PREFILL_PREFETCH.clear()
         base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PREFILL_STAGE_BUFFERS": "2"}
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):

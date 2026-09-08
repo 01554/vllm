@@ -1305,17 +1305,20 @@ class TierLayer:
         return state
 
     def cold_set(self, rows):
-        """This layer's cold experts (ascending id, at most `rows`) from the
-        live device map, without a host sync: the count is the layer's cold
-        slot count, so a partial scratch takes the lowest ids."""
+        """This layer's cold experts from the live device map, without a host
+        sync: `take` holds the `rows` lowest ids with cold ones first, and
+        `count` (device int32 [1]) is how many of them are cold, so a partial
+        scratch stages the lowest cold ids and the copy kernel reads the
+        count on the device."""
         import torch
 
         cold_map = self.cold_map
         if cold_map is None:
             raise RuntimeError("Staged prefill needs the cold map")
-        count = min(int(rows), int(self.cold_slots))
-        order = torch.argsort((cold_map < 0).to(torch.int8), stable=True)
-        take = order[:count]
+        is_cold = cold_map >= 0
+        order = torch.argsort((~is_cold).to(torch.int8), stable=True)
+        take = order[: int(rows)]
+        count = is_cold.sum().clamp(max=int(rows)).to(torch.int32).reshape(1)
         return take, count
 
     def issue_prefetch(self, state, index, buffer):
@@ -1331,24 +1334,29 @@ class TierLayer:
             raise RuntimeError("Staged prefill needs the coordinator")
         tier = coordinator.layers[index]
         bank = state.buffers[buffer]
-        take, count = tier.cold_set(bank[TENSORS[0]].shape[0])
+        rows = bank[TENSORS[0]].shape[0]
+        take, count = tier.cold_set(rows)
         cold_map = tier.cold_map
         if cold_map is None:
             raise RuntimeError("Staged prefill needs the cold map")
-        src_rows = cold_map[take].to(torch.int32)
-        dst_rows = torch.arange(count, dtype=torch.int32, device=src_rows.device)
+        # Rows past `count` map hot experts (-1): clamp so the index tensor
+        # is always valid; the device count keeps the kernel from using them.
+        src_rows = cold_map[take].clamp(min=0).to(torch.int32)
+        dst_rows = torch.arange(rows, dtype=torch.int32, device=src_rows.device)
+        compute = _current_stream(self.device)
         stream = state.stream
+        # The index tensors were produced on the compute stream: the copy
+        # stream waits for them, and they stay referenced (and recorded on the
+        # copy stream) until the prefetch is consumed.
+        _stream_wait_event(stream, _record_event(compute))
         _stream_wait_event(stream, state.release[buffer])
+        for tensor in (take, count, src_rows, dst_rows):
+            if hasattr(tensor, "record_stream") and tensor.device.type == "cuda":
+                tensor.record_stream(stream)
         with _on_stream(stream):
-            copy_rows(
-                tier.cold,
-                bank,
-                src_rows,
-                dst_rows,
-                torch.tensor([count], dtype=torch.int32, device=src_rows.device),
-            )
+            copy_rows(tier.cold, bank, src_rows, dst_rows, count)
         state.ready[buffer] = _record_event(stream)
-        state.pending = (index, buffer, take, count)
+        state.pending = (index, buffer, take, count, src_rows, dst_rows)
 
     def stage_prefetched_partition(self):
         """Double-buffered staging for this layer: consume the prefetch issued
@@ -1366,7 +1374,7 @@ class TierLayer:
             # any stale copy on the same stream.
             self.issue_prefetch(state, self.index, buffer)
             pending = state.pending
-        _, _, take, count = pending
+        _, _, take, count, _, _ = pending
         state.pending = None
         compute = _current_stream(self.device)
         _stream_wait_event(compute, state.ready[buffer])
@@ -1374,17 +1382,18 @@ class TierLayer:
         cold_map = self.cold_map
         if cold_map is None:
             raise RuntimeError("Staged prefill needs the cold map")
+        rows = take.numel()
+        slots = torch.arange(rows, dtype=cold_map.dtype, device=cold_map.device)
+        staged_slot = torch.where(slots < count.to(cold_map.dtype), slots, -1)
         scratch_map = torch.full_like(cold_map, -1)
-        scratch_map[take] = torch.arange(
-            count, dtype=cold_map.dtype, device=cold_map.device
+        scratch_map[take] = staged_slot
+        overflow_map = torch.where(
+            scratch_map >= 0, torch.full_like(cold_map, -1), cold_map
         )
-        overflow_map = cold_map.clone()
-        overflow_map[take] = -1
-        self.prefill_staged_rows = count
-        self.prefill_overflow_rows = int(self.cold_slots) - count
+        self.prefill_staged_count = count
         kernel = self.cold_kernel.fused_experts
-        staged = (kernel, bank, scratch_map, count)
-        overflow = (kernel, self.cold, overflow_map, self.prefill_overflow_rows)
+        staged = (kernel, bank, scratch_map, rows)
+        overflow = (kernel, self.cold, overflow_map, self.cold_slots)
         return state, buffer, staged, overflow
 
     def finish_prefetched_partition(self, state, buffer, rows):
