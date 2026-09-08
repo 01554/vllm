@@ -338,6 +338,39 @@ boundaries:
   `ngram` with `1 + num_speculative_tokens <= spec_rows`; draft-model
   methods (MTP, DFlash, EAGLE) stay rejected until their tier connection
   lands. Not verified on a GPU.
+- **Placement controls** (global pool; env at start, `CONTROL_FILE` at run
+  time). Device scalars read by the step program (fixed addresses, no host
+  sync): `PROMOTE_LIMIT` promotions per *layer call* (0 = unlimited; every
+  layer reads the same scalar, so it is not a model-wide total),
+  `PROMOTE_INTERVAL` promote only on every N-th forward (counted once per
+  forward at layer 0 with the gate open; a prefill or a multi-row verify
+  forward counts once), `PROMOTE_MIN_MISSES` misses a key needs since it
+  was last resident before it is promoted, `PROTECT_RECENT` forwards a
+  used row stays unevictable, and `gate` (0 freezes the placement). In
+  every frozen or deferred case all misses are still computed from the
+  staging rows; only the cache placement changes. `CONTROL_FILE` names a
+  JSON object with any subset of these fields, polled at each stats report
+  (so not immediate), validated as a whole and applied at the forward
+  boundary; invalid or partial content keeps the previous values. Applied
+  values are logged as `LAB_EXPERT_TIER_CONTROL` and appear in the stats
+  as `pool_control`. `COPY_PROGRAMS` / `COPY_WORDS` size the copy grid.
+
+## Tunables at a glance
+
+| Feature | Switch (env `VLLM_LAB_EXPERT_TIER_*`) | Parameters | Run-time |
+| --- | --- | --- | --- |
+| Hot capacity | `GIB` | `LAYER_SLOTS` (per-layer start) | no |
+| Periodic heat exchange (non-promote) | `PROMOTE=0` | `SYNC_TOKENS`, `SWAPS_PER_TOKEN`, `DECAY`, `HYSTERESIS`, `DWELL_TOKENS`, `MAX_SWAPS_PER_RESYNC`, `TEMP_SLOTS`, `ASYNC_MIGRATION` | no |
+| Per-token promote | `PROMOTE`, `STAGING`, `PLANNER` | `RAM_BACKING` | gate via `enable_heat` |
+| Global pool | `GLOBAL_POOL` | `PROMOTE_LIMIT`, `PROMOTE_INTERVAL`, `PROMOTE_MIN_MISSES`, `PROTECT_RECENT`, `gate` | yes (`CONTROL_FILE`) |
+| Expert copy | `COPY_SHAPE` | `COPY_PROGRAMS`, `COPY_WORDS` | no |
+| Observer | `OBSERVER`, `RECORD_KERNEL` | `STATS_EVERY` | no |
+| Expert kernel | `MOE_KERNEL` | `NATIVE_PREFILL`, `NATIVE_OUTPUT` | no |
+| Shared-expert gate | `SHARED_GATE` | | no |
+| Deferred PLE | `VLLM_PLE_MMAP_DEFERRED` | (capacity fixed at 8 rows) | no |
+| Speculation | vLLM `--speculative-config` (method, k, `prompt_lookup_min/max`) | `SPEC_ROWS` | no (launch only) |
+| Init verification / stats | `VERIFY_INIT` | `STATS_EVERY` | no |
+
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.

@@ -54,6 +54,12 @@ class GlobalTables:
     clock: Any  # [1] int64
     gate: Any  # [1] int32 promotions allowed
     error: Any  # [1] int32 sticky device error
+    promote_limit: Any  # [1] int32 max promotions per layer call, 0 = unlimited
+    promote_interval: Any  # [1] int32 promote only every N forwards
+    forwards: Any  # [1] int32 forwards seen with the gate open (layer 0 count)
+    promote_min_misses: Any  # [1] int32 misses a key needs before promotion
+    protect_recent: Any  # [1] int32 forwards a used row stays unevictable
+    miss_count: Any  # [L*E] int32 misses since the key was last resident
     staging_rows: Any  # [S] int32 shared staging rows (constant)
 
     @property
@@ -120,6 +126,12 @@ def allocate_global_tables(device, num_experts, slots_per_layer, staging):
         clock=torch.zeros(1, dtype=torch.int64, device=device),
         gate=torch.zeros(1, dtype=torch.int32, device=device),
         error=torch.zeros(1, dtype=torch.int32, device=device),
+        promote_limit=torch.zeros(1, dtype=torch.int32, device=device),
+        promote_interval=torch.ones(1, dtype=torch.int32, device=device),
+        forwards=torch.zeros(1, dtype=torch.int32, device=device),
+        promote_min_misses=torch.ones(1, dtype=torch.int32, device=device),
+        protect_recent=torch.zeros(1, dtype=torch.int32, device=device),
+        miss_count=torch.zeros(keys, dtype=torch.int32, device=device),
         staging_rows=torch.arange(
             pool_rows, pool_rows + staging, dtype=torch.int32, device=device
         ),
@@ -147,6 +159,68 @@ def allocate_step_buffers(device, num_experts, width=PLAN_WIDTH):
 
 def set_gate(tables, enabled):
     tables.gate.fill_(1 if enabled else 0)
+
+
+CONTROL_MAX = 2**31 - 1  # device scalars are int32
+CONTROL_FIELDS = (
+    "promote_limit",
+    "promote_interval",
+    "promote_min_misses",
+    "protect_recent",
+    "gate",
+)
+
+
+def validate_control(values):
+    """Validate a control mapping; returns the normalized dict or raises."""
+    out = {}
+    for name, value in values.items():
+        if name not in CONTROL_FIELDS:
+            raise ValueError(f"Unknown pool control {name!r}")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Pool control {name} must be an integer")
+        if not 0 <= value <= CONTROL_MAX:
+            raise ValueError(f"Pool control {name} outside [0, {CONTROL_MAX}]")
+        if name == "promote_limit" and value < 0:
+            raise ValueError("promote_limit must be nonnegative")
+        if name in ("promote_interval", "promote_min_misses") and value < 1:
+            raise ValueError(f"{name} must be positive")
+        if name == "protect_recent" and value < 0:
+            raise ValueError("protect_recent must be nonnegative")
+        if name == "gate" and value not in (0, 1):
+            raise ValueError("gate must be 0 or 1")
+        out[name] = value
+    return out
+
+
+def set_control(tables, **values):
+    """Write placement controls (device scalars at fixed addresses).
+
+    `promote_limit`: promotions per *layer call* (0 = unlimited); every
+    layer reads the same scalar, so it is not a model-wide total.
+    `promote_interval`: promote only on every N-th forward with the gate
+    open, counted once per forward at layer 0 (a prefill or a multi-row
+    verify forward counts once). `promote_min_misses`: a key is promoted
+    only once it has missed this many times since it was last resident
+    (1 = first miss). `protect_recent`: rows used within the last N
+    forwards, the previous one included, are never victims (0 = none).
+    `gate`: 0 freezes the placement. In every frozen or deferred case all
+    misses are still computed from staging rows; only the placement changes.
+    All fields are validated before any is written.
+    """
+    out = validate_control(values)
+    for name, value in out.items():
+        if name == "gate":
+            set_gate(tables, bool(value))
+        else:
+            getattr(tables, name).fill_(value)
+    return out
+
+
+def read_control(tables):
+    values = {name: int(getattr(tables, name)[0]) for name in CONTROL_FIELDS}
+    values["forwards"] = int(tables.forwards[0])
+    return values
 
 
 def step_reference(tables, layer, ids, buffers):
@@ -193,12 +267,21 @@ def step_reference(tables, layer, ids, buffers):
         if value not in selected:
             selected.append(value)
     clock = int(tables.clock[0])
+    forwards = int(tables.forwards[0])
     base = layer * E
     if gate:
         clock += 1
+        if layer == 0:
+            forwards += 1
         for e in selected:
             if hot[base + e] >= 0:
                 row_use[hot[base + e]] = clock
+    limit = int(tables.promote_limit[0])
+    interval = int(tables.promote_interval[0])
+    min_misses = int(tables.promote_min_misses[0])
+    protect = int(tables.protect_recent[0]) * tables.num_layers
+    miss_count = tables.miss_count.tolist()
+    promote_ok = gate and (forwards - 1) % interval == 0
     gathers: list[tuple[int, int]] = []
     staged: list[tuple[int, int]] = []
     for e in selected:
@@ -207,9 +290,19 @@ def step_reference(tables, layer, ids, buffers):
             continue
         victim_row = -1
         if gate:
+            miss_count[key] += 1
+        if (
+            promote_ok
+            and (limit == 0 or len(gathers) < limit)
+            and miss_count[key] >= min_misses
+        ):
             best = None
             for r in range(tables.pool_rows):
-                if row_key[r] >= 0 and row_use[r] < clock:
+                if (
+                    row_key[r] >= 0
+                    and row_use[r] < clock
+                    and (protect == 0 or row_use[r] < clock - protect)
+                ):
                     candidate = (row_use[r], r)
                     if best is None or candidate < best:
                         best = candidate
@@ -223,6 +316,7 @@ def step_reference(tables, layer, ids, buffers):
         hot[key], cold[key] = victim_row, -1
         row_key[victim_row] = key
         row_use[victim_row] = clock
+        miss_count[key] = 0
         gathers.append((e, victim_row))
     step_map = hot[base : base + E]
     for e, row in staged:
@@ -241,6 +335,8 @@ def step_reference(tables, layer, ids, buffers):
     write(tables.row_key, row_key, torch.int32)
     write(tables.row_use, row_use, torch.int64)
     tables.clock.fill_(clock)
+    tables.forwards.fill_(forwards)
+    write(tables.miss_count, miss_count, torch.int32)
     tables.error.fill_(1 if error else 0)
     pairs = gathers + [(e, row) for e, row in staged]
     buffers.gather_count.fill_(len(pairs))
@@ -278,6 +374,12 @@ def step(tables, layer, ids, buffers):
         tables.clock,
         tables.gate,
         tables.error,
+        tables.promote_limit,
+        tables.promote_interval,
+        tables.forwards,
+        tables.promote_min_misses,
+        tables.protect_recent,
+        tables.miss_count,
         tables.staging_rows,
         buffers.gather_src,
         buffers.gather_dst,
@@ -290,6 +392,7 @@ def step(tables, layer, ids, buffers):
         buffers.step_map,
         tables.num_experts,
         rows,
+        tables.num_layers,
         WIDTH=width,
         BLOCK_R=_next_power_of_two(rows),
         MAP_BLOCK=1024,
@@ -357,6 +460,12 @@ def _step_kernel():
         clock_ptr,
         gate_ptr,
         error_ptr,
+        limit_ptr,
+        interval_ptr,
+        forwards_ptr,
+        min_misses_ptr,
+        protect_ptr,
+        miss_count_ptr,
         staging_ptr,
         gather_src_ptr,
         gather_dst_ptr,
@@ -369,6 +478,7 @@ def _step_kernel():
         step_map_ptr,
         num_experts,
         pool_rows,
+        num_layers,
         WIDTH: tl.constexpr,
         BLOCK_R: tl.constexpr,
         MAP_BLOCK: tl.constexpr,
@@ -393,10 +503,19 @@ def _step_kernel():
         hit = distinct & (resident >= 0)
         gate = tl.load(gate_ptr) != 0
         clock = tl.load(clock_ptr)
+        forwards = tl.load(forwards_ptr)
         if gate:
             clock = clock + 1
             tl.store(clock_ptr, clock)
+            if layer == 0:
+                forwards = forwards + 1
+                tl.store(forwards_ptr, forwards)
             tl.store(row_use_ptr + tl.where(hit, resident, 0), clock, mask=hit)
+        limit = tl.load(limit_ptr)
+        interval = tl.load(interval_ptr)
+        min_misses = tl.load(min_misses_ptr)
+        protect = tl.load(protect_ptr).to(tl.int64) * num_layers
+        promote_ok = gate & (((forwards - 1) % interval) == 0)
         tl.debug_barrier()
         # The pool-wide recency vector is only needed when a miss can be
         # promoted (FreeToken scans its cache inside the same condition);
@@ -404,10 +523,14 @@ def _step_kernel():
         offs_r = tl.arange(0, BLOCK_R)
         in_pool = offs_r < pool_rows
         misses = tl.sum((distinct & (~hit)).to(tl.int32), 0)
-        scan = gate & (misses > 0)
+        scan = promote_ok & (misses > 0)
         use = tl.full((BLOCK_R,), never, tl.int64)
         if scan:
             use = tl.load(row_use_ptr + offs_r, mask=in_pool, other=never)
+            # Rows used within the last protect_recent forwards (the
+            # previous one included) stay.
+            if protect > 0:
+                use = tl.where(use >= clock - protect, never, use)
             # Rows selected this step (hits) are masked in registers; extract
             # lane i's hit row (or -1): the other lanes contribute 0.
             hit_rows = tl.where(hit, resident, -1)
@@ -424,7 +547,15 @@ def _step_kernel():
                 expert = tl.load(ids_ptr + i).to(tl.int64)
                 key = base + expert
                 victim_row = tl.full((), -1, tl.int64)
+                misses_so_far = tl.load(miss_count_ptr + key)
                 if gate:
+                    misses_so_far = misses_so_far + 1
+                    tl.store(miss_count_ptr + key, misses_so_far)
+                if (
+                    promote_ok
+                    & ((limit == 0) | (promoted < limit))
+                    & (misses_so_far >= min_misses)
+                ):
                     best = tl.min(use, 0)
                     if best != never:
                         victim_row = tl.min(
@@ -440,6 +571,7 @@ def _step_kernel():
                     tl.store(cold_phys_ptr + key, -1)
                     tl.store(row_key_ptr + victim_row, key.to(tl.int32))
                     tl.store(row_use_ptr + victim_row, clock)
+                    tl.store(miss_count_ptr + key, 0)
                     tl.store(gather_src_ptr + promoted, expert.to(tl.int32))
                     tl.store(gather_dst_ptr + promoted, victim_row.to(tl.int32))
                     use = tl.where(offs_r.to(tl.int64) == victim_row, never, use)
@@ -501,6 +633,8 @@ class GlobalPool:
             name: tensor[self.tables.pool_rows :] for name, tensor in self.bank.items()
         }
         self.row_bytes = sum(t[0].numel() * t.element_size() for t in sources.values())
+        self._control_version: tuple[int, int] | None = None
+        self._control_error: str | None = None
         self.staging_bytes = self.row_bytes * staging
         self.pool_bytes = self.row_bytes * self.tables.pool_rows
 
@@ -528,6 +662,48 @@ class GlobalPool:
         check_global_tables(self.tables)
         return resident_per_layer(self.tables)
 
+    def apply_control(self, **values):
+        """Validate then write the controls; the gate is not touched here."""
+        return set_control(self.tables, **values)
+
+    def control(self):
+        return read_control(self.tables)
+
+    def poll_control_file(self, path):
+        """Apply a JSON control file if it changed and is valid.
+
+        Returns the applied values, or None when unchanged, missing, or
+        invalid (invalid or partial content keeps the previous values; the
+        reason is kept in `control_error` for the caller to report once per
+        file version).
+        """
+        import json
+        import os
+
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        version = (stat.st_mtime_ns, stat.st_size)
+        if version == self._control_version:
+            return None
+        self._control_version = version
+        try:
+            with open(path) as handle:
+                values = json.load(handle)
+            if not isinstance(values, dict):
+                raise ValueError("control file must hold a JSON object")
+            validated = validate_control(values)
+        except (OSError, ValueError) as error:
+            self._control_error = f"{path}: {error}"
+            return None
+        self._control_error = None
+        return set_control(self.tables, **validated)
+
+    @property
+    def control_error(self):
+        return self._control_error
+
 
 def copy_in(source, bank, buffers):
     """Copy the planned RAM rows of this layer into the bank rows."""
@@ -548,6 +724,11 @@ __all__ = [
     "check_global_tables",
     "copy_in",
     "resident_per_layer",
+    "CONTROL_FIELDS",
+    "CONTROL_MAX",
+    "read_control",
+    "validate_control",
+    "set_control",
     "set_gate",
     "step",
     "step_reference",

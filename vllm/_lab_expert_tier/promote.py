@@ -511,11 +511,19 @@ _COPY_SHAPE = "stripe"
 COPY_CHUNK_PROGRAMS_PER_BANK = 8
 
 
-def configure_copy(shape):
-    """Select the copy launch shape (validated by the runtime settings)."""
-    global _COPY_SHAPE
+def configure_copy(shape, programs=None, words=None):
+    """Select the copy launch shape and its grid (runtime settings)."""
+    global _COPY_SHAPE, COPY_PROGRAMS_PER_BANK, COPY_CHUNK_PROGRAMS_PER_BANK, COPY_WORDS
     if shape not in COPY_SHAPES:
         raise ValueError(f"Copy shape must be one of {COPY_SHAPES}")
+    if programs is not None:
+        if int(programs) < 1:
+            raise ValueError("Copy programs per bank must be positive")
+        COPY_PROGRAMS_PER_BANK = COPY_CHUNK_PROGRAMS_PER_BANK = int(programs)
+    if words is not None:
+        if int(words) < 32 or int(words) & (int(words) - 1):
+            raise ValueError("Copy words per iteration must be a power of two >= 32")
+        COPY_WORDS = int(words)
     _COPY_SHAPE = shape
 
 

@@ -159,6 +159,21 @@ class Settings:
     # processed. Needs GLOBAL_POOL=1 when above 1. The tier admits vLLM
     # speculation only for method "ngram" with 1 + k <= spec_rows.
     spec_rows: int = 1
+    # Global pool placement controls (device scalars, also settable at run
+    # time through CONTROL_FILE): promotions per layer call (0 = unlimited),
+    # promote only every N forwards, misses a key needs before promotion,
+    # forwards a used row stays unevictable. See global_pool.set_control.
+    promote_limit: int = 0
+    promote_interval: int = 1
+    promote_min_misses: int = 1
+    protect_recent: int = 0
+    # JSON file polled at every stats report: {"promote_limit": .., "gate": ..}
+    # (any subset of global_pool.CONTROL_FIELDS); validated whole, applied at
+    # the forward boundary, invalid or partial content keeps the last values.
+    control_file: str = ""
+    # Copy launch grid: programs per bank and int32 words per iteration.
+    copy_programs: int = 0  # 0 = the shape's default (32 stripe / 8 chunks)
+    copy_words: int = 4096
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -201,6 +216,13 @@ class Settings:
             "NATIVE_OUTPUT",
             "COPY_SHAPE",
             "SPEC_ROWS",
+            "PROMOTE_LIMIT",
+            "PROMOTE_INTERVAL",
+            "PROMOTE_MIN_MISSES",
+            "PROTECT_RECENT",
+            "CONTROL_FILE",
+            "COPY_PROGRAMS",
+            "COPY_WORDS",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -249,6 +271,25 @@ class Settings:
         copy_shape = os.environ.get(PREFIX + "COPY_SHAPE", "stripe")
         if copy_shape not in ("stripe", "chunks"):
             raise ValueError("COPY_SHAPE must be stripe or chunks")
+        controls = {
+            key: int(os.environ.get(PREFIX + key.upper(), default))
+            for key, default in (
+                ("promote_limit", "0"),
+                ("promote_interval", "1"),
+                ("promote_min_misses", "1"),
+                ("protect_recent", "0"),
+            )
+        }
+        from .global_pool import validate_control
+
+        validate_control(controls)
+        control_file = os.environ.get(PREFIX + "CONTROL_FILE", "").strip()
+        copy_programs = int(os.environ.get(PREFIX + "COPY_PROGRAMS", "0"))
+        copy_words = int(os.environ.get(PREFIX + "COPY_WORDS", "4096"))
+        if copy_programs < 0:
+            raise ValueError("COPY_PROGRAMS must be nonnegative (0 = default)")
+        if copy_words < 32 or copy_words & (copy_words - 1):
+            raise ValueError("COPY_WORDS must be a power of two >= 32")
         spec_rows = int(os.environ.get(PREFIX + "SPEC_ROWS", "1"))
         if not 1 <= spec_rows <= MAX_SPEC_ROWS:
             raise ValueError(f"SPEC_ROWS must be in [1, {MAX_SPEC_ROWS}]")
@@ -339,6 +380,13 @@ class Settings:
             native_output,
             copy_shape,
             spec_rows,
+            controls["promote_limit"],
+            controls["promote_interval"],
+            controls["promote_min_misses"],
+            controls["protect_recent"],
+            control_file,
+            copy_programs,
+            copy_words,
         )
 
 
@@ -1786,6 +1834,7 @@ class TierCoordinator:
     def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
         self.pool = None
+        self._control_rejected = None
         hot_slots = tuple(layer.hot_slots for layer in layers)
         self.policy = TierPolicy(
             len(layers),
@@ -2347,7 +2396,20 @@ class TierCoordinator:
             # host maps for the report. One host copy per report, not per step.
             pool = getattr(self, "pool", None)
             if pool is not None:
+                if self.settings.control_file:
+                    applied = pool.poll_control_file(self.settings.control_file)
+                    if applied:
+                        LOGGER.warning(
+                            "LAB_EXPERT_TIER_CONTROL %s",
+                            json.dumps(applied, sort_keys=True),
+                        )
+                    rejected = pool.control_error
+                    if rejected and rejected != self._control_rejected:
+                        # One line per rejected file version; values unchanged.
+                        LOGGER.warning("LAB_EXPERT_TIER_CONTROL_REJECTED %s", rejected)
+                    self._control_rejected = rejected
                 self.stats["pool_resident_per_layer"] = pool.snapshot()
+                self.stats["pool_control"] = pool.control()
             for layer in self.layers:
                 if (
                     pool is not None
@@ -2620,7 +2682,11 @@ def initialize_model(model, model_config):
         return
     from .promote import configure_copy
 
-    configure_copy(settings.copy_shape)
+    configure_copy(
+        settings.copy_shape,
+        settings.copy_programs or None,
+        settings.copy_words,
+    )
     import torch
 
     from vllm import envs
@@ -2781,6 +2847,12 @@ def initialize_model(model, model_config):
             slots_per_layer,
             staging_rows,
         )
+        pool.apply_control(
+            promote_limit=settings.promote_limit,
+            promote_interval=settings.promote_interval,
+            promote_min_misses=settings.promote_min_misses,
+            protect_recent=settings.protect_recent,
+        )
     tiers = []
     for index, (name, layer, method) in enumerate(candidates):
         tier, raw_refs = _compact_one(
@@ -2909,6 +2981,10 @@ def initialize_model(model, model_config):
                 "native_output": settings.native_output,
                 "copy_shape": settings.copy_shape,
                 "spec_rows": settings.spec_rows,
+                "pool_control": None if pool is None else pool.control(),
+                "control_file": settings.control_file or None,
+                "copy_programs": settings.copy_programs or None,
+                "copy_words": settings.copy_words,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,
