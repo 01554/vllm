@@ -19,9 +19,15 @@ from typing import Any
 
 
 def native_requested():
-    """Whether the tier settings select the native backend (no CUDA touched)."""
+    """Whether the tier settings select the native backend (no CUDA touched).
+
+    False inside a draft-model load: draft layers keep their stock path.
+    """
+    from .draft_scope import is_draft_load_scope
     from .runtime import Settings
 
+    if is_draft_load_scope():
+        return False
     settings = Settings.from_env()
     return settings is not None and settings.moe_kernel == "native"
 
