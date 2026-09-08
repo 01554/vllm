@@ -37,7 +37,7 @@ from typing import Any
 from .staging import TENSORS
 
 PLAN_WIDTH = 16
-KEY_BITS = 16  # keys < 2**16: 48 layers x 512 experts = 24576
+ROW_USE_NEVER = 0x7FFFFFFFFFFFFFFF  # staging rows: never a victim
 
 
 @dataclass
@@ -50,7 +50,7 @@ class GlobalTables:
     hot_phys: Any  # [L*E] int32 key -> bank row / -1
     cold_phys: Any  # [L*E] int32 key -> RAM row (expert id) / -1
     row_key: Any  # [pool_rows + staging] int32 row -> key / -1
-    last_use: Any  # [L*E] int64 step of last selection
+    row_use: Any  # [pool_rows + staging] int64 step of the row's last selection
     clock: Any  # [1] int64
     gate: Any  # [1] int32 promotions allowed
     error: Any  # [1] int32 sticky device error
@@ -72,6 +72,7 @@ class StepBuffers:
     gather_src: Any  # [W] int32 RAM rows
     gather_dst: Any  # [W] int32 bank rows
     gather_count: Any  # [1] int32
+    routes: Any  # [W] int32 physical row per ids lane this step, -1 padding
     staged_expert: Any  # [W] int32 (scratch for the map overlay)
     staged_row: Any  # [W] int32
     staged_count: Any  # [1] int32
@@ -87,8 +88,6 @@ def allocate_global_tables(device, num_experts, slots_per_layer, staging):
     num_layers = len(slots_per_layer)
     if staging < 1 or any(not 0 < s < num_experts for s in slots_per_layer):
         raise ValueError("Global pool needs staging rows and partial layers")
-    if num_layers * num_experts >= 1 << KEY_BITS:
-        raise ValueError("Global pool keys exceed the packed key width")
     keys = num_layers * num_experts
     pool_rows = sum(slots_per_layer)
     hot_phys = torch.full((keys,), -1, dtype=torch.int32)
@@ -112,7 +111,12 @@ def allocate_global_tables(device, num_experts, slots_per_layer, staging):
         hot_phys=hot_phys.to(device),
         cold_phys=cold_phys.to(device),
         row_key=row_key.to(device),
-        last_use=torch.zeros(keys, dtype=torch.int64, device=device),
+        row_use=torch.cat(
+            (
+                torch.zeros(pool_rows, dtype=torch.int64),
+                torch.full((staging,), ROW_USE_NEVER, dtype=torch.int64),
+            )
+        ).to(device),
         clock=torch.zeros(1, dtype=torch.int64, device=device),
         gate=torch.zeros(1, dtype=torch.int32, device=device),
         error=torch.zeros(1, dtype=torch.int32, device=device),
@@ -132,6 +136,7 @@ def allocate_step_buffers(device, num_experts, width=PLAN_WIDTH):
         gather_src=ints(width),
         gather_dst=ints(width),
         gather_count=ints(1),
+        routes=torch.full((width,), -1, dtype=torch.int32, device=device),
         staged_expert=ints(width),
         staged_row=ints(width),
         staged_count=ints(1),
@@ -153,11 +158,15 @@ def step_reference(tables, layer, ids, buffers):
     - `ids` values outside [0, E) other than -1 set the sticky error and
       are skipped; -1 is padding.
     - Distinct valid selections in first-occurrence order. With the gate
-      open the clock advances and every selection is stamped.
-    - Each miss, in that order, evicts the resident key (any layer) with
-      the smallest (last_use, key) among keys not stamped this step and
-      takes its row; without such a key it is staged only. With the gate
+      open the clock advances and every selected resident row is stamped.
+    - Recency lives on pool rows (FreeToken's usage-per-slot): each miss,
+      in that order, evicts the pool row with the smallest (row_use, row)
+      among rows not stamped this step and takes it; without such a row
+      it is staged only. Staging rows are never victims. With the gate
       closed every miss is staged only and recency is untouched.
+    - `buffers.routes[i]` is the physical row of ids lane i (-1 for
+      padding, invalid, or a duplicate of an earlier lane's expert is still
+      resolved to that expert's row).
     """
     import torch
 
@@ -167,7 +176,7 @@ def step_reference(tables, layer, ids, buffers):
     hot = tables.hot_phys.tolist()
     cold = tables.cold_phys.tolist()
     row_key = tables.row_key.tolist()
-    last_use = tables.last_use.tolist()
+    row_use = tables.row_use.tolist()
     staging_rows = tables.staging_rows.tolist()
     gate = bool(int(tables.gate[0]))
     raw = [int(v) for v in ids.reshape(-1).tolist()]
@@ -184,38 +193,44 @@ def step_reference(tables, layer, ids, buffers):
         if value not in selected:
             selected.append(value)
     clock = int(tables.clock[0])
+    base = layer * E
     if gate:
         clock += 1
         for e in selected:
-            last_use[layer * E + e] = clock
-    base = layer * E
+            if hot[base + e] >= 0:
+                row_use[hot[base + e]] = clock
     gathers: list[tuple[int, int]] = []
     staged: list[tuple[int, int]] = []
     for e in selected:
         key = base + e
         if hot[key] >= 0:
             continue
-        victim = -1
+        victim_row = -1
         if gate:
             best = None
-            for k in range(tables.keys):
-                if hot[k] >= 0 and last_use[k] < clock:
-                    candidate = (last_use[k], k)
+            for r in range(tables.pool_rows):
+                if row_key[r] >= 0 and row_use[r] < clock:
+                    candidate = (row_use[r], r)
                     if best is None or candidate < best:
                         best = candidate
             if best is not None:
-                victim = best[1]
-        if victim < 0:
+                victim_row = best[1]
+        if victim_row < 0:
             staged.append((e, staging_rows[len(staged)]))
             continue
-        row = hot[victim]
+        victim = row_key[victim_row]
         hot[victim], cold[victim] = -1, victim % E
-        hot[key], cold[key] = row, -1
-        row_key[row] = key
-        gathers.append((e, row))
+        hot[key], cold[key] = victim_row, -1
+        row_key[victim_row] = key
+        row_use[victim_row] = clock
+        gathers.append((e, victim_row))
     step_map = hot[base : base + E]
     for e, row in staged:
         step_map[e] = row
+    routes = [-1] * buffers.routes.shape[0]
+    for i, value in enumerate(raw):
+        if 0 <= value < E:
+            routes[i] = step_map[value]
     device = tables.hot_phys.device
 
     def write(target, values, dtype):
@@ -224,7 +239,7 @@ def step_reference(tables, layer, ids, buffers):
     write(tables.hot_phys, hot, torch.int32)
     write(tables.cold_phys, cold, torch.int32)
     write(tables.row_key, row_key, torch.int32)
-    write(tables.last_use, last_use, torch.int64)
+    write(tables.row_use, row_use, torch.int64)
     tables.clock.fill_(clock)
     tables.error.fill_(1 if error else 0)
     pairs = gathers + [(e, row) for e, row in staged]
@@ -236,6 +251,7 @@ def step_reference(tables, layer, ids, buffers):
     for i, (e, row) in enumerate(staged):
         buffers.staged_expert[i], buffers.staged_row[i] = e, row
     write(buffers.step_map, step_map, torch.int32)
+    write(buffers.routes, routes, torch.int32)
     return pairs, buffers.step_map
 
 
@@ -250,8 +266,7 @@ def step(tables, layer, ids, buffers):
     width = buffers.gather_src.shape[0]
     if flat.numel() > width or flat.numel() > tables.staging_rows.shape[0]:
         raise ValueError("Step ids exceed the plan width or the staging rows")
-    keys = tables.keys
-    block = 1024
+    rows = tables.pool_rows
     _step_kernel()[(1,)](
         flat,
         flat.numel(),
@@ -259,7 +274,7 @@ def step(tables, layer, ids, buffers):
         tables.hot_phys,
         tables.cold_phys,
         tables.row_key,
-        tables.last_use,
+        tables.row_use,
         tables.clock,
         tables.gate,
         tables.error,
@@ -267,17 +282,18 @@ def step(tables, layer, ids, buffers):
         buffers.gather_src,
         buffers.gather_dst,
         buffers.gather_count,
+        buffers.routes,
         buffers.staged_expert,
         buffers.staged_row,
         buffers.staged_count,
         buffers.promoted_count,
         buffers.step_map,
         tables.num_experts,
-        keys,
+        rows,
         WIDTH=width,
-        BLOCK=block,
-        NUM_BLOCKS=(keys + block - 1) // block,
+        BLOCK_R=_next_power_of_two(rows),
         MAP_BLOCK=1024,
+        num_warps=8,
     )
 
 
@@ -319,6 +335,10 @@ def resident_per_layer(tables):
 _KERNELS: dict[str, Any] = {}
 
 
+def _next_power_of_two(value):
+    return 1 << max(int(value) - 1, 0).bit_length()
+
+
 def _step_kernel():
     """One program: `step_reference` on the device."""
     if "step" in _KERNELS:
@@ -333,7 +353,7 @@ def _step_kernel():
         hot_phys_ptr,
         cold_phys_ptr,
         row_key_ptr,
-        last_use_ptr,
+        row_use_ptr,
         clock_ptr,
         gate_ptr,
         error_ptr,
@@ -341,19 +361,19 @@ def _step_kernel():
         gather_src_ptr,
         gather_dst_ptr,
         gather_count_ptr,
+        routes_ptr,
         staged_expert_ptr,
         staged_row_ptr,
         staged_count_ptr,
         promoted_count_ptr,
         step_map_ptr,
         num_experts,
-        num_keys,
+        pool_rows,
         WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
-        NUM_BLOCKS: tl.constexpr,
+        BLOCK_R: tl.constexpr,
         MAP_BLOCK: tl.constexpr,
     ):
-        key_max = 0x7FFFFFFFFFFFFFFF
+        never = 0x7FFFFFFFFFFFFFFF
         lane = tl.arange(0, WIDTH)
         present = lane < n
         raw = tl.load(ids_ptr + lane, mask=present, other=-1).to(tl.int64)
@@ -369,55 +389,61 @@ def _step_kernel():
         # `layer` may arrive as a Python int (Triton specializes 0 and 1).
         base = tl.full((), 0, tl.int64) + layer * num_experts
         keys = base + safe
+        resident = tl.load(hot_phys_ptr + keys, mask=distinct, other=-1).to(tl.int64)
+        hit = distinct & (resident >= 0)
         gate = tl.load(gate_ptr) != 0
         clock = tl.load(clock_ptr)
         if gate:
             clock = clock + 1
             tl.store(clock_ptr, clock)
-            tl.store(last_use_ptr + keys, clock, mask=distinct)
+            tl.store(row_use_ptr + tl.where(hit, resident, 0), clock, mask=hit)
         tl.debug_barrier()
+        # One vector of every pool row's recency; rows selected this step
+        # (hits) and rows handed out below are masked in registers.
+        offs_r = tl.arange(0, BLOCK_R)
+        in_pool = offs_r < pool_rows
+        use = tl.load(row_use_ptr + offs_r, mask=in_pool, other=never)
+        # Extract lane i's hit row (or -1): the other lanes contribute 0.
+        hit_rows = tl.where(hit, resident, -1)
+        for i in range(0, WIDTH):
+            hit_row = tl.sum(tl.where(lane == i, hit_rows, 0), 0)
+            use = tl.where(offs_r.to(tl.int64) == hit_row, never, use)
         promoted = 0
         staged = 0
         for i in range(0, WIDTH):
-            is_distinct = tl.sum(tl.where(lane == i, distinct.to(tl.int32), 0), 0)
-            if is_distinct > 0:
+            is_miss = tl.sum(
+                tl.where(lane == i, (distinct & (~hit)).to(tl.int32), 0), 0
+            )
+            if is_miss > 0:
                 expert = tl.load(ids_ptr + i).to(tl.int64)
                 key = base + expert
-                resident = tl.load(hot_phys_ptr + key)
-                if resident < 0:
-                    best = tl.full((), key_max, tl.int64)
-                    if gate:
-                        for block in range(0, NUM_BLOCKS):
-                            offs = block * BLOCK + tl.arange(0, BLOCK)
-                            in_range = offs < num_keys
-                            rows = tl.load(hot_phys_ptr + offs, mask=in_range, other=-1)
-                            use = tl.load(
-                                last_use_ptr + offs, mask=in_range, other=key_max
-                            )
-                            candidate = in_range & (rows >= 0) & (use < clock)
-                            packed = tl.where(
-                                candidate,
-                                use * (1 << 16) + offs.to(tl.int64),
-                                key_max,
-                            )
-                            best = tl.minimum(best, tl.min(packed, 0))
-                    if best != key_max:
-                        victim = best % (1 << 16)
-                        row = tl.load(hot_phys_ptr + victim)
-                        tl.store(hot_phys_ptr + victim, -1)
-                        tl.store(cold_phys_ptr + victim, (victim % num_experts))
-                        tl.store(hot_phys_ptr + key, row)
-                        tl.store(cold_phys_ptr + key, -1)
-                        tl.store(row_key_ptr + row, key.to(tl.int32))
-                        tl.store(gather_src_ptr + promoted, expert.to(tl.int32))
-                        tl.store(gather_dst_ptr + promoted, row)
-                        promoted += 1
-                    else:
-                        tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
-                        tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
-                        staged += 1
+                victim_row = tl.full((), -1, tl.int64)
+                if gate:
+                    best = tl.min(use, 0)
+                    if best != never:
+                        victim_row = tl.min(
+                            tl.where(use == best, offs_r.to(tl.int64), never), 0
+                        )
+                if victim_row >= 0:
+                    victim = tl.load(row_key_ptr + victim_row).to(tl.int64)
+                    tl.store(hot_phys_ptr + victim, -1)
+                    tl.store(
+                        cold_phys_ptr + victim, (victim % num_experts).to(tl.int32)
+                    )
+                    tl.store(hot_phys_ptr + key, victim_row.to(tl.int32))
+                    tl.store(cold_phys_ptr + key, -1)
+                    tl.store(row_key_ptr + victim_row, key.to(tl.int32))
+                    tl.store(row_use_ptr + victim_row, clock)
+                    tl.store(gather_src_ptr + promoted, expert.to(tl.int32))
+                    tl.store(gather_dst_ptr + promoted, victim_row.to(tl.int32))
+                    use = tl.where(offs_r.to(tl.int64) == victim_row, never, use)
+                    promoted += 1
+                else:
+                    tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
+                    tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
+                    staged += 1
             # The scalar table stores above must be visible to the next
-            # miss's vector scan, which reads hot_phys across all lanes.
+            # miss's loads of hot_phys / row_key.
             tl.debug_barrier()
         tl.store(promoted_count_ptr, promoted)
         tl.store(staged_count_ptr, staged)
@@ -435,6 +461,10 @@ def _step_kernel():
         for i in range(0, staged):
             expert = tl.load(staged_expert_ptr + i)
             tl.store(step_map_ptr + expert, tl.load(staged_row_ptr + i))
+        tl.debug_barrier()
+        # Routes: the physical row of every ids lane through the step map.
+        route = tl.load(step_map_ptr + safe, mask=valid, other=-1)
+        tl.store(routes_ptr + lane, tl.where(valid, route, -1), mask=lane < WIDTH)
 
     _KERNELS["step"] = global_pool_step
     return global_pool_step
