@@ -147,6 +147,10 @@ class Settings:
     # combine without a shared expert), before the next layer's gemv
     # rewrites the workspace; the two-partition path keeps its own copy.
     native_output: str = "clone"
+    # Expert row copy launch shape: "stripe" (current) or "chunks"
+    # (FreeToken's fast_index_copy_multi shape: 8 programs x 32 warps per
+    # bank over (row, chunk) pairs). See promote.COPY_SHAPES.
+    copy_shape: str = "stripe"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -187,6 +191,7 @@ class Settings:
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
+            "COPY_SHAPE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -232,6 +237,9 @@ class Settings:
         native_output = os.environ.get(PREFIX + "NATIVE_OUTPUT", "clone")
         if native_output not in ("clone", "alias"):
             raise ValueError("NATIVE_OUTPUT must be clone or alias")
+        copy_shape = os.environ.get(PREFIX + "COPY_SHAPE", "stripe")
+        if copy_shape not in ("stripe", "chunks"):
+            raise ValueError("COPY_SHAPE must be stripe or chunks")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -315,6 +323,7 @@ class Settings:
             record_kernel == "1",
             shared_gate,
             native_output,
+            copy_shape,
         )
 
 
@@ -2570,6 +2579,9 @@ def initialize_model(model, model_config):
     settings = Settings.from_env()
     if settings is None:
         return
+    from .promote import configure_copy
+
+    configure_copy(settings.copy_shape)
     import torch
 
     from vllm import envs
@@ -2851,6 +2863,7 @@ def initialize_model(model, model_config):
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
+                "copy_shape": settings.copy_shape,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

@@ -266,6 +266,14 @@ class PromoteReferenceTests(unittest.TestCase):
             for name in pm.TENSORS:
                 self.assertTrue(torch.equal(ram[name], before[name]))
 
+    def test_copy_shape_selection_is_validated(self):
+        self.assertEqual(pm._COPY_SHAPE, "stripe")
+        pm.configure_copy("chunks")
+        self.assertEqual(pm._COPY_SHAPE, "chunks")
+        pm.configure_copy("stripe")
+        with self.assertRaises(ValueError):
+            pm.configure_copy("rows")
+
     def test_random_steps_keep_ownership_and_bytes_consistent(self):
         rng = random.Random(5)
         for trial in range(30):
