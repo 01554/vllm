@@ -131,6 +131,10 @@ class Settings:
     # adapter's fallback); "grouped" calls native_prefill.prefill (grouped
     # GEMM over the same bank and workspace). Decode is unaffected.
     native_prefill: str = "gemv"
+    # Shared-expert gate of the Qwen4 exp MoE block: "torch" (cuBLAS dot,
+    # sigmoid, multiply) or "fused" (one Triton program per token,
+    # `shared_gate.py`, FreeToken's gate kernel taken one step further).
+    shared_gate: str = "torch"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -168,6 +172,7 @@ class Settings:
             "GLOBAL_POOL",
             "MOE_KERNEL",
             "NATIVE_PREFILL",
+            "SHARED_GATE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -204,6 +209,9 @@ class Settings:
             raise ValueError("MOE_KERNEL must be marlin or native")
         if moe_kernel == "native" and ram_backing != "1":
             raise ValueError("MOE_KERNEL=native requires RAM_BACKING=1")
+        shared_gate = os.environ.get(PREFIX + "SHARED_GATE", "torch")
+        if shared_gate not in ("torch", "fused"):
+            raise ValueError("SHARED_GATE must be torch or fused")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -282,6 +290,7 @@ class Settings:
             global_pool == "1",
             moe_kernel,
             native_prefill,
+            shared_gate,
         )
 
 
@@ -1151,7 +1160,8 @@ class TierLayer:
 
         from .native_nvfp4 import gemv
 
-        compute, workspace_for = gemv, self.native_workspace
+        compute: Any = gemv
+        workspace_for = self.native_workspace
         if x.shape[0] > 1 and self.settings.native_prefill == "grouped":
             from .native_prefill import prefill
 
@@ -2785,6 +2795,7 @@ def initialize_model(model, model_config):
                 "source_bank_retained": settings.ram_backing,
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
+                "shared_gate": settings.shared_gate,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

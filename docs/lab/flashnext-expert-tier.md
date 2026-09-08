@@ -285,6 +285,17 @@ boundaries:
   `native_prefill.prefill` (separate ownership) with the same arguments
   and that module's own workspace (allocated at init per physical row
   count) for rows > 1; decode is unaffected either way.
+- **Fused shared-expert gate** (`VLLM_LAB_EXPERT_TIER_SHARED_GATE=fused`,
+  default `torch`). The Qwen4 exp shared expert's gate,
+  `sigmoid(x @ w) * out`, is a cuBLAS dot (two kernels), a sigmoid, and a
+  broadcast multiply per layer in vLLM; FreeToken computes the gate in one
+  Triton program and applies it in another. `shared_gate.py` does the dot,
+  the sigmoid, and the scaling in one program per token, keeping vLLM's
+  rounding points (dot, sigmoid, and product each round to the activation
+  dtype). The hook is in `Qwen4ExpSparseMoeBlock.__init__` and replaces
+  the shared MLP's forward; the routed + shared addition stays in the MoE
+  runner. CPU test holds the reference equal to the module's own forward.
+  Not verified on a GPU.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
