@@ -39,8 +39,18 @@ def tensor_fields(obj):
     }
 
 
-def run_case(gp, graph_mode, cpu_only, rows=1):
-    """rows > 1: a speculative verify step (rows x top_k lanes per layer)."""
+CONTROL_SCHEDULE = {
+    # repeat -> controls applied to both tables before that repeat's steps.
+    0: {"promote_limit": 1},
+    1: {"promote_limit": 0, "promote_interval": 2, "promote_min_misses": 2},
+    2: {"promote_interval": 1, "promote_min_misses": 1, "protect_recent": 1},
+}
+
+
+def run_case(gp, graph_mode, cpu_only, rows=1, control=False):
+    """rows > 1: a speculative verify step (rows x top_k lanes per layer).
+    control: change the placement controls (device scalars) between repeats
+    and check the captured graph reads them in place at fixed addresses."""
     lanes = 10 * rows
     width = 1 << (lanes - 1).bit_length()
     sources = []
@@ -143,20 +153,40 @@ def run_case(gp, graph_mode, cpu_only, rows=1):
             ),
         ]
         sequence = [(e, lyr, i, f"{label}[{rows}]") for e, lyr, i, label in base]
+    control_addresses = None
     for repeat in range(3):
+        if control:
+            values = CONTROL_SCHEDULE[repeat]
+            gp.set_control(cpu.tables, **values)
+            if gpu is not None:
+                addresses = {
+                    name: getattr(gpu.tables, name).data_ptr()
+                    for name in gp.CONTROL_FIELDS
+                }
+                control_addresses = control_addresses or addresses
+                assert addresses == control_addresses, "control scalars moved"
+                gp.set_control(gpu.tables, **values)
+                assert gpu.control() == cpu.control(), "control mismatch"
         for enabled, layer, ids, label in sequence:
             host_ids = torch.tensor(ids if rows > 1 else [ids], dtype=torch.int32)
+            if control and repeat == 0 and label.startswith("physical550"):
+                # promote_limit=1: exactly one promotion, the rest staged.
+                expected_promoted = 1
+            else:
+                expected_promoted = None
             gp.set_gate(cpu.tables, enabled)
             gp.step(cpu.tables, layer, host_ids, cb[layer])
             gp.copy_in(sources[layer], cpu.bank, cb[layer])
             cpu.snapshot()
+            if expected_promoted is not None:
+                assert int(cb[layer].promoted_count[0]) == expected_promoted, label
             if repeat == 0 and label.startswith("rows-promote"):
                 # Every lane (rows x top_k) resolves to a row: promoted or staged.
                 for lane in range(lanes):
                     assert int(cb[layer].routes[lane]) >= 0, (label, lane)
-            if repeat == 0 and label == "physical550":
+            if repeat == 0 and label == "physical550" and not control:
                 assert cpu.tables.hot_phys[500:510].tolist() == list(range(550, 560))
-            if label == "staging750" and repeat == 0:
+            if label == "staging750" and repeat == 0 and not control:
                 assert cb[layer].gather_dst[:10].tolist() == list(range(750, 760))
             if gpu is not None:
                 gp.set_gate(gpu.tables, enabled)
@@ -206,6 +236,7 @@ def run_case(gp, graph_mode, cpu_only, rows=1):
         f"PASS pool graph={graph_mode} cpu_only={cpu_only}: "
         "15 steps, six banks, immutable RAM, "
         "physical550/staging750/cross-layer/padding"
+        + ("/control-scalars" if control else "")
     )
 
 
@@ -213,15 +244,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--rows", type=int, default=1)
+    parser.add_argument("--control", action="store_true")
     parser.add_argument(
         "--repo", type=Path, default=Path(__file__).resolve().parents[2]
     )
     args = parser.parse_args()
     module = load_pool(args.repo)
     if args.cpu_only:
-        run_case(module, False, True, args.rows)
+        run_case(module, False, True, args.rows, args.control)
     else:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA required; run only as the GPU integration owner")
         for mode in (False, True):
-            run_case(module, mode, False, args.rows)
+            run_case(module, mode, False, args.rows, args.control)
