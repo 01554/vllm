@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only invariants and real tensor byte/lifetime tests for the tier adapter."""
 
+import dataclasses
 import gc
 import importlib.util
 import json
@@ -2129,8 +2130,54 @@ class TensorTests(unittest.TestCase):
                 ("gemv", (1, 2), "ws", "silu"),
             ],
         )
+        # A speculative verify step (rows <= native_gemv_rows) is decode:
+        # it takes the GEMV even under the grouped multi-token path.
+        layer.settings = dataclasses.replace(layer.settings, native_gemv_rows=2)
+        calls.clear()
+        with (
+            patch.dict(sys.modules, {"lab_expert_tier.native_prefill": stub}),
+            patch.object(native_nvfp4, "gemv", fake_gemv),
+        ):
+            for rows in (2, 3):
+                layer._run_marlin_chains(
+                    torch.ones(rows, 3, dtype=torch.bfloat16),
+                    torch.ones(rows, 2),
+                    torch.tensor([[0, 1]] * rows, dtype=torch.int32),
+                    parts,
+                )
+        self.assertEqual(
+            [c[:2] for c in calls], [("gemv", (2, 2)), ("prefill", (3, 2))]
+        )
         base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_PREFILL": "grouped"}
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+
+    def test_native_gemv_rows_defaults_to_spec_rows(self):
+        """NATIVE_GEMV_ROWS follows SPEC_ROWS unless set; below 1 is rejected."""
+        base = {
+            rt.PREFIX + "GIB": "32",
+            rt.PREFIX + "PROMOTE": "1",
+            rt.PREFIX + "STAGING": "1",
+            rt.PREFIX + "RAM_BACKING": "1",
+            rt.PREFIX + "GLOBAL_POOL": "1",
+        }
+        with patch.dict(os.environ, base, clear=True):
+            self.assertEqual(rt.Settings.from_env().native_gemv_rows, 1)
+        with patch.dict(os.environ, {**base, rt.PREFIX + "SPEC_ROWS": "3"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().native_gemv_rows, 3)
+        override = {
+            **base,
+            rt.PREFIX + "SPEC_ROWS": "3",
+            rt.PREFIX + "NATIVE_GEMV_ROWS": "1",
+        }
+        with patch.dict(os.environ, override, clear=True):
+            self.assertEqual(rt.Settings.from_env().native_gemv_rows, 1)
+        with (
+            patch.dict(
+                os.environ, {**base, rt.PREFIX + "NATIVE_GEMV_ROWS": "0"}, clear=True
+            ),
+            self.assertRaises(ValueError),
+        ):
             rt.Settings.from_env()
 
     def test_fused_record_setting_and_fallbacks(self):
