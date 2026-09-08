@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -184,6 +185,11 @@ class Settings:
     # (any subset of global_pool.CONTROL_FIELDS); validated whole, applied at
     # the forward boundary, invalid or partial content keeps the last values.
     control_file: str = ""
+    # Steady-state pool verification trigger: a file whose mtime change makes
+    # the next forward boundary compare every resident expert row in the pool
+    # bank with its host source row (bytes) and log the mismatches. Needs
+    # RAM_BACKING=1 (source row = expert id). "" = off (default).
+    verify_file: str = ""
     # Copy launch grid: programs per bank and int32 words per iteration.
     copy_programs: int = 0  # 0 = the shape's default (32 stripe / 8 chunks)
     copy_words: int = 4096
@@ -243,6 +249,7 @@ class Settings:
             "PROMOTE_MIN_MISSES",
             "PROTECT_RECENT",
             "CONTROL_FILE",
+            "VERIFY_FILE",
             "COPY_PROGRAMS",
             "COPY_WORDS",
             "VRAM_BUDGET_GIB",
@@ -308,6 +315,9 @@ class Settings:
 
         validate_control(controls)
         control_file = os.environ.get(PREFIX + "CONTROL_FILE", "").strip()
+        verify_file = os.environ.get(PREFIX + "VERIFY_FILE", "").strip()
+        if verify_file and ram_backing != "1":
+            raise ValueError("VERIFY_FILE requires RAM_BACKING=1")
         copy_programs = int(os.environ.get(PREFIX + "COPY_PROGRAMS", "0"))
         copy_words = int(os.environ.get(PREFIX + "COPY_WORDS", "4096"))
         if copy_programs < 0:
@@ -430,6 +440,7 @@ class Settings:
             controls["promote_min_misses"],
             controls["protect_recent"],
             control_file,
+            verify_file,
             copy_programs,
             copy_words,
             vram_budget_gib,
@@ -2004,6 +2015,7 @@ class TierCoordinator:
         # One asynchronous exchange plan in flight, at most.
         self.pending: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
+        self._verify_version = None
         self.draft_reserve: dict[str, Any] | None = None
         self.draft_resident: dict[str, Any] | None = None
         self.per_layer_swaps = [0] * len(layers)
@@ -2086,6 +2098,17 @@ class TierCoordinator:
         elif rows != self.forward_rows:
             raise ValueError("Token count changed within a model forward")
         self.adopt_stream(stream, tier.index == 0)
+        if (
+            tier.index == 0
+            and getattr(self.settings, "verify_file", "")
+            and not _is_capturing(tier.device)
+        ):
+            # A pending verification runs here: after the stream is adopted
+            # and any in-flight exchange is settled, before this forward's
+            # pool step. Eager forwards only (a replay runs no layer Python);
+            # the probe request must force an eager prefill (unique prompt).
+            self.settle_pending(wait=True)
+            self.poll_verify_file(force_cadence=True, entry="begin_layer")
         if (
             x.ndim != 2
             or ids.ndim != 2
@@ -2206,6 +2229,235 @@ class TierCoordinator:
         if result is not None:
             self._consume(result, plan)
 
+    def poll_verify_file(self, force_cadence=False, entry="finish"):
+        """Run a pool verification when the trigger file's mtime changed.
+
+        Polled at the end of every 16th forward (one stat call) and, with
+        `force_cadence`, at layer 0 of every eager forward, so "touch, then
+        send any request" checks the state the previous request left."""
+        path = getattr(self.settings, "verify_file", "")
+        if not path or (not force_cadence and self.stats["model_forwards"] % 16):
+            return None
+        import os
+
+        try:
+            version = os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+        if version == self._verify_version:
+            return None
+        self._verify_version = version
+        return self.verify_pool(entry=entry, trigger_version=version)
+
+    def verify_pool(self, entry="direct", trigger_version=None):
+        """Read-only steady-state check of the global pool at a forward
+        boundary. Ownership: every pool row holds exactly one key and the
+        maps agree (hot_phys / row_key bijection over the pool rows,
+        cold_phys consistent). Bytes: every resident expert row of the device
+        bank equals its host source row, compared as raw bytes (uint8 view:
+        NaN payloads compare equal only when identical, +0/-0 differ). Logs
+        LAB_EXPERT_TIER_VERIFY_POOL and returns the report with a status of
+        "pass" (all checks done on all pool rows, no finding), "fail"
+        (any finding), or "skipped" (preconditions not met). Nothing in the
+        bank or the tables is modified; nothing is repaired."""
+        import torch
+
+        # entry: "begin_layer" = the state the previous request left (before
+        # this forward's pool step); "finish" = after the forward that hit the
+        # cadence; "direct" = called by code. ACK for a probe run: entry ==
+        # begin_layer, status == pass, checked_rows == pool_rows > 0.
+        report: dict[str, Any] = {
+            "forwards": int(self.stats["model_forwards"]),
+            "entry": entry,
+            "trigger_version": trigger_version,
+            "status": "skipped",
+        }
+        if _is_capturing(self.device):
+            raise RuntimeError("Pool verification cannot run during graph capture")
+        pool = getattr(self, "pool", None)
+        settings = self.settings
+        if pool is None or not getattr(settings, "global_pool", False):
+            report["reason"] = "global pool not active"
+            self._log_verify(report)
+            return report
+        if not getattr(settings, "ram_backing", False):
+            report["reason"] = "RAM_BACKING required (source row = expert id)"
+            self._log_verify(report)
+            return report
+        tables = pool.tables
+        num_layers, num_experts, P = (
+            tables.num_layers,
+            tables.num_experts,
+            int(tables.pool_rows),
+        )
+        K = num_layers * num_experts
+        # Table shapes/dtypes before any slicing: a wrong table is a finding,
+        # not something to reinterpret.
+        shape_ok = (
+            P > 0
+            and tuple(tables.hot_phys.shape) == (K,)
+            and tuple(tables.cold_phys.shape) == (K,)
+            and tables.row_key.dim() == 1
+            and tables.row_key.shape[0] >= P
+            and tables.hot_phys.dtype
+            == tables.cold_phys.dtype
+            == tables.row_key.dtype
+            == torch.int32
+        )
+        if not shape_ok:
+            report.update(
+                status="fail",
+                reason="pool table shape/dtype",
+                pool_rows=P,
+                shapes={
+                    "hot_phys": list(tables.hot_phys.shape),
+                    "cold_phys": list(tables.cold_phys.shape),
+                    "row_key": list(tables.row_key.shape),
+                },
+            )
+            self._log_verify(report)
+            self.stats["verify_pool_runs"] += 1
+            self.stats["verify_pool_failures"] += 1
+            return report
+        H = tables.hot_phys.long()
+        C = tables.cold_phys.long()
+        R = tables.row_key[:P].long()
+        staging_keys = tables.row_key[P:].long()
+        own: dict[str, int] = {}
+        own["staging_rows_nonfree"] = int((staging_keys != -1).sum())
+        own["hot_out_of_range"] = int(((H < -1) | (H >= P)).sum())
+        own["row_key_out_of_range"] = int(((R < 0) | (R >= K)).sum())
+        valid_R = R[(R >= 0) & (R < K)]
+        own["row_key_duplicates"] = int(valid_R.numel() - torch.unique(valid_R).numel())
+        own["unfilled_rows"] = int((R < 0).sum())
+        # forward: each filled row's key must point back at that row
+        filled = torch.nonzero((R >= 0) & (R < K)).flatten()
+        own["row_key_hot_mismatch"] = (
+            int((H[R[filled]] != filled).sum()) if filled.numel() else 0
+        )
+        # reverse: each resident key's row must hold that key
+        resident = torch.nonzero((H >= 0) & (H < P)).flatten()
+        own["resident_keys"] = int(resident.numel())
+        own["hot_row_key_mismatch"] = (
+            int((R[H[resident]] != resident).sum()) if resident.numel() else 0
+        )
+        expected_C = torch.where(
+            H >= 0,
+            torch.full_like(C, -1),
+            torch.arange(K, device=C.device) % num_experts,
+        )
+        own["cold_phys_mismatch"] = int((expected_C != C).sum())
+        report["ownership"] = own
+        # Placement identity: sha256 of the contiguous CPU int32 bytes of each
+        # table over the pool-resident range only (hot_phys[K], cold_phys[K],
+        # row_key[:P]). The staging sentinel range row_key[P:] and the moving
+        # staging bank contents are excluded. Equal hashes mean the two
+        # checkpoint placements are identical (including same-layer exchanges
+        # that a per-layer resident count cannot see); they say nothing about
+        # movement between the checkpoints.
+        placement: dict[str, Any] = {}
+        for name, table in (
+            ("hot_phys", tables.hot_phys),
+            ("cold_phys", tables.cold_phys),
+            ("row_key_resident", tables.row_key[:P]),
+        ):
+            placement[name] = hashlib.sha256(
+                table.detach().to("cpu").contiguous().numpy().tobytes()
+            ).hexdigest()
+        placement["combined"] = hashlib.sha256(
+            "".join(
+                placement[n] for n in ("hot_phys", "cold_phys", "row_key_resident")
+            ).encode()
+        ).hexdigest()
+        placement["ranges"] = {
+            "hot_phys": K,
+            "cold_phys": K,
+            "row_key_resident": P,
+            "dtype": "int32",
+        }
+        report["placement"] = placement
+        ownership_ok = (
+            own["hot_out_of_range"] == 0
+            and own["row_key_out_of_range"] == 0
+            and own["row_key_duplicates"] == 0
+            and own["unfilled_rows"] == 0
+            and own["row_key_hot_mismatch"] == 0
+            and own["hot_row_key_mismatch"] == 0
+            and own["cold_phys_mismatch"] == 0
+            and own["resident_keys"] == P
+            and own["staging_rows_nonfree"] == 0
+        )
+        # bytes: per layer, resident experts vs host source rows, raw bytes
+        layers_report: dict[int, Any] = {}
+        checked = mismatched = tensors_done = 0
+        for tier in self.layers:
+            hot_map = tier.hot_map
+            if hot_map is None:
+                continue
+            experts = torch.nonzero((hot_map >= 0) & (hot_map < P)).flatten()
+            if experts.numel() == 0:
+                continue
+            rows = hot_map[experts].long()
+            bank = getattr(tier, "hot_tensors", None)
+            if bank is None:
+                bank = tier.hot
+            bad = torch.zeros(experts.numel(), dtype=torch.bool, device=experts.device)
+            # Row chunks bound the transient device memory to about three
+            # chunk-sized buffers whatever the pool's per-layer balance; each
+            # chunk's copies are dropped before the next one is made.
+            chunk = 32
+            for name in TENSORS:
+                for start in range(0, experts.numel(), chunk):
+                    sel = slice(start, start + chunk)
+                    device_rows = bank[name].index_select(0, rows[sel]).contiguous()
+                    source_rows = (
+                        tier.cold[name]
+                        .index_select(0, experts[sel].long())
+                        .contiguous()
+                    )
+                    db = device_rows.view(torch.uint8).reshape(device_rows.shape[0], -1)
+                    sb = source_rows.view(torch.uint8).reshape(source_rows.shape[0], -1)
+                    bad[sel] |= (db != sb).any(1)
+                    del device_rows, source_rows, db, sb
+                tensors_done += 1
+            count = int(bad.sum())
+            checked += int(experts.numel())
+            mismatched += count
+            if count:
+                layers_report[tier.index] = {
+                    "mismatched": count,
+                    "experts": experts[bad][:8].tolist(),
+                    "rows": rows[bad][:8].tolist(),
+                }
+        report.update(
+            pool_rows=P,
+            checked_rows=checked,
+            mismatched_rows=mismatched,
+            tensors_compared=tensors_done,
+            layers=layers_report,
+        )
+        bytes_ok = (
+            mismatched == 0
+            and checked == P
+            and tensors_done
+            == len(TENSORS)
+            * sum(
+                1
+                for t in self.layers
+                if t.hot_map is not None
+                and int(((t.hot_map >= 0) & (t.hot_map < P)).sum())
+            )
+        )
+        report["status"] = "pass" if (ownership_ok and bytes_ok) else "fail"
+        self._log_verify(report)
+        self.stats["verify_pool_runs"] += 1
+        self.stats["verify_pool_mismatched_rows"] += mismatched
+        self.stats["verify_pool_failures"] += int(report["status"] == "fail")
+        return report
+
+    def _log_verify(self, report):
+        LOGGER.warning("LAB_EXPERT_TIER_VERIFY_POOL %s", json.dumps(report))
+
     def _finish_forward(self, rows, valid_rows=None, is_decode=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
             raise ValueError("Runner valid token count exceeds the padded rows")
@@ -2244,6 +2496,7 @@ class TierCoordinator:
         if not self.heat_enabled:
             self.stats["ignored_startup_forwards"] += 1
         self._consume(result, plan=True)
+        self.poll_verify_file()
         if self.stats["model_forwards"] % self.settings.stats_every == 0:
             self.report()
 
@@ -3212,6 +3465,7 @@ def initialize_model(model, model_config):
                 "draft_reserve": coordinator.draft_reserve,
                 "pool_control": None if pool is None else pool.control(),
                 "control_file": settings.control_file or None,
+                "verify_file": settings.verify_file or None,
                 "copy_programs": settings.copy_programs or None,
                 "copy_words": settings.copy_words,
                 "routing_host_copies_per_model_step": 1,

@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 import weakref
+from collections import Counter
 from importlib.abc import Loader
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -1091,6 +1092,195 @@ class TensorTests(unittest.TestCase):
             os.environ, {**marlin, rt.PREFIX + "MOE_KERNEL": "native"}, clear=True
         ):
             self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
+
+    def make_verify_pool(self, layers=2, experts=4, pool_rows=4, width=4):
+        """A global pool with a consistent placement: layer l keeps experts
+        (l, l+1) resident at rows (2l, 2l+1); banks hold the source bytes."""
+        import math
+
+        keys = layers * experts
+        hot_phys = torch.full((keys,), -1, dtype=torch.int32)
+        cold_phys = torch.arange(experts, dtype=torch.int32).repeat(layers)
+        row_key = torch.full((pool_rows + 1,), -1, dtype=torch.int32)  # +1 staging
+        for layer in range(layers):
+            for j, e in enumerate((layer, layer + 1)):
+                row, key = 2 * layer + j, layer * experts + e
+                hot_phys[key], row_key[row], cold_phys[key] = row, key, -1
+        tables = SimpleNamespace(
+            num_layers=layers,
+            num_experts=experts,
+            pool_rows=pool_rows,
+            hot_phys=hot_phys,
+            cold_phys=cold_phys,
+            row_key=row_key,
+        )
+        tables.layer_slice = lambda table, layer: table[
+            layer * experts : (layer + 1) * experts
+        ]
+        sources = [
+            {
+                n: (
+                    torch.arange(experts * width, dtype=torch.float32).reshape(
+                        experts, width
+                    )
+                    + 100 * layer
+                )
+                for n in rt.TENSORS
+            }
+            for layer in range(layers)
+        ]
+        sources[0][rt.TENSORS[1]][0, 1] = math.nan  # a NaN payload in the source
+        bank = {
+            n: torch.zeros(pool_rows + 1, width, dtype=torch.float32)
+            for n in rt.TENSORS
+        }
+        tiers = []
+        for layer in range(layers):
+            tier = object.__new__(rt.TierLayer)
+            tier.index, tier.device = layer, torch.device("cpu")
+            tier.cold = sources[layer]
+            tier.hot_map = tables.layer_slice(hot_phys, layer)
+            tier.hot_tensors = bank
+            for e in (layer, layer + 1):
+                for n in rt.TENSORS:
+                    bank[n][int(tier.hot_map[e])] = sources[layer][n][e]
+            tiers.append(tier)
+        coordinator = object.__new__(rt.TierCoordinator)
+        coordinator.stats = Counter()
+        coordinator._verify_version = None
+        coordinator.device = torch.device("cpu")
+        coordinator.layers = tiers
+        coordinator.pool = SimpleNamespace(tables=tables, bank=bank)
+        coordinator.settings = dataclasses.replace(
+            rt.Settings(1), global_pool=True, ram_backing=True
+        )
+        coordinator.settle_pending = lambda wait=True: None
+        return coordinator, tables, bank, tiers
+
+    def test_verify_pool_passes_a_consistent_pool_and_is_read_only(self):
+        coordinator, tables, bank, tiers = self.make_verify_pool()
+        before = {n: bank[n].clone() for n in rt.TENSORS}
+        maps = (
+            tables.hot_phys.clone(),
+            tables.cold_phys.clone(),
+            tables.row_key.clone(),
+        )
+        report = coordinator.verify_pool()
+        self.assertEqual(report["status"], "pass", report)
+        self.assertEqual(
+            (report["checked_rows"], report["mismatched_rows"], report["pool_rows"]),
+            (4, 0, 4),
+        )
+        self.assertEqual(report["tensors_compared"], len(rt.TENSORS) * 2)
+        for (
+            n
+        ) in rt.TENSORS:  # bytes: the source holds a NaN, torch.equal would fail on it
+            self.assertTrue(
+                torch.equal(bank[n].view(torch.int32), before[n].view(torch.int32))
+            )
+        for a, b in zip(maps, (tables.hot_phys, tables.cold_phys, tables.row_key)):
+            self.assertTrue(torch.equal(a, b))
+        # Identical NaN payloads count as equal (raw bytes), signed zero does not.
+        bank[rt.TENSORS[2]][0, 0] = -0.0  # source has +0.0 at layer 0, expert 0, col 0
+        self.assertEqual(coordinator.verify_pool()["status"], "fail")
+        bank[rt.TENSORS[2]][0, 0] = 0.0
+        self.assertEqual(coordinator.verify_pool()["status"], "pass")
+
+    def test_verify_pool_placement_hash_tracks_tables_not_staging_or_bytes(self):
+        coordinator, tables, bank, tiers = self.make_verify_pool()
+        first = coordinator.verify_pool()["placement"]
+        self.assertEqual(
+            first["ranges"],
+            {"hot_phys": 8, "cold_phys": 8, "row_key_resident": 4, "dtype": "int32"},
+        )
+        # Bank bytes and the staging sentinel range do not enter the hash.
+        bank[rt.TENSORS[0]][0, 0] += 1.0
+        if tables.row_key.shape[0] > 4:
+            tables.row_key[4:] = 7
+        again = coordinator.verify_pool()["placement"]
+        self.assertEqual(again["combined"], first["combined"])
+        if tables.row_key.shape[0] > 4:
+            tables.row_key[4:] = -1
+        bank[rt.TENSORS[0]][0, 0] -= 1.0
+        # Exchanging two resident rows keeps every per-layer count and changes
+        # the hash of both row_key and hot_phys.
+        r0, r1 = int(tables.row_key[0]), int(tables.row_key[1])
+        tables.row_key[0], tables.row_key[1] = r1, r0
+        tables.hot_phys[r0], tables.hot_phys[r1] = 1, 0
+        swapped = coordinator.verify_pool()
+        self.assertEqual(swapped["ownership"]["row_key_hot_mismatch"], 0)
+        self.assertNotEqual(
+            swapped["placement"]["row_key_resident"], first["row_key_resident"]
+        )
+        self.assertNotEqual(swapped["placement"]["hot_phys"], first["hot_phys"])
+        self.assertEqual(swapped["placement"]["cold_phys"], first["cold_phys"])
+        self.assertNotEqual(swapped["placement"]["combined"], first["combined"])
+
+    def test_verify_pool_finds_corruption_in_every_tensor_and_names_it(self):
+        for k, n in enumerate(rt.TENSORS):
+            coordinator, tables, bank, tiers = self.make_verify_pool()
+            bank[n][3, 2] += 1.0  # row 3 = layer 1, expert 2
+            report = coordinator.verify_pool()
+            self.assertEqual(report["status"], "fail", n)
+            self.assertEqual(
+                report["layers"], {1: {"mismatched": 1, "experts": [2], "rows": [3]}}, n
+            )
+            self.assertEqual(report["mismatched_rows"], 1)
+
+    def test_verify_pool_flags_ownership_faults(self):
+        cases = {
+            "duplicate hot row": lambda t: t.hot_phys.__setitem__(
+                1, 0
+            ),  # key 1 -> row 0 (also key 0)
+            "reverse mismatch": lambda t: t.row_key.__setitem__(
+                2, 1
+            ),  # row 2 says key 1, hot says key 4
+            "invalid row_key": lambda t: t.row_key.__setitem__(1, 99),
+            "unfilled row": lambda t: t.row_key.__setitem__(3, -1),
+            "wrong cold_phys": lambda t: t.cold_phys.__setitem__(
+                0, 0
+            ),  # resident key must be -1
+        }
+        for name, mutate in cases.items():
+            coordinator, tables, bank, tiers = self.make_verify_pool()
+            mutate(tables)
+            report = coordinator.verify_pool()
+            self.assertEqual(report["status"], "fail", name)
+            self.assertTrue(
+                any(v for k, v in report["ownership"].items() if k != "resident_keys"),
+                name,
+            )
+
+    def test_verify_pool_skips_without_pool_or_ram_backing_and_trigger_fires(self):
+        import tempfile
+
+        coordinator, tables, bank, tiers = self.make_verify_pool()
+        coordinator.settings = dataclasses.replace(
+            coordinator.settings, ram_backing=False
+        )
+        self.assertEqual(coordinator.verify_pool()["status"], "skipped")
+        coordinator.settings = dataclasses.replace(
+            coordinator.settings, ram_backing=True
+        )
+        coordinator.pool = None
+        self.assertEqual(coordinator.verify_pool()["status"], "skipped")
+        coordinator, tables, bank, tiers = self.make_verify_pool()
+        with tempfile.NamedTemporaryFile() as f:
+            coordinator.settings = dataclasses.replace(
+                coordinator.settings, verify_file=f.name
+            )
+            coordinator.stats["model_forwards"] = 15
+            self.assertIsNone(coordinator.poll_verify_file())
+            self.assertIsNotNone(coordinator.poll_verify_file(force_cadence=True))
+            self.assertIsNone(
+                coordinator.poll_verify_file(force_cadence=True)
+            )  # same mtime
+            os.utime(f.name, (1, 2))
+            coordinator.stats["model_forwards"] = 16
+            self.assertIsNotNone(coordinator.poll_verify_file())
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "VERIFY_FILE": "/tmp/x"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
 
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
