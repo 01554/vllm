@@ -59,7 +59,14 @@ def oracle(x, weights, ids, bank, mapping):
 
 
 def run_case(
-    tokens, hidden, intermediate, *, grouped=False, physical_rows=4, uva=False
+    tokens,
+    hidden,
+    intermediate,
+    *,
+    grouped=False,
+    physical_rows=4,
+    uva=False,
+    routes_ready=False,
 ):
     generator = torch.Generator().manual_seed(513)
     bank = {}
@@ -113,8 +120,32 @@ def run_case(
 
         operation, allocator = prefill, allocate_workspace
     workspace = allocator(bank, tokens, 4, num_experts=4)
+    if routes_ready:
+        if grouped:
+            raise ValueError("routes_ready is only supported by the decode smoke")
+        ready_routes = torch.tensor(
+            [[2, -1, 3, 0]], dtype=torch.int32, device="cuda"
+        ).repeat(tokens, 1)
+        workspace.routes[:tokens].copy_(ready_routes)
+        # Deliberately make the logical inputs unusable.  The ready route
+        # buffer must be the only route source in this mode.
+        ids.fill_(99)
+        mapping.fill_(-1)
+        ready_mapping = torch.arange(physical_rows, dtype=torch.int32, device="cuda")
+    else:
+        ready_mapping = None
 
     def forward():
+        if routes_ready:
+            return operation(
+                x,
+                weights,
+                ids,
+                bank,
+                mapping,
+                workspace,
+                routes_ready=True,
+            )
         return operation(x, weights, ids, bank, mapping, workspace)
 
     forward()  # Compile and initialize all kernels before capture.
@@ -124,38 +155,105 @@ def run_case(
         captured = forward()
     for step in range(3):
         if step == 1:
-            ids[:, 0] = -1  # Formerly valid lanes must overwrite stale scratch.
-            mapping[:4].copy_(
-                torch.tensor(
-                    [base_row + 1, base_row + 3, base_row, base_row + 2], device="cuda"
+            if routes_ready:
+                workspace.routes[:tokens].copy_(
+                    torch.tensor(
+                        [[1, 0, 2, -1]], dtype=torch.int32, device="cuda"
+                    ).repeat(tokens, 1)
                 )
-            )
+                ids.fill_(98)
+            else:
+                ids[:, 0] = -1  # Formerly valid lanes must overwrite stale scratch.
+                mapping[:4].copy_(
+                    torch.tensor(
+                        [base_row + 1, base_row + 3, base_row, base_row + 2],
+                        device="cuda",
+                    )
+                )
         elif step == 2:
-            ids[:, 0] = 1
-            bank["w2_weight"][base_row + 3].zero_()  # Replay must read live bank bytes.
+            if routes_ready:
+                workspace.routes[:tokens].copy_(
+                    torch.tensor(
+                        [[3, 2, -1, 0]], dtype=torch.int32, device="cuda"
+                    ).repeat(tokens, 1)
+                )
+                ids.fill_(97)
+                bank["w2_weight"][3].zero_()
+            else:
+                ids[:, 0] = 1
+                bank["w2_weight"][
+                    base_row + 3
+                ].zero_()  # Replay must read live bank bytes.
         graph.replay()
         actual = captured.cpu()
-        expected = oracle(x, weights, ids.cpu(), bank, mapping.cpu())
+        expected_ids = workspace.routes[:tokens].cpu() if routes_ready else ids.cpu()
+        expected_map = ready_mapping.cpu() if routes_ready else mapping.cpu()
+        expected = oracle(x, weights, expected_ids, bank, expected_map)
         torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.0002)
         eager = forward().cpu()
         torch.testing.assert_close(eager, actual, rtol=0, atol=0)
         assert workspace.error.item() == 0
+    workspace.error.zero_()
     ids.fill_(-1)
     x.fill_(float("nan"))
     weights.fill_(float("nan"))
+    if routes_ready:
+        workspace.routes[:tokens].fill_(-1)
     graph.replay()
     assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
     assert workspace.error.item() == 0
-    ids[:, 0] = 4  # Out-of-domain ID must never read a physical bank row.
+    if routes_ready:
+        # Each physical-row failure is checked independently after resetting
+        # the sticky flag; padding remains a non-error route.
+        workspace.error.zero_()
+        workspace.routes[:tokens].fill_(-1)
+        workspace.routes[:, 0] = physical_rows
+        graph.replay()
+        assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+        assert workspace.error.item() == 1
+
+        workspace.error.zero_()
+        workspace.routes[:tokens].fill_(-1)
+        workspace.routes[:, 0] = -2
+        graph.replay()
+        assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+        assert workspace.error.item() == 1
+    else:
+        workspace.error.zero_()
+        ids[:, 0] = 4  # Out-of-domain ID must never read a physical bank row.
+        graph.replay()
+        assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+        assert workspace.error.item() == 1
+
+        workspace.error.zero_()
+        # A valid logical expert with no bank row must also zero NaN-valued routes.
+        ids.fill_(-1)
+        ids[:, 0] = 1
+        mapping[1] = -1
+        graph.replay()
+        assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+        assert workspace.error.item() == 1
+
+        for invalid_id, invalid_row in ((-2, 0), (1, physical_rows)):
+            workspace.error.zero_()
+            ids.fill_(-1)
+            ids[:, 0] = invalid_id
+            mapping[1] = invalid_row
+            graph.replay()
+            assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
+            assert workspace.error.item() == 1
+
+    # A padding-only replay does not clear a sticky failure by itself.
+    if routes_ready:
+        workspace.routes[:tokens].fill_(-1)
+    else:
+        ids.fill_(-1)
     graph.replay()
     assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
     assert workspace.error.item() == 1
-    # A valid logical expert with no bank row must also zero NaN-valued routes.
-    ids[:, 0] = 1
-    mapping[1] = -1
+    workspace.error.zero_()
     graph.replay()
-    assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
-    assert workspace.error.item() == 1
+    assert workspace.error.item() == 0
     print(
         f"PASS M={tokens}, H={hidden}, I={intermediate}, "
         f"rows={physical_rows}, UVA={uva}: eager/graph/oracle"
@@ -172,6 +270,7 @@ if __name__ == "__main__":
         run_case(65, 128, 32, grouped=True, physical_rows=560)
         run_case(17, 64, 32, grouped=True, uva=True)
     else:
-        run_case(1, 32, 16)
+        run_case(1, 32, 16, physical_rows=560)
         run_case(3, 32, 16)
         run_case(1, 2064, 32)  # FreeToken deep-K launch configuration.
+        run_case(1, 32, 16, routes_ready=True)

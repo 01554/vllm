@@ -132,10 +132,13 @@ def _build_kernels() -> tuple[Any, Any]:
         global_ptr,  # [S, N] fp16 or fp32
         c_ptr,  # [M, TOP_K, N]
         topk_weights_ptr,  # [M, TOP_K]
-        topk_ids_ptr,  # [M, TOP_K] physical row ids
+        topk_ids_ptr,  # [M, TOP_K] physical or logical ids
+        expert_to_row_ptr,  # [num_experts] logical -> physical, or unused
+        error_ptr,  # sticky route error, or unused
         lut_ptr,  # [16] fp32
         total_routes,
         num_rows,
+        num_experts,
         N,
         K,
         stride_am,
@@ -160,6 +163,8 @@ def _build_kernels() -> tuple[Any, Any]:
         TOP_K: tl.constexpr,
         A_ROW_IS_ROUTE: tl.constexpr,
         MUL_ROUTED_WEIGHT: tl.constexpr,
+        USE_MAP: tl.constexpr,
+        WRITE_ERROR: tl.constexpr,
         USE_NATIVE_SCALE: tl.constexpr,
         compute_type: tl.constexpr,
     ):
@@ -172,11 +177,35 @@ def _build_kernels() -> tuple[Any, Any]:
         offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         n_mask = offs_n < N
 
-        raw_slot = tl.load(
+        raw_id = tl.load(
             topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k,
             mask=route_mask,
             other=-1,
         ).to(tl.int64)
+        if USE_MAP:
+            valid_expert = route_mask & (raw_id >= 0) & (raw_id < num_experts)
+            safe_expert = tl.where(valid_expert, raw_id, 0).to(tl.int64)
+            mapped = tl.load(
+                expert_to_row_ptr + safe_expert,
+                mask=valid_expert,
+                other=-1,
+            ).to(tl.int64)
+            bad_route = route_mask & (raw_id != -1) & ~valid_expert
+            bad_route = bad_route | (
+                route_mask & valid_expert & ((mapped < 0) | (mapped >= num_rows))
+            )
+            raw_slot = mapped
+        else:
+            raw_slot = raw_id
+            bad_route = (
+                route_mask
+                & (raw_slot != -1)
+                & ((raw_slot < 0) | (raw_slot >= num_rows))
+            )
+        if WRITE_ERROR:
+            # One atomic per route is enough; n_block_id 0 reports the
+            # route while the other output tiles only compute its value.
+            tl.atomic_or(error_ptr, 1, mask=bad_route & (n_block_id == 0))
         valid_slot = route_mask & (raw_slot >= 0) & (raw_slot < num_rows)
         # Clamp before forming every bank pointer.  The validity mask is kept
         # on every load so a -1 or an out-of-range map cannot touch row zero.
@@ -506,11 +535,19 @@ def launch_decode_gemm(
     mul_routed_weight: bool,
     a_row_is_route: bool,
     num_rows: int,
+    expert_to_row: torch.Tensor | None = None,
+    num_experts: int | None = None,
+    error: torch.Tensor | None = None,
+    write_error: bool | None = None,
 ) -> None:
     """Launch the FreeToken-style native wide-load NVFP4 GEMV.
 
     ``packed`` must still be raw ``uint8``.  The int32 view is made only for
     the kernel's coalesced loads and is never exposed as a bank contract.
+    When ``expert_to_row`` is supplied, ``physical_ids`` contains logical
+    expert IDs and the mapping is performed in this GEMM launch.  This avoids
+    a separate route-map launch in decode while retaining the physical-ID
+    mode used by grouped callers.
     """
 
     if a.device.type != "cuda":
@@ -521,6 +558,37 @@ def launch_decode_gemm(
         raise ValueError("native NVFP4 packed weights must be contiguous")
     if packed.shape[-1] % 4:
         raise ValueError("native NVFP4 K/2 byte width must be divisible by four")
+    if physical_ids.ndim != 2 or physical_ids.dtype != torch.int32:
+        raise TypeError("native NVFP4 route IDs must be contiguous int32 [M, top_k]")
+    if physical_ids.device != a.device or not physical_ids.is_contiguous():
+        raise ValueError(
+            "native NVFP4 route IDs must be contiguous on the input device"
+        )
+    if num_rows <= 0:
+        raise ValueError("native NVFP4 physical row count must be positive")
+    use_map = expert_to_row is not None
+    if expert_to_row is not None:
+        if num_experts is None or num_experts <= 0:
+            raise ValueError("inline route mapping requires positive num_experts")
+        if expert_to_row.ndim != 1 or expert_to_row.dtype != torch.int32:
+            raise TypeError("inline route map must be one-dimensional int32")
+        if expert_to_row.numel() < num_experts:
+            raise ValueError("inline route map must contain every logical expert")
+        if expert_to_row.device != a.device or not expert_to_row.is_contiguous():
+            raise ValueError("inline route map must be contiguous on the input device")
+    elif num_experts is not None:
+        raise ValueError("num_experts requires an inline route map")
+    if error is not None and (
+        error.device != a.device
+        or error.dtype != torch.int32
+        or error.shape != (1,)
+        or not error.is_contiguous()
+    ):
+        raise ValueError("route error flag must be contiguous CUDA int32[1]")
+    if write_error is None:
+        write_error = error is not None
+    if write_error and error is None:
+        raise ValueError("inline route mapping requires a sticky error flag")
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     use_native_scale = fp8_dtype is not None and block_scale.dtype == fp8_dtype
     if block_scale.dtype not in (torch.uint8, fp8_dtype):
@@ -542,6 +610,8 @@ def launch_decode_gemm(
     block_n = 8 if deep_k else 16
     block_kw = 128 if deep_k else 16
     grid = (total_routes, triton_cdiv(n, block_n))
+    map_ptr = physical_ids if expert_to_row is None else expert_to_row
+    error_ptr = physical_ids if error is None else error
     decode_kernel[grid](
         a,
         packed_i32,
@@ -550,9 +620,12 @@ def launch_decode_gemm(
         c,
         topk_weights,
         physical_ids,
+        map_ptr,
+        error_ptr,
         _e2m1_lut(a.device),
         total_routes,
         num_rows,
+        num_experts if num_experts is not None else 0,
         n,
         k,
         a.stride(0),
@@ -577,6 +650,8 @@ def launch_decode_gemm(
         TOP_K=physical_ids.shape[1],
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        USE_MAP=use_map,
+        WRITE_ERROR=write_error,
         USE_NATIVE_SCALE=use_native_scale,
         compute_type=_triton_compute_type(c.dtype, tl_module=None),
         num_warps=4,
