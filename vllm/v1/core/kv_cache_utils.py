@@ -1273,8 +1273,14 @@ def _glm5_next_tensor_layout(
     for group in uniform_groups:
         inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
         if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+            if attn_group is not None:
+                # Owner separation can produce multiple attention groups.
+                # This specialized allocator only accounts for one.
+                return None
             attn_group = group
         elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+            if tail_group is not None:
+                return None
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
@@ -1721,6 +1727,9 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names:
+            # PP retains empty groups to preserve global group indices.
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -2059,7 +2068,6 @@ def _get_packed_kv_cache_groups(
         groups,
         use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
     )
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
@@ -2180,6 +2188,60 @@ def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    """Group formats, then separate explicitly registered draft owners.
+
+    Format unification may update the input mapping; ownership is preserved.
+    """
+    owners = {name: spec.is_draft_layer for name, spec in kv_cache_spec.items()}
+    explicit = any(owner is not None for owner in owners.values())
+    if explicit and any(owner is None for owner in owners.values()):
+        raise ValueError("KV cache ownership must be reported for every layer")
+
+    format_specs = (
+        {
+            name: replace(spec, is_draft_layer=None)
+            for name, spec in kv_cache_spec.items()
+        }
+        if explicit
+        else kv_cache_spec
+    )
+    groups = _get_kv_cache_groups_by_format(vllm_config, format_specs)
+    # Format unification may replace per-layer specs. Keep ownership on the
+    # caller's mapping for repeated grouping and worker projection.
+    if explicit:
+        for name, spec in format_specs.items():
+            kv_cache_spec[name] = replace(spec, is_draft_layer=owners[name])
+
+    spec_config = vllm_config.speculative_config
+    if explicit and spec_config is not None and spec_config.use_eagle_block_drop():
+        owned_groups = []
+        for group in groups:
+            for is_draft in (False, True):
+                names = [n for n in group.layer_names if owners[n] == is_draft]
+                if not names:
+                    continue
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = replace(
+                        spec, kv_cache_specs={n: spec.kv_cache_specs[n] for n in names}
+                    )
+                owned_groups.append(
+                    replace(
+                        group,
+                        layer_names=names,
+                        kv_cache_spec=spec,
+                        is_eagle_group=is_draft,
+                    )
+                )
+        groups = owned_groups
+    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
+    return groups
+
+
+def _get_kv_cache_groups_by_format(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
     """
     Split the layers in the model into groups with the same KV cache spec.
 
@@ -2262,7 +2324,6 @@ def get_kv_cache_groups(
             groups.append(KVCacheGroupSpec([name], aligned))
 
     _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
@@ -2559,6 +2620,10 @@ def get_kv_cache_configs(
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
             else:
+                assert (
+                    merged_kv_cache_specs[layer_name].is_draft_layer
+                    == layer_spec.is_draft_layer
+                ), "KV cache ownership for the same layer differs across workers"
                 assert merged_kv_cache_specs[layer_name] == layer_spec, (
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."

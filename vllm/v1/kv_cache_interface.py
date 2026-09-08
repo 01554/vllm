@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
@@ -155,6 +155,10 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+
+    # Ownership is independent of cache format. None preserves legacy inference
+    # for runners that do not report their draft layer registration set.
+    is_draft_layer: bool | None = field(default=None, kw_only=True, compare=False)
 
     @property
     def prefix_cacheable(self) -> bool:
