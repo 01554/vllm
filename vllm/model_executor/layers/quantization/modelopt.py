@@ -1508,7 +1508,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         # Same gate as ModelOptFp8Config.has_blocked_weights, resolved per
         # layer: "+quant_fp8" must be on as soon as any layer is block-scaled.
         return any(
-            info.get("quant_algo", "").upper() == "FP8_PB_WO"
+            info.get("quant_algo", "").upper() in ("FP8_PB_WO", "FP8_BLOCK_SCALES")
             for info in self.quantized_layers.values()
         )
 
@@ -1743,6 +1743,23 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return build_linear_method(getattr(self, subcfg_attr), quant_algo, prefix)
 
         if isinstance(layer, RoutedExperts):
+            if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8MoEMethod,
+                )
+
+                # ModelOpt block-FP8 exports use the standard weight_scale_inv
+                # layout. Reuse its loader and backend conversion (including
+                # Marlin W8A16), rather than the per-tensor ModelOpt FP8 method.
+                return Fp8MoEMethod(
+                    Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=[128, 128],
+                    ),
+                    layer,
+                )
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,
