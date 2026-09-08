@@ -308,6 +308,15 @@ boundaries:
   the shared MLP's forward; the routed + shared addition stays in the MoE
   runner. CPU test holds the reference equal to the module's own forward.
   Not verified on a GPU.
+- **Native output alias** (`VLLM_LAB_EXPERT_TIER_NATIVE_OUTPUT=alias`,
+  default `clone`). The native decode path cloned the adapter's workspace
+  output once per layer (48 device copies per forward). With `alias` the
+  single-partition (decode) call returns the workspace output itself. Its
+  lifetime: the MoE runner consumes it in the same layer through the
+  out-of-place `shared_output + fused_output` (Qwen4 exp has a shared
+  expert), or, without one, the next layer's hyper-connection combine reads
+  it before that layer's gemv rewrites the workspace; init verification
+  clones its own outputs; the two-partition eager path keeps its copy.
 - **Copy launch shape** (`VLLM_LAB_EXPERT_TIER_COPY_SHAPE`, default
   `stripe`). The post-PLE profile still showed the expert row copy at
   about 3.2 ms per forward after the fixed grid, so the launch shape of
