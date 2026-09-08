@@ -502,15 +502,28 @@ def flip_step(tables, plan, buffers, staging_rows):
 
 COPY_PROGRAMS_PER_BANK = 32
 COPY_WORDS = 4096  # int32 words (16 KiB) per program iteration
+# "stripe": banks x 32 programs of 4 warps, each streaming its column stripe
+# of every row in turn. "chunks": FreeToken's fast_index_copy_multi shape,
+# banks x 8 programs of 32 warps grid-striding over (row, 16 KiB chunk)
+# pairs, so every row is in flight at once. Selected by the runtime setting.
+COPY_SHAPES = ("stripe", "chunks")
+_COPY_SHAPE = "stripe"
+COPY_CHUNK_PROGRAMS_PER_BANK = 8
+
+
+def configure_copy(shape):
+    """Select the copy launch shape (validated by the runtime settings)."""
+    global _COPY_SHAPE
+    if shape not in COPY_SHAPES:
+        raise ValueError(f"Copy shape must be one of {COPY_SHAPES}")
+    _COPY_SHAPE = shape
 
 
 def copy_rows(source, destination, src_rows, dst_rows, count):
     """Copy `count` (src, dst) row pairs of every bank tensor; device count.
 
-    One launch of a fixed small grid (banks x COPY_PROGRAMS_PER_BANK): each
-    program streams its stripe of every row, reading `count` on the device
-    (the FreeToken multi-bank copy shape), so an empty step costs a few
-    programs instead of one per row chunk.
+    One launch of a fixed small grid reading `count` on the device, in one
+    of two shapes (see COPY_SHAPES); an empty step costs a few programs.
     """
     src_device = source[TENSORS[0]].device
     if src_device.type != "cuda":
@@ -523,6 +536,22 @@ def copy_rows(source, destination, src_rows, dst_rows, count):
     for name, src, dst in zip(TENSORS, srcs, dsts):
         if src.shape[1] != dst.shape[1]:
             raise ValueError(f"{name}: destination row size differs from the source")
+    if _COPY_SHAPE == "chunks":
+        grid = (len(TENSORS) * COPY_CHUNK_PROGRAMS_PER_BANK,)
+        _copy_chunks_kernel()[grid](
+            *srcs,
+            *dsts,
+            src_rows,
+            dst_rows,
+            count,
+            *(dst.shape[1] for dst in dsts),
+            *(src.stride(0) for src in srcs),
+            *(dst.stride(0) for dst in dsts),
+            PROGRAMS=COPY_CHUNK_PROGRAMS_PER_BANK,
+            BLOCK=COPY_WORDS,
+            num_warps=32,
+        )
+        return
     grid = (len(TENSORS) * COPY_PROGRAMS_PER_BANK,)
     _copy_kernel()[grid](
         *srcs,
@@ -859,3 +888,165 @@ def _copy_kernel():
 
     _KERNELS["copy"] = promote_copy
     return promote_copy
+
+
+def _copy_chunks_kernel():
+    """FreeToken-shaped copy: programs grid-stride over (row, chunk) pairs."""
+    if "copy_chunks" in _KERNELS:
+        return _KERNELS["copy_chunks"]
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _chunks(
+        src,
+        dst,
+        src_rows_ptr,
+        dst_rows_ptr,
+        count,
+        words,
+        sstride,
+        dstride,
+        program,
+        PROGRAMS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        chunks_per_row = tl.cdiv(words, BLOCK)
+        total = count * chunks_per_row
+        for c in range(program, total, PROGRAMS):
+            row = c // chunks_per_row
+            chunk = c - row * chunks_per_row
+            src_row = tl.load(src_rows_ptr + row).to(tl.int64)
+            dst_row = tl.load(dst_rows_ptr + row).to(tl.int64)
+            offsets = chunk * BLOCK + tl.arange(0, BLOCK)
+            mask = offsets < words
+            values = tl.load(src + src_row * sstride + offsets, mask=mask)
+            tl.store(dst + dst_row * dstride + offsets, values, mask=mask)
+
+    @triton.jit
+    def promote_copy_chunks(
+        src0,
+        src1,
+        src2,
+        src3,
+        src4,
+        src5,
+        dst0,
+        dst1,
+        dst2,
+        dst3,
+        dst4,
+        dst5,
+        src_rows_ptr,
+        dst_rows_ptr,
+        count_ptr,
+        words0,
+        words1,
+        words2,
+        words3,
+        words4,
+        words5,
+        sstride0,
+        sstride1,
+        sstride2,
+        sstride3,
+        sstride4,
+        sstride5,
+        dstride0,
+        dstride1,
+        dstride2,
+        dstride3,
+        dstride4,
+        dstride5,
+        PROGRAMS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        which = tl.program_id(0) // PROGRAMS
+        program = tl.program_id(0) % PROGRAMS
+        count = tl.load(count_ptr)
+        if which == 0:
+            _chunks(
+                src0,
+                dst0,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words0,
+                sstride0,
+                dstride0,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+        elif which == 1:
+            _chunks(
+                src1,
+                dst1,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words1,
+                sstride1,
+                dstride1,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+        elif which == 2:
+            _chunks(
+                src2,
+                dst2,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words2,
+                sstride2,
+                dstride2,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+        elif which == 3:
+            _chunks(
+                src3,
+                dst3,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words3,
+                sstride3,
+                dstride3,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+        elif which == 4:
+            _chunks(
+                src4,
+                dst4,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words4,
+                sstride4,
+                dstride4,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+        else:
+            _chunks(
+                src5,
+                dst5,
+                src_rows_ptr,
+                dst_rows_ptr,
+                count,
+                words5,
+                sstride5,
+                dstride5,
+                program,
+                PROGRAMS,
+                BLOCK,
+            )
+
+    _KERNELS["copy_chunks"] = promote_copy_chunks
+    return promote_copy_chunks

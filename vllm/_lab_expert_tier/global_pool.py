@@ -398,16 +398,22 @@ def _step_kernel():
             tl.store(clock_ptr, clock)
             tl.store(row_use_ptr + tl.where(hit, resident, 0), clock, mask=hit)
         tl.debug_barrier()
-        # One vector of every pool row's recency; rows selected this step
-        # (hits) and rows handed out below are masked in registers.
+        # The pool-wide recency vector is only needed when a miss can be
+        # promoted (FreeToken scans its cache inside the same condition);
+        # on an all-hit layer, the common case, nothing below touches it.
         offs_r = tl.arange(0, BLOCK_R)
         in_pool = offs_r < pool_rows
-        use = tl.load(row_use_ptr + offs_r, mask=in_pool, other=never)
-        # Extract lane i's hit row (or -1): the other lanes contribute 0.
-        hit_rows = tl.where(hit, resident, -1)
-        for i in range(0, WIDTH):
-            hit_row = tl.sum(tl.where(lane == i, hit_rows, 0), 0)
-            use = tl.where(offs_r.to(tl.int64) == hit_row, never, use)
+        misses = tl.sum((distinct & (~hit)).to(tl.int32), 0)
+        scan = gate & (misses > 0)
+        use = tl.full((BLOCK_R,), never, tl.int64)
+        if scan:
+            use = tl.load(row_use_ptr + offs_r, mask=in_pool, other=never)
+            # Rows selected this step (hits) are masked in registers; extract
+            # lane i's hit row (or -1): the other lanes contribute 0.
+            hit_rows = tl.where(hit, resident, -1)
+            for i in range(0, WIDTH):
+                hit_row = tl.sum(tl.where(lane == i, hit_rows, 0), 0)
+                use = tl.where(offs_r.to(tl.int64) == hit_row, never, use)
         promoted = 0
         staged = 0
         for i in range(0, WIDTH):

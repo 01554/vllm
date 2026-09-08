@@ -140,6 +140,10 @@ class Settings:
     # sigmoid, multiply) or "fused" (one Triton program per token,
     # `shared_gate.py`, FreeToken's gate kernel taken one step further).
     shared_gate: str = "torch"
+    # Expert row copy launch shape: "stripe" (current) or "chunks"
+    # (FreeToken's fast_index_copy_multi shape: 8 programs x 32 warps per
+    # bank over (row, chunk) pairs). See promote.COPY_SHAPES.
+    copy_shape: str = "stripe"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -179,6 +183,7 @@ class Settings:
             "NATIVE_PREFILL",
             "RECORD_KERNEL",
             "SHARED_GATE",
+            "COPY_SHAPE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -221,6 +226,9 @@ class Settings:
         shared_gate = os.environ.get(PREFIX + "SHARED_GATE", "torch")
         if shared_gate not in ("torch", "fused"):
             raise ValueError("SHARED_GATE must be torch or fused")
+        copy_shape = os.environ.get(PREFIX + "COPY_SHAPE", "stripe")
+        if copy_shape not in ("stripe", "chunks"):
+            raise ValueError("COPY_SHAPE must be stripe or chunks")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -303,6 +311,7 @@ class Settings:
             native_prefill,
             record_kernel == "1",
             shared_gate,
+            copy_shape,
         )
 
 
@@ -2550,6 +2559,9 @@ def initialize_model(model, model_config):
     settings = Settings.from_env()
     if settings is None:
         return
+    from .promote import configure_copy
+
+    configure_copy(settings.copy_shape)
     import torch
 
     from vllm import envs
@@ -2830,6 +2842,7 @@ def initialize_model(model, model_config):
                 "native_prefill": settings.native_prefill,
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
+                "copy_shape": settings.copy_shape,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

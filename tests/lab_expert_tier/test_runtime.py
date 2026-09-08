@@ -1869,6 +1869,16 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(out.shape, (1, 3))
         self.assertEqual(pool.snapshot(), [1, 3])
 
+    def test_copy_shape_setting(self):
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "COPY_SHAPE": "chunks"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(rt.Settings.from_env().copy_shape, "chunks")
+        with patch.dict(os.environ, {rt.PREFIX + "GIB": "32"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().copy_shape, "stripe")
+        env[rt.PREFIX + "COPY_SHAPE"] = "rows"
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+
     def test_pool_host_swap_while_gated_copies_in_and_restores(self):
         pool, (first, second) = self.make_pool_layers()
         temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}

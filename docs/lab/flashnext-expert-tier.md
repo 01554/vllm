@@ -308,6 +308,16 @@ boundaries:
   the shared MLP's forward; the routed + shared addition stays in the MoE
   runner. CPU test holds the reference equal to the module's own forward.
   Not verified on a GPU.
+- **Copy launch shape** (`VLLM_LAB_EXPERT_TIER_COPY_SHAPE`, default
+  `stripe`). The post-PLE profile still showed the expert row copy at
+  about 3.2 ms per forward after the fixed grid, so the launch shape of
+  FreeToken's `fast_index_copy_multi` is available as `chunks`: 8 programs
+  of 32 warps per bank grid-striding over (row, 16 KiB chunk) pairs, so
+  every row is in flight at once, instead of 32 programs of 4 warps each
+  streaming its stripe of one row at a time. Same bytes, same order of
+  rows; contribution not measured. The pool step also skips its pool-wide
+  recency load on all-hit layers (FreeToken scans its cache only when
+  there is something to fetch).
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.
