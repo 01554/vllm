@@ -66,6 +66,7 @@ MAX_SPEC_ROWS = 8
 NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
 _NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
 _NATIVE_PREFILL_WORKSPACES: dict[tuple[str, int], Any] = {}
+_PREFILL_SCRATCH: dict[tuple[str, int], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -137,6 +138,13 @@ class Settings:
     # 1 + k <= spec_rows rows and is decode, not prefill. Defaults to
     # spec_rows (1 without speculation, so the plain decode step only).
     native_gemv_rows: int = 1
+    # Staged prefill: rows of a device scratch bank (shared by all layers,
+    # used one layer at a time). A multi-token forward copies the cold experts
+    # it routes to into the scratch with the bank copy kernel (contiguous
+    # rows, host -> device) and runs the kernel on device memory instead of
+    # gathering host rows through UVA inside the kernel. Experts beyond the
+    # scratch rows stay on the UVA partition. 0 = off (default).
+    prefill_stage_rows: int = 0
     # Fused per-layer routing record (device observer only): one program
     # writes the observer records, counts, route totals, and the sticky
     # error (including the former device assertion) instead of ~30 small
@@ -224,6 +232,7 @@ class Settings:
             "MOE_KERNEL",
             "NATIVE_PREFILL",
             "NATIVE_GEMV_ROWS",
+            "PREFILL_STAGE_ROWS",
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
@@ -324,6 +333,11 @@ class Settings:
         )
         if native_gemv_rows < 1:
             raise ValueError("NATIVE_GEMV_ROWS must be at least 1")
+        prefill_stage_rows = int(os.environ.get(PREFIX + "PREFILL_STAGE_ROWS", "0"))
+        if prefill_stage_rows < 0:
+            raise ValueError("PREFILL_STAGE_ROWS must be nonnegative (0 = off)")
+        if prefill_stage_rows and ram_backing != "1":
+            raise ValueError("PREFILL_STAGE_ROWS requires RAM_BACKING=1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -400,6 +414,7 @@ class Settings:
             moe_kernel,
             native_prefill,
             native_gemv_rows,
+            prefill_stage_rows,
             record_kernel == "1",
             shared_gate,
             native_output,
@@ -1207,6 +1222,69 @@ class TierLayer:
             ),
         )
 
+    def prefill_scratch(self):
+        """The shared device scratch bank for staged prefill (None when off)."""
+        rows = self.settings.prefill_stage_rows
+        if not rows:
+            return None
+        key = (str(self.device), rows)
+        scratch = _PREFILL_SCRATCH.get(key)
+        if scratch is None:
+            import torch
+
+            scratch = {
+                name: torch.empty(
+                    (rows, *self.cold[name].shape[1:]),
+                    dtype=self.cold[name].dtype,
+                    device=self.device,
+                )
+                for name in TENSORS
+            }
+            _PREFILL_SCRATCH[key] = scratch
+        return scratch
+
+    def stage_cold_partition(self, ids, scratch):
+        """Copy this forward's routed cold experts into `scratch` and return
+        the (staged, overflow) partitions replacing the UVA cold partition.
+
+        Routed cold experts are taken in ascending id order up to the scratch
+        rows; the rest keep the UVA partition through an overflow map. One
+        host read of the routed count per layer (eager prefill only).
+        """
+        import torch
+
+        from .promote import copy_rows
+
+        cold_map = self.cold_map
+        if cold_map is None:
+            raise RuntimeError("Staged prefill needs the cold map")
+        valid = (ids >= 0) & (ids < self.num_experts)
+        safe = torch.where(valid, ids, torch.zeros_like(ids)).long()
+        routed = valid & (cold_map[safe] >= 0)
+        experts = torch.unique(safe[routed])
+        rows = scratch[TENSORS[0]].shape[0]
+        take = experts[:rows]
+        count = int(take.numel())
+        src_rows = cold_map[take].to(torch.int32)
+        dst_rows = torch.arange(count, dtype=torch.int32, device=ids.device)
+        copy_rows(
+            self.cold,
+            scratch,
+            src_rows,
+            dst_rows,
+            torch.tensor([count], dtype=torch.int32, device=ids.device),
+        )
+        scratch_map = torch.full_like(cold_map, -1)
+        scratch_map[take] = dst_rows.to(cold_map.dtype)
+        overflow_map = cold_map.clone()
+        overflow_map[take] = -1
+        self.prefill_staged_rows = count
+        self.prefill_overflow_rows = int(experts.numel()) - count
+        kernel = self.cold_kernel.fused_experts
+        staged = (kernel, scratch, scratch_map, count)
+        overflow = (kernel, self.cold, overflow_map, self.prefill_overflow_rows)
+        return staged, overflow
+
     def split_fused(self, x, weights, ids):
         """Both partitions into one per-slot row buffer, reduced once.
 
@@ -1219,7 +1297,7 @@ class TierLayer:
         GEMMs per partition. Numerics are checked against the source kernel
         by init verification.
         """
-        partitions = (
+        partitions: tuple[Any, ...] = (
             (
                 self.hot_kernel.fused_experts,
                 getattr(self, "hot_tensors", self.hot),
@@ -1233,6 +1311,10 @@ class TierLayer:
                 getattr(self, "cold_local", self.cold_slots),
             ),
         )
+        scratch = self.prefill_scratch()
+        if scratch is not None and x.shape[0] > self.settings.native_gemv_rows:
+            staged, overflow = self.stage_cold_partition(ids, scratch)
+            partitions = (partitions[0], staged, overflow)
         return self._run_marlin_chains(x, weights, ids, partitions)
 
     def native_workspace(self, tensors):
@@ -3096,6 +3178,12 @@ def initialize_model(model, model_config):
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
                 "native_gemv_rows": settings.native_gemv_rows,
+                "prefill_stage_rows": settings.prefill_stage_rows,
+                "prefill_stage_bytes": (
+                    settings.prefill_stage_rows * row_sizes[0]
+                    if settings.prefill_stage_rows
+                    else 0
+                ),
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
