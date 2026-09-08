@@ -136,6 +136,10 @@ class Settings:
     # error (including the former device assertion) instead of ~30 small
     # kernels per layer. Rows beyond the fused width take the old path.
     record_kernel: bool = False
+    # Shared-expert gate of the Qwen4 exp MoE block: "torch" (cuBLAS dot,
+    # sigmoid, multiply) or "fused" (one Triton program per token,
+    # `shared_gate.py`, FreeToken's gate kernel taken one step further).
+    shared_gate: str = "torch"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -174,6 +178,7 @@ class Settings:
             "MOE_KERNEL",
             "NATIVE_PREFILL",
             "RECORD_KERNEL",
+            "SHARED_GATE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -213,6 +218,9 @@ class Settings:
         record_kernel = os.environ.get(PREFIX + "RECORD_KERNEL", "0")
         if record_kernel not in ("0", "1"):
             raise ValueError("RECORD_KERNEL must be 0 or 1")
+        shared_gate = os.environ.get(PREFIX + "SHARED_GATE", "torch")
+        if shared_gate not in ("torch", "fused"):
+            raise ValueError("SHARED_GATE must be torch or fused")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -294,6 +302,7 @@ class Settings:
             moe_kernel,
             native_prefill,
             record_kernel == "1",
+            shared_gate,
         )
 
 
@@ -2820,6 +2829,7 @@ def initialize_model(model, model_config):
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
                 "record_kernel": settings.record_kernel,
+                "shared_gate": settings.shared_gate,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

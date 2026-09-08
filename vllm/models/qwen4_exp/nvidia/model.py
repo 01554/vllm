@@ -196,6 +196,19 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+        # Lab expert tier, opt-in: fused shared-expert gate (one program per
+        # token instead of dot + sigmoid + multiply).
+        from vllm._lab_expert_tier.runtime import Settings as _LabSettings
+
+        lab = _LabSettings.from_env()
+        if lab is not None and lab.shared_gate == "fused":
+            if self.shared_expert is None:
+                raise NotImplementedError(
+                    "SHARED_GATE=fused needs the separate (unfused) shared expert"
+                )
+            from vllm._lab_expert_tier.shared_gate import fuse_shared_gate
+
+            fuse_shared_gate(self.shared_expert)
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
