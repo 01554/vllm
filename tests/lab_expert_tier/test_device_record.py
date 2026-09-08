@@ -150,13 +150,20 @@ class DeviceRecordTests(unittest.TestCase):
 
     def test_invalid_id_bad_weight_and_layer_skip_set_the_error(self):
         rng = random.Random(3)
-        for kind in ("invalid", "bad_weight", "skip", "count"):
+        for kind in ("invalid", "bad_weight", "inf", "neg_inf", "nan", "skip", "count"):
             rows = 2
             base = self.layer_inputs(rng, rows)
             if kind == "invalid":
                 steps = [(0, rows, *self.layer_inputs(rng, rows, invalid=True))]
             elif kind == "bad_weight":
                 steps = [(0, rows, *self.layer_inputs(rng, rows, bad_weight=True))]
+            elif kind in ("inf", "neg_inf", "nan"):
+                ids, weights, padding, hot_map = self.layer_inputs(rng, rows)
+                weights[0, 0] = {"inf": float("inf"), "neg_inf": -float("inf")}.get(
+                    kind, float("nan")
+                )
+                padding[0] = False
+                steps = [(0, rows, ids, weights, padding, hot_map)]
             elif kind == "skip":
                 steps = [(0, rows, *base), (2, rows, *self.layer_inputs(rng, rows))]
             else:
@@ -167,6 +174,13 @@ class DeviceRecordTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 classic, fused = self.run_both(steps)
                 self.assertTrue(bool(fused.accumulator._error_flag), kind)
+
+    def test_non_finite_weights_on_padding_rows_are_tolerated(self):
+        ids = torch.tensor([[-1, -1], [2, 3]], dtype=torch.int32)
+        weights = torch.tensor([[float("inf"), float("nan")], [0.5, 0.5]])
+        padding = torch.tensor([True, False])
+        classic, fused = self.run_both([(0, 2, ids, weights, padding, None)])
+        self.assertFalse(bool(fused.accumulator._error_flag))
 
     def test_second_forward_resets_at_layer_zero_like_the_observer(self):
         rng = random.Random(4)

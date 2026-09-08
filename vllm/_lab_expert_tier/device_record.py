@@ -259,7 +259,9 @@ def _record_kernel():
         invalid_real = (~in_range) & valid
         error = error | (tl.sum(invalid_real.to(tl.int32), 0) > 0)
         allowed = in_range | ((ids == -1) & padding)
-        good_weights = ((weights == weights) & (weights >= 0)) | padding
+        # finite (not NaN, not +/-inf) and nonnegative, or a padding row.
+        finite = (weights == weights) & (tl.abs(weights) < float("inf"))
+        good_weights = (finite & (weights >= 0)) | padding
         bad = present & (~(allowed & good_weights))
         error = error | (tl.sum(bad.to(tl.int32), 0) > 0)
         safe = tl.where(in_range, ids, 0)
