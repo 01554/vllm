@@ -1022,6 +1022,76 @@ class TensorTests(unittest.TestCase):
                             stock(tokens, top_k, local, 512, dtype),
                         )
 
+    def test_staged_prefill_copies_routed_cold_experts_and_keeps_overflow(self):
+        """PREFILL_STAGE_ROWS: a multi-row forward copies the cold experts it
+        routes to (ascending id, up to the scratch rows) into the shared device
+        scratch and runs the cold kernel on it; the remainder stays on the UVA
+        partition through an overflow map; single-row decode is untouched."""
+        tier = object.__new__(rt.TierLayer)
+        tier.settings = dataclasses.replace(
+            rt.Settings(32 * 2**30), prefill_stage_rows=2, native_gemv_rows=1
+        )
+        tier.device = torch.device("cpu")
+        tier.num_experts, tier.hot_slots, tier.cold_slots = 6, 2, 4
+        tier.hot_map = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
+        tier.cold_map = torch.tensor([-1, -1, 0, 1, 2, 3], dtype=torch.int32)
+        tier.hot = {name: torch.zeros(2, 4, dtype=torch.int32) for name in rt.TENSORS}
+        tier.cold = {
+            name: torch.arange(16, dtype=torch.int32).reshape(4, 4) * (i + 1)
+            for i, name in enumerate(rt.TENSORS)
+        }
+        tier.hot_kernel = SimpleNamespace(fused_experts="hot")
+        tier.cold_kernel = SimpleNamespace(fused_experts="cold")
+        tier.native = True
+        seen: list[Any] = []
+        tier._run_marlin_chains = lambda x, w, ids, parts: seen.append(parts)
+        rt._PREFILL_SCRATCH.clear()
+        # Routes: experts 5, 3, 2 are cold (slots 3, 1, 0); 0 is hot; -1 padding.
+        ids = torch.tensor([[5, 3], [2, 0], [5, -1]], dtype=torch.int32)
+        tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
+        hot, staged, overflow = seen[-1]
+        self.assertEqual(hot[0], "hot")
+        kernel, scratch, scratch_map, count = staged
+        self.assertEqual((kernel, count), ("cold", 2))
+        # Ascending ids 2 and 3 are staged; 5 overflows.
+        self.assertEqual(scratch_map.tolist(), [-1, -1, 0, 1, -1, -1])
+        for i, name in enumerate(rt.TENSORS):
+            self.assertEqual(scratch[name][0].tolist(), tier.cold[name][0].tolist())
+            self.assertEqual(scratch[name][1].tolist(), tier.cold[name][1].tolist())
+        self.assertEqual(overflow[1], tier.cold)
+        self.assertEqual(overflow[2].tolist(), [-1, -1, -1, -1, 2, 3])
+        self.assertEqual((tier.prefill_staged_rows, tier.prefill_overflow_rows), (2, 1))
+        self.assertIs(tier.prefill_scratch(), scratch)
+        # A layer with a different bank signature gets its own scratch.
+        other = object.__new__(rt.TierLayer)
+        other.settings, other.device = tier.settings, tier.device
+        other.cold = {name: torch.zeros(4, 8, dtype=torch.int32) for name in rt.TENSORS}
+        self.assertIsNot(other.prefill_scratch(), scratch)
+        self.assertEqual(other.prefill_scratch()[rt.TENSORS[0]].shape, (2, 8))
+        # Decode row count: the plain two-partition split.
+        tier.split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
+        self.assertEqual(len(seen[-1]), 2)
+        # Marlin chains keep scales on the layer: no staging there.
+        tier.native = False
+        tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
+        self.assertEqual(len(seen[-1]), 2)
+        rt._PREFILL_SCRATCH.clear()
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PREFILL_STAGE_ROWS": "8"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+        marlin = {
+            **base,
+            rt.PREFIX + "PROMOTE": "1",
+            rt.PREFIX + "STAGING": "1",
+            rt.PREFIX + "RAM_BACKING": "1",
+        }
+        with patch.dict(os.environ, marlin, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+        with patch.dict(
+            os.environ, {**marlin, rt.PREFIX + "MOE_KERNEL": "native"}, clear=True
+        ):
+            self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
+
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
         tier.settings = rt.Settings(32 * 2**30)
