@@ -1164,7 +1164,13 @@ __all__ = [
 def qwen4_exp_ple_deferred_rows(output: torch.Tensor, layer_name: str) -> None:
     """Capture stream WAIT/H2D; host completes fills after graph dispatch."""
     context = get_forward_context()
-    if context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+    # MRv2 captures FULL graphs with forward_fn(NONE) to avoid nested graph
+    # dispatch. Record the consumer during that capture too, but not during
+    # eager NONE forwards or PIECEWISE capture.
+    mode = context.cudagraph_runtime_mode
+    if mode == CUDAGraphMode.FULL or (
+        mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+    ):
         layer = context.no_compile_layers[layer_name]
         deferred_rows = layer.ple_embedding.deferred_rows
         if deferred_rows is not None and output.shape[0] <= deferred_rows.capacity:

@@ -74,11 +74,71 @@ def load_runner_ple_eligibility():
 
 
 class DeferredStateTests(unittest.TestCase):
+    def test_custom_op_captures_mrv2_none_but_not_eager_or_piecewise(self):
+        source = Path(__file__).parents[3] / "vllm/models/qwen4_exp/nvidia/ple_layer.py"
+        tree = ast.parse(source.read_text())
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "qwen4_exp_ple_deferred_rows"
+        )
+        modes = SimpleNamespace(NONE=0, FULL=1, PIECEWISE=2)
+        for mode, capturing, rows, present, expected in (
+            (modes.NONE, True, 1, True, True),
+            (modes.NONE, True, 8, True, True),
+            (modes.NONE, False, 1, True, False),
+            (modes.PIECEWISE, True, 1, True, False),
+            (modes.FULL, True, 1, True, True),
+            (modes.NONE, True, 9, True, False),
+            (modes.NONE, True, 1, False, False),
+        ):
+            with self.subTest(
+                mode=mode, capturing=capturing, rows=rows, present=present
+            ):
+                helper = SimpleNamespace(capacity=8, consume=Mock())
+                context = SimpleNamespace(
+                    cudagraph_runtime_mode=mode,
+                    no_compile_layers={
+                        "ple": SimpleNamespace(
+                            ple_embedding=SimpleNamespace(
+                                deferred_rows=helper if present else None
+                            )
+                        )
+                    },
+                )
+                namespace: dict[str, Any] = {
+                    "torch": SimpleNamespace(
+                        Tensor=torch.Tensor,
+                        cuda=SimpleNamespace(
+                            is_current_stream_capturing=Mock(return_value=capturing)
+                        ),
+                    ),
+                    "CUDAGraphMode": modes,
+                    "get_forward_context": Mock(return_value=context),
+                }
+                exec(
+                    compile(
+                        ast.Module(body=[function], type_ignores=[]),
+                        str(source),
+                        "exec",
+                    ),
+                    namespace,
+                )
+                output = torch.empty(rows, 1, 2)
+                namespace[function.name](output, "ple")
+                if expected:
+                    helper.consume.assert_called_once_with(output)
+                else:
+                    helper.consume.assert_not_called()
+
     def make_state(self, count=3):
         state = object.__new__(load_state())
         state._mmap_ple_modules = tuple(
             SimpleNamespace(deferred_rows=Mock()) for _ in range(count)
         )
+        for module in state._mmap_ple_modules:
+            module.deferred_rows.verify_consumed_rows.return_value = None
         state._deferred_ple_step = False
         state._deferred_ple_poisoned = False
         return state
@@ -94,6 +154,22 @@ class DeferredStateTests(unittest.TestCase):
         state.set_deferred_ple_step(True)
         self.assertTrue(state._deferred_ple_step)
 
+    def test_verify_waits_until_all_fills_are_released(self):
+        state = self.make_state()
+        calls = []
+        for i, module in enumerate(state._mmap_ple_modules):
+            module.deferred_rows.complete.side_effect = lambda i=i: calls.append(
+                ("fill", i)
+            )
+            module.deferred_rows.verify_consumed_rows.side_effect = lambda i=i: (
+                calls.append(("verify", i))
+            )
+        state.set_deferred_ple_step(True)
+        state.complete_deferred_ple()
+        self.assertEqual(
+            calls, [("fill", i) for i in range(3)] + [("verify", i) for i in range(3)]
+        )
+
     def test_fill_failure_releases_unvisited_layers_and_poison_latches(self):
         state = self.make_state()
         state._mmap_ple_modules[0].deferred_rows.complete.side_effect = ValueError(
@@ -104,6 +180,7 @@ class DeferredStateTests(unittest.TestCase):
             state.complete_deferred_ple()
         for module in state._mmap_ple_modules:
             module.deferred_rows.abort.assert_called_once()
+            module.deferred_rows.verify_consumed_rows.assert_not_called()
         state._mmap_ple_modules[1].deferred_rows.complete.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "poisoned"):
             state.set_deferred_ple_step(False)

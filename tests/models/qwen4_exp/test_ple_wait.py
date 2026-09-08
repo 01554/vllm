@@ -8,6 +8,7 @@ import importlib.util
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import torch
 
@@ -34,6 +35,8 @@ class _FakeEvent:
 
 
 class _FakeStream:
+    cuda_stream = 1
+
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
@@ -59,6 +62,73 @@ def _bare_helper(rows: torch.Tensor) -> Any:
 
 
 class DeferredRowsTests(unittest.TestCase):
+    def test_dummy_signals_before_captured_wait_and_copy(self):
+        calls: list[str] = []
+        helper = _bare_helper(torch.ones((2, 1, 2)))
+        helper._pending = False
+        helper._poisoned = False
+        helper._gate_armed = False
+        helper.flag = torch.zeros(1, dtype=torch.int64)
+        helper._ext = _FakeExtension(calls)
+        helper._ext.memop_wait_reset = lambda stream, flag: calls.append("wait")
+        stream = _FakeStream(calls)
+        helper._operation_stream = lambda *args: stream
+        helper._validate_destination = lambda destination: None
+        destination = type(
+            "Destination",
+            (),
+            {
+                "shape": (2, 1, 2),
+                "copy_": lambda _, rows, **kwargs: calls.append("copy"),
+            },
+        )()
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            helper.prepare_dummy(2)
+        self.assertEqual(calls, ["stream", "signal"])
+        self.assertEqual(helper.rows.count_nonzero().item(), 0)
+        helper.consume(destination, capture=True)
+        self.assertEqual(calls, ["stream", "signal", "wait", "copy"])
+
+    def test_verify_raw_nan_padding_ids_and_stale_rows(self):
+        """Byte diagnostics detect stale rows/IDs without rewriting staging."""
+        source = torch.tensor([[[float("nan"), -0.0]]])
+        for defect in (None, "row", "ids", "padding"):
+            with self.subTest(defect=defect):
+                helper = _bare_helper(torch.zeros((2, 1, 2)))
+                helper._verify_enabled = True
+                helper._verify_ids = torch.tensor([[5]])
+                helper.ids = torch.tensor([[5], [0]])
+                helper._verify_step = 1
+                helper._active_rows = 1
+                helper._padded_rows = 2
+                helper._pending = False
+                helper.flag = torch.zeros(1, dtype=torch.int64)
+                helper.destination = torch.cat(
+                    (source.clone(), torch.zeros_like(source))
+                )
+                helper.table = type("Table", (), {"gather": lambda _, ids: source})()
+                if defect == "row":
+                    helper.destination[0, 0, 1] = 0.0
+                elif defect == "ids":
+                    helper.ids[0, 0] = 7
+                elif defect == "padding":
+                    helper.destination[1, 0, 0] = 1.0
+                before = helper.destination.view(torch.uint8).clone()
+                with (
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=False
+                    ),
+                    patch.object(torch.accelerator, "synchronize"),
+                ):
+                    report = helper.verify_consumed_rows()
+                self.assertEqual(report["status"], "pass" if defect is None else "fail")
+                self.assertEqual(report["checked_rows"], 1)
+                self.assertTrue(
+                    torch.equal(before, helper.destination.view(torch.uint8))
+                )
+
     def test_complete_gathers_only_real_candidate_prefix(self) -> None:
         calls: list[str] = []
 
