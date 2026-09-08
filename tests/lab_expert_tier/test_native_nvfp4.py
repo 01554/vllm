@@ -36,6 +36,17 @@ class NativeNVFP4Tests(unittest.TestCase):
             self.x, self.weights, self.ids, self.bank, self.mapping, self.workspace
         )
 
+    def run_decode_with_ready_routes(self):
+        return native.gemv(
+            self.x,
+            self.weights,
+            self.ids,
+            self.bank,
+            self.mapping,
+            self.workspace,
+            routes_ready=True,
+        )
+
     def test_per_row_globals_router_weights_and_duplicate_routes(self):
         actual = self.run_native()
         expected = oracle(self.x, self.weights, self.ids, self.bank, self.mapping)
@@ -93,6 +104,49 @@ class NativeNVFP4Tests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_routes_ready_uses_physical_rows_over_logical_inputs(self):
+        physical = torch.tensor([[1, -1, 0, 2], [2, 1, -1, 0]], dtype=torch.int32)
+        self.workspace.routes[:2].copy_(physical)
+        row_scales = torch.tensor([0.125, 0.25, 0.5], dtype=torch.float16)
+        self.bank["w2_weight_scale_2"].copy_(
+            row_scales[:, None].expand_as(self.bank["w2_weight_scale_2"])
+        )
+        # These logical values and map entries must be ignored in ready mode.
+        self.ids.copy_(torch.tensor([[-2, 99, -1, 0], [99, -2, 1, -1]]))
+        self.mapping.fill_(-1)
+
+        actual = self.run_decode_with_ready_routes()
+        identity = torch.arange(3, dtype=torch.int32)
+        expected = oracle(self.x, self.weights, physical, self.bank, identity)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(self.workspace.error.item(), 0)
+
+    def test_routes_ready_invalid_rows_are_zero_and_error_reset_is_explicit(self):
+        self.workspace.routes[:2].copy_(
+            torch.tensor([[0, -1, 3, -2], [1, -1, -1, 0]], dtype=torch.int32)
+        )
+        actual = self.run_decode_with_ready_routes()
+        sanitized = torch.tensor([[0, -1, -1, -1], [1, -1, -1, 0]], dtype=torch.int32)
+        identity = torch.arange(3, dtype=torch.int32)
+        expected = oracle(self.x, self.weights, sanitized, self.bank, identity)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(self.workspace.error.item(), 1)
+
+        # The error is sticky across a padding-only call.
+        self.workspace.routes[:2].fill_(-1)
+        self.x.fill_(float("nan"))
+        self.weights.fill_(float("nan"))
+        self.assertTrue(
+            torch.equal(self.run_decode_with_ready_routes(), torch.zeros_like(self.x))
+        )
+        self.assertEqual(self.workspace.error.item(), 1)
+
+        self.workspace.error.zero_()
+        self.assertTrue(
+            torch.equal(self.run_decode_with_ready_routes(), torch.zeros_like(self.x))
+        )
+        self.assertEqual(self.workspace.error.item(), 0)
 
     def test_repacked_marlin_and_non_e4m3_scales_are_rejected(self):
         for name, replacement in (

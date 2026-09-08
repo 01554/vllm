@@ -153,11 +153,14 @@ def gemv(
     workspace: Workspace,
     *,
     activation: str = "silu",
+    routes_ready: bool = False,
 ) -> torch.Tensor:
-    """Compute all original routes, applying router weights once after down.
+    """Compute all routes, applying router weights once after down.
 
     ``ids=-1`` is padding. Missing/out-of-range active routes set the persistent
     ``workspace.error`` and contribute zero until the coordinator checks it.
+    With ``routes_ready=True``, ``workspace.routes`` already contains physical
+    row IDs; ``ids`` and ``step_map`` are retained for shape/device validation.
     Output aliases workspace storage and must be consumed before its next use.
     """
     if activation != "silu":
@@ -171,7 +174,7 @@ def gemv(
         raise ValueError("route dimensions must match tokens and configured top_k")
     if ids.dtype != torch.int32 or weights.dtype != torch.float32:
         raise TypeError("ids must be int32 and router weights float32")
-    if (
+    if not routes_ready and (
         step_map.ndim != 1
         or step_map.numel() < workspace.num_experts
         or step_map.dtype != torch.int32
@@ -196,14 +199,8 @@ def gemv(
     if x.device.type == "cuda":
         from . import native_nvfp4_kernels as kernels
 
-        kernels.map_routes_inplace(
-            ids,
-            step_map,
-            routes,
-            num_experts=workspace.num_experts,
-            num_rows=workspace.num_rows,
-            error=workspace.error,
-        )
+        route_ids = routes if routes_ready else ids
+        route_map = None if routes_ready else step_map
         kernels.launch_decode_gemm(
             x,
             bank["w13_weight"],
@@ -211,10 +208,13 @@ def gemv(
             bank["w13_weight_scale_2"],
             gu,
             weights,
-            routes,
+            route_ids,
             mul_routed_weight=False,
             a_row_is_route=False,
             num_rows=workspace.num_rows,
+            expert_to_row=route_map,
+            num_experts=workspace.num_experts if route_map is not None else None,
+            error=workspace.error,
         )
         kernels.activation_inplace(gu, act)
         kernels.launch_decode_gemm(
@@ -224,19 +224,30 @@ def gemv(
             bank["w2_weight_scale_2"],
             down,
             weights,
-            routes,
+            route_ids,
             mul_routed_weight=True,
             a_row_is_route=True,
             num_rows=workspace.num_rows,
+            expert_to_row=route_map,
+            num_experts=workspace.num_experts if route_map is not None else None,
+            error=workspace.error if route_map is not None else None,
+            write_error=False,
         )
         kernels.sum_routes_inplace(down, out)
     else:
-        valid = (ids >= 0) & (ids < workspace.num_experts)
-        mapped = step_map[torch.where(valid, ids, 0).long()]
-        valid_row = valid & (mapped >= 0) & (mapped < workspace.num_rows)
-        bad = (ids != -1) & ~valid_row
+        if routes_ready:
+            valid_row = (routes >= 0) & (routes < workspace.num_rows)
+            bad = (routes != -1) & ~valid_row
+        else:
+            valid = (ids >= 0) & (ids < workspace.num_experts)
+            mapped = step_map[torch.where(valid, ids, 0).long()]
+            valid_row = valid & (mapped >= 0) & (mapped < workspace.num_rows)
+            bad = (ids != -1) & ~valid_row
         workspace.error.bitwise_or_(bad.any().to(torch.int32))
-        routes.copy_(torch.where(valid_row, mapped, -1))
+        if routes_ready:
+            routes.copy_(torch.where(valid_row, routes, -1))
+        else:
+            routes.copy_(torch.where(valid_row, mapped, -1))
         gu.copy_(_cpu_projection(x, bank, "w13", routes, None))
         gate, up = gu.float().chunk(2, dim=-1)
         act.copy_((torch.nn.functional.silu(gate) * up).reshape_as(act))
