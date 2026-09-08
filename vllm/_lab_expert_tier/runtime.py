@@ -161,6 +161,14 @@ class Settings:
     # combine without a shared expert), before the next layer's gemv
     # rewrites the workspace; the two-partition path keeps its own copy.
     native_output: str = "clone"
+    # How a multi-partition native forward combines its partitions (prefill:
+    # hot + staged/cold). "bf16": each partition's BF16 output is added in
+    # BF16, adding one rounding per partition that follows the current
+    # placement. "fp32": accumulate the partition outputs in FP32 and round
+    # once at the end. This removes the sequential inter-partition BF16
+    # roundings only; each partition's own BF16 route sum still depends on
+    # which experts it holds, so the result is not placement-invariant.
+    native_combine: str = "bf16"
     # Expert row copy launch shape: "stripe" (current) or "chunks"
     # (FreeToken's fast_index_copy_multi shape: 8 programs x 32 warps per
     # bank over (row, chunk) pairs). See promote.COPY_SHAPES.
@@ -236,6 +244,7 @@ class Settings:
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
+            "NATIVE_COMBINE",
             "COPY_SHAPE",
             "SPEC_ROWS",
             "PROMOTE_LIMIT",
@@ -290,6 +299,9 @@ class Settings:
         if shared_gate not in ("torch", "fused"):
             raise ValueError("SHARED_GATE must be torch or fused")
         native_output = os.environ.get(PREFIX + "NATIVE_OUTPUT", "clone")
+        native_combine = os.environ.get(PREFIX + "NATIVE_COMBINE", "bf16")
+        if native_combine not in ("bf16", "fp32"):
+            raise ValueError("NATIVE_COMBINE must be bf16 or fp32")
         if native_output not in ("clone", "alias"):
             raise ValueError("NATIVE_OUTPUT must be clone or alias")
         copy_shape = os.environ.get(PREFIX + "COPY_SHAPE", "stripe")
@@ -423,6 +435,7 @@ class Settings:
             record_kernel == "1",
             shared_gate,
             native_output,
+            native_combine,
             copy_shape,
             spec_rows,
             controls["promote_limit"],
@@ -1429,7 +1442,14 @@ class TierLayer:
                 # layer's combine) before the next gemv rewrites it.
                 return out
             # The output aliases the workspace: own it before the next call.
-            total = out.clone() if total is None else total.add_(out)
+            if self.settings.native_combine == "fp32":
+                # Accumulate in FP32 and round once: fewer placement-dependent
+                # roundings (the per-partition BF16 route sums remain).
+                total = out.float() if total is None else total.add_(out.float())
+            else:
+                total = out.clone() if total is None else total.add_(out)
+        if total is not None and total.dtype != x.dtype:
+            total = total.to(x.dtype)
         return total
 
     def _run_marlin_chains(self, x, weights, ids, partitions):
@@ -3207,6 +3227,7 @@ def initialize_model(model, model_config):
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
+                "native_combine": settings.native_combine,
                 "copy_shape": settings.copy_shape,
                 "spec_rows": settings.spec_rows,
                 "draft_reserve": coordinator.draft_reserve,
