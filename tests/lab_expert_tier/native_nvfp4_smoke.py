@@ -184,12 +184,34 @@ def run_case(
                 bank["w2_weight"][
                     base_row + 3
                 ].zero_()  # Replay must read live bank bytes.
+        expected_ready_routes = (
+            workspace.routes[:tokens].clone() if routes_ready else None
+        )
         graph.replay()
         actual = captured.cpu()
         expected_ids = workspace.routes[:tokens].cpu() if routes_ready else ids.cpu()
         expected_map = ready_mapping.cpu() if routes_ready else mapping.cpu()
         expected = oracle(x, weights, expected_ids, bank, expected_map)
         torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.0002)
+        if routes_ready:
+            assert expected_ready_routes is not None
+            torch.testing.assert_close(
+                workspace.routes[:tokens].cpu(),
+                expected_ready_routes.cpu(),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            logical = ids.cpu()
+            route_valid = (logical >= 0) & (logical < mapping.numel())
+            safe = torch.where(route_valid, logical, 0).long()
+            mapped = mapping.cpu()[safe]
+            expected_routes = torch.where(
+                route_valid & (mapped >= 0) & (mapped < physical_rows), mapped, -1
+            )
+            torch.testing.assert_close(
+                workspace.routes[:tokens].cpu(), expected_routes, rtol=0, atol=0
+            )
         eager = forward().cpu()
         torch.testing.assert_close(eager, actual, rtol=0, atol=0)
         assert workspace.error.item() == 0
@@ -202,6 +224,11 @@ def run_case(
     graph.replay()
     assert torch.equal(captured.cpu(), torch.zeros_like(captured.cpu()))
     assert workspace.error.item() == 0
+    if not routes_ready:
+        assert torch.equal(
+            workspace.routes[:tokens].cpu(),
+            torch.full_like(workspace.routes[:tokens].cpu(), -1),
+        )
     if routes_ready:
         # Each physical-row failure is checked independently after resetting
         # the sticky flag; padding remains a non-error route.
