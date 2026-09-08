@@ -122,6 +122,19 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if quantized_layers:
+            # Mixed-precision checkpoints number MTP layers from zero, while
+            # draft modules start after the target layers. Replace the mapping
+            # rather than mutating metadata also used by the target config.
+            remapped_names = _remap_ignored_layers(
+                list(quantized_layers), mtp_start_layer_idx
+            )
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "quantized_layers",
+                dict(zip(remapped_names, quantized_layers.values())),
+            )
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
