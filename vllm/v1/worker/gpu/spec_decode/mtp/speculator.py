@@ -17,7 +17,12 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        draft_model = load_eagle_model(target_model, self.vllm_config)
+        from vllm._lab_expert_tier.draft_scope import draft_load_scope
+
+        # Cover construction and quantization finalization, not just the
+        # model-level post-load hook, so target offloading cannot capture MTP.
+        with draft_load_scope():
+            draft_model = load_eagle_model(target_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config
