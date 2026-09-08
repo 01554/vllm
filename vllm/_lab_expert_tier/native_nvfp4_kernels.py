@@ -133,6 +133,7 @@ def _build_kernels() -> tuple[Any, Any]:
         c_ptr,  # [M, TOP_K, N]
         topk_weights_ptr,  # [M, TOP_K]
         topk_ids_ptr,  # [M, TOP_K] physical or logical ids
+        route_output_ptr,  # [M, TOP_K] optional sanitized physical rows
         expert_to_row_ptr,  # [num_experts] logical -> physical, or unused
         error_ptr,  # sticky route error, or unused
         lut_ptr,  # [16] fp32
@@ -158,12 +159,15 @@ def _build_kernels() -> tuple[Any, Any]:
         stride_tw_k,
         stride_tid_m,
         stride_tid_k,
+        stride_route_m,
+        stride_route_k,
         BLOCK_SIZE_N: tl.constexpr,
         BLOCK_SIZE_KW: tl.constexpr,
         TOP_K: tl.constexpr,
         A_ROW_IS_ROUTE: tl.constexpr,
         MUL_ROUTED_WEIGHT: tl.constexpr,
         USE_MAP: tl.constexpr,
+        WRITE_ROUTES: tl.constexpr,
         WRITE_ERROR: tl.constexpr,
         USE_NATIVE_SCALE: tl.constexpr,
         compute_type: tl.constexpr,
@@ -210,6 +214,21 @@ def _build_kernels() -> tuple[Any, Any]:
         # Clamp before forming every bank pointer.  The validity mask is kept
         # on every load so a -1 or an out-of-range map cannot touch row zero.
         slot = tl.where(valid_slot, raw_slot, 0).to(tl.int64)
+
+        if WRITE_ROUTES:
+            # Only the first N tile owns the route result.  The logical input
+            # is a separate buffer in this mode, so later N tiles can keep
+            # reading it while this store publishes the physical row.
+            route_offset = (
+                token_id.to(tl.int64) * stride_route_m
+                + route_k.to(tl.int64) * stride_route_k
+            )
+            route_value = tl.where(valid_slot, raw_slot, -1).to(tl.int32)
+            tl.store(
+                route_output_ptr + route_offset,
+                route_value,
+                mask=route_mask & (n_block_id == 0),
+            )
 
         a_row = route_id if A_ROW_IS_ROUTE else token_id
         a_base = a_ptr + a_row * stride_am
@@ -523,6 +542,18 @@ def triton_cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _buffers_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Return whether two contiguous tensors cover overlapping bytes."""
+
+    if first.device != second.device:
+        return False
+    first_start = first.data_ptr()
+    second_start = second.data_ptr()
+    first_end = first_start + first.numel() * first.element_size()
+    second_end = second_start + second.numel() * second.element_size()
+    return first_start < second_end and second_start < first_end
+
+
 def launch_decode_gemm(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -539,6 +570,7 @@ def launch_decode_gemm(
     num_experts: int | None = None,
     error: torch.Tensor | None = None,
     write_error: bool | None = None,
+    route_output: torch.Tensor | None = None,
 ) -> None:
     """Launch the FreeToken-style native wide-load NVFP4 GEMV.
 
@@ -548,6 +580,9 @@ def launch_decode_gemm(
     expert IDs and the mapping is performed in this GEMM launch.  This avoids
     a separate route-map launch in decode while retaining the physical-ID
     mode used by grouped callers.
+    ``route_output`` optionally receives the sanitized physical IDs.  It must
+    not alias any GEMV input because every N tile reads its route and weight
+    inputs while the first N tile publishes the route result.
     """
 
     if a.device.type != "cuda":
@@ -564,6 +599,15 @@ def launch_decode_gemm(
         raise ValueError(
             "native NVFP4 route IDs must be contiguous on the input device"
         )
+    if route_output is not None:
+        if route_output.ndim != 2 or route_output.shape != physical_ids.shape:
+            raise ValueError("native NVFP4 route output must match route IDs")
+        if route_output.dtype != torch.int32:
+            raise TypeError("native NVFP4 route output must be int32")
+        if route_output.device != a.device or not route_output.is_contiguous():
+            raise ValueError(
+                "native NVFP4 route output must be contiguous on the input device"
+            )
     if num_rows <= 0:
         raise ValueError("native NVFP4 physical row count must be positive")
     use_map = expert_to_row is not None
@@ -589,6 +633,22 @@ def launch_decode_gemm(
         write_error = error is not None
     if write_error and error is None:
         raise ValueError("inline route mapping requires a sticky error flag")
+    if route_output is not None and any(
+        _buffers_overlap(route_output, tensor)
+        for tensor in (
+            a,
+            packed,
+            block_scale,
+            global_scale,
+            c,
+            topk_weights,
+            physical_ids,
+            expert_to_row,
+            error,
+        )
+        if tensor is not None
+    ):
+        raise ValueError("native NVFP4 route output must not alias GEMV inputs")
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     use_native_scale = fp8_dtype is not None and block_scale.dtype == fp8_dtype
     if block_scale.dtype not in (torch.uint8, fp8_dtype):
@@ -612,6 +672,13 @@ def launch_decode_gemm(
     grid = (total_routes, triton_cdiv(n, block_n))
     map_ptr = physical_ids if expert_to_row is None else expert_to_row
     error_ptr = physical_ids if error is None else error
+    route_output_ptr = physical_ids if route_output is None else route_output
+    route_stride_m = (
+        physical_ids.stride(0) if route_output is None else route_output.stride(0)
+    )
+    route_stride_k = (
+        physical_ids.stride(1) if route_output is None else route_output.stride(1)
+    )
     decode_kernel[grid](
         a,
         packed_i32,
@@ -620,6 +687,7 @@ def launch_decode_gemm(
         c,
         topk_weights,
         physical_ids,
+        route_output_ptr,
         map_ptr,
         error_ptr,
         _e2m1_lut(a.device),
@@ -645,12 +713,15 @@ def launch_decode_gemm(
         topk_weights.stride(1),
         physical_ids.stride(0),
         physical_ids.stride(1),
+        route_stride_m,
+        route_stride_k,
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_KW=block_kw,
         TOP_K=physical_ids.shape[1],
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         USE_MAP=use_map,
+        WRITE_ROUTES=route_output is not None,
         WRITE_ERROR=write_error,
         USE_NATIVE_SCALE=use_native_scale,
         compute_type=_triton_compute_type(c.dtype, tl_module=None),
