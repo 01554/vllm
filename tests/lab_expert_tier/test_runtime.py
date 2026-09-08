@@ -1186,6 +1186,36 @@ class TensorTests(unittest.TestCase):
         bank[rt.TENSORS[2]][0, 0] = 0.0
         self.assertEqual(coordinator.verify_pool()["status"], "pass")
 
+    def test_verify_pool_placement_hash_tracks_tables_not_staging_or_bytes(self):
+        coordinator, tables, bank, tiers = self.make_verify_pool()
+        first = coordinator.verify_pool()["placement"]
+        self.assertEqual(
+            first["ranges"],
+            {"hot_phys": 8, "cold_phys": 8, "row_key_resident": 4, "dtype": "int32"},
+        )
+        # Bank bytes and the staging sentinel range do not enter the hash.
+        bank[rt.TENSORS[0]][0, 0] += 1.0
+        if tables.row_key.shape[0] > 4:
+            tables.row_key[4:] = 7
+        again = coordinator.verify_pool()["placement"]
+        self.assertEqual(again["combined"], first["combined"])
+        if tables.row_key.shape[0] > 4:
+            tables.row_key[4:] = -1
+        bank[rt.TENSORS[0]][0, 0] -= 1.0
+        # Exchanging two resident rows keeps every per-layer count and changes
+        # the hash of both row_key and hot_phys.
+        r0, r1 = int(tables.row_key[0]), int(tables.row_key[1])
+        tables.row_key[0], tables.row_key[1] = r1, r0
+        tables.hot_phys[r0], tables.hot_phys[r1] = 1, 0
+        swapped = coordinator.verify_pool()
+        self.assertEqual(swapped["ownership"]["row_key_hot_mismatch"], 0)
+        self.assertNotEqual(
+            swapped["placement"]["row_key_resident"], first["row_key_resident"]
+        )
+        self.assertNotEqual(swapped["placement"]["hot_phys"], first["hot_phys"])
+        self.assertEqual(swapped["placement"]["cold_phys"], first["cold_phys"])
+        self.assertNotEqual(swapped["placement"]["combined"], first["combined"])
+
     def test_verify_pool_finds_corruption_in_every_tensor_and_names_it(self):
         for k, n in enumerate(rt.TENSORS):
             coordinator, tables, bank, tiers = self.make_verify_pool()

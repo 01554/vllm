@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -2347,6 +2348,33 @@ class TierCoordinator:
         )
         own["cold_phys_mismatch"] = int((expected_C != C).sum())
         report["ownership"] = own
+        # Placement identity: sha256 of the contiguous CPU int32 bytes of each
+        # table over the pool-resident range only (hot_phys[K], cold_phys[K],
+        # row_key[:P]). The staging sentinel range row_key[P:] and the moving
+        # staging bank contents are excluded. Equal hashes at two points mean
+        # no row moved or exchanged, including same-layer exchanges that a
+        # per-layer resident count cannot see.
+        placement: dict[str, Any] = {}
+        for name, table in (
+            ("hot_phys", tables.hot_phys),
+            ("cold_phys", tables.cold_phys),
+            ("row_key_resident", tables.row_key[:P]),
+        ):
+            placement[name] = hashlib.sha256(
+                table.detach().to("cpu").contiguous().numpy().tobytes()
+            ).hexdigest()
+        placement["combined"] = hashlib.sha256(
+            "".join(
+                placement[n] for n in ("hot_phys", "cold_phys", "row_key_resident")
+            ).encode()
+        ).hexdigest()
+        placement["ranges"] = {
+            "hot_phys": K,
+            "cold_phys": K,
+            "row_key_resident": P,
+            "dtype": "int32",
+        }
+        report["placement"] = placement
         ownership_ok = (
             own["hot_out_of_range"] == 0
             and own["row_key_out_of_range"] == 0
