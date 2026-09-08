@@ -51,7 +51,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from ..common.ple import PLEVocabParallelEmbedding
 from . import ple_mmap
 from .ops.ple import ple_conv, ple_gate, ple_ngram_ids
-from .ple_wait import DeferredRows
+from .ple_wait import PLE_DEFERRED_MAX_TOKENS, DeferredRows
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -529,18 +529,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             table = self._require_mmap_embedding().table
             if table is None:
                 raise RuntimeError("Deferred PLE requires an initialized mmap table")
-            self.deferred_rows = DeferredRows(self._mmap_staging[:1], table)
+            deferred_tokens = min(max_num_tokens, PLE_DEFERRED_MAX_TOKENS)
+            self.deferred_rows = DeferredRows(
+                self._mmap_staging[:deferred_tokens], table
+            )
 
     def prepare_deferred_mmap_rows(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        actual_tokens: int | None = None,
+        padded_tokens: int | None = None,
     ) -> None:
         if self.deferred_rows is None:
             raise RuntimeError("Deferred PLE was not initialized")
+        if actual_tokens is None:
+            actual_tokens = int(input_ids.reshape(-1).shape[0])
+        if padded_tokens is None:
+            padded_tokens = actual_tokens
+        if int(input_ids.reshape(-1).shape[0]) != actual_tokens:
+            raise ValueError(
+                "Deferred PLE input IDs must contain exactly the actual rows"
+            )
         ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
-        self.deferred_rows.prepare(ids)
+        self.deferred_rows.prepare(ids, padded_rows=padded_tokens)
 
     def prepare_mmap_rows(
         self,
@@ -583,8 +596,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"PLE mmap: {self.layer_name!r} staging was never initialized"
             )
         self._mmap_staging[:padded_tokens].zero_()
-        if padded_tokens == 1 and self.deferred_rows is not None:
-            self.deferred_rows.prepare_dummy()
+        if (
+            self.deferred_rows is not None
+            and padded_tokens <= self.deferred_rows.capacity
+        ):
+            self.deferred_rows.prepare_dummy(padded_tokens)
 
     def forward(
         self,
@@ -1148,9 +1164,11 @@ __all__ = [
 def qwen4_exp_ple_deferred_rows(output: torch.Tensor, layer_name: str) -> None:
     """Capture stream WAIT/H2D; host completes fills after graph dispatch."""
     context = get_forward_context()
-    if context.cudagraph_runtime_mode == CUDAGraphMode.FULL and output.shape[0] == 1:
+    if context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
         layer = context.no_compile_layers[layer_name]
-        layer.ple_embedding.deferred_rows.consume()
+        deferred_rows = layer.ple_embedding.deferred_rows
+        if deferred_rows is not None and output.shape[0] <= deferred_rows.capacity:
+            deferred_rows.consume(output)
 
 
 def qwen4_exp_ple_deferred_rows_fake(output: torch.Tensor, layer_name: str) -> None:

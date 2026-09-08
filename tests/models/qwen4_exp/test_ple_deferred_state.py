@@ -31,9 +31,46 @@ def load_state():
         def prepare_inputs(self, input_batch, req_states):
             return {}
 
-    namespace: dict[str, Any] = {"Parent": Parent}
+    namespace: dict[str, Any] = {"Parent": Parent, "torch": torch}
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     return namespace["Qwen4ExpModelState"]
+
+
+def load_runner_ple_eligibility():
+    source = Path(__file__).parents[3] / "vllm/v1/worker/gpu/model_runner.py"
+    tree = ast.parse(source.read_text())
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner"
+    )
+    method = next(
+        node
+        for node in runner.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_is_deferred_ple_eligible"
+    )
+    method.decorator_list = []
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+
+    class Modes:
+        FULL = object()
+        NONE = object()
+
+    namespace: dict[str, Any] = {
+        "CUDAGraphMode": Modes,
+        "_PLE_DEFERRED_MAX_TOKENS": 8,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    return namespace["_is_deferred_ple_eligible"], Modes
 
 
 class DeferredStateTests(unittest.TestCase):
@@ -108,6 +145,109 @@ class DeferredStateTests(unittest.TestCase):
         state._mmap_ple_modules[2].prepare_deferred_mmap_rows.assert_not_called()
         for module in state._mmap_ple_modules:
             module.deferred_rows.abort.assert_called_once()
+
+    def test_ngram_context_stops_at_committed_prefix(self):
+        state = self.make_state(0)
+        state.ngram_context = torch.full((1, 2), 99, dtype=torch.int32)
+        state.ngram_context_offsets = torch.tensor([-2, -1], dtype=torch.int64)
+        state.ngram_eos_token_id = 99
+
+        input_batch = SimpleNamespace(
+            num_reqs=1,
+            num_reqs_after_padding=1,
+            idx_mapping=torch.tensor([0], dtype=torch.int32),
+        )
+        all_token_ids = torch.tensor(
+            [[101, 102, 103, 104, 105, 900, 901]], dtype=torch.int32
+        )
+        req_states = SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(
+                gpu=torch.tensor([0], dtype=torch.int32)
+            ),
+            all_token_ids=SimpleNamespace(gpu=all_token_ids),
+        )
+
+        expected = (
+            torch.tensor([99, 99], dtype=torch.int32),
+            torch.tensor([99, 101], dtype=torch.int32),
+            torch.tensor([103, 104], dtype=torch.int32),
+        )
+        for committed, want in zip((0, 1, 4), expected):
+            req_states.num_computed_tokens.gpu[0] = committed
+            before = all_token_ids.clone()
+            actual = state._prepare_ngram_context(input_batch, req_states)
+            self.assertTrue(torch.equal(actual[0], want))
+            self.assertTrue(torch.equal(all_token_ids, before))
+
+        # During verification, the committed boundary advances by the number
+        # of accepted tokens. Rejected candidate rows remain beyond that
+        # boundary and therefore cannot become the next context by accident.
+        for num_rejected, want in (
+            (2, (102, 103)),
+            (1, (103, 104)),
+            (0, (104, 105)),
+        ):
+            committed = 2 + 3 - num_rejected
+            req_states.num_computed_tokens.gpu[0] = committed
+            before = all_token_ids.clone()
+            actual = state._prepare_ngram_context(input_batch, req_states)
+            self.assertEqual(actual[0].tolist(), list(want))
+            self.assertTrue(torch.equal(all_token_ids, before))
+
+    def test_prepare_deferred_uses_real_prefix_and_padded_width(self):
+        state = self.make_state(2)
+        state.uses_ngram_embedding = True
+        state.ple_query_start_loc = torch.zeros(3, dtype=torch.int32)
+        state._prepare_ngram_context = Mock(return_value=torch.zeros((2, 2)))
+        batch = SimpleNamespace(
+            num_reqs_after_padding=2,
+            num_tokens=3,
+            num_tokens_after_padding=8,
+            num_reqs=2,
+            input_ids=torch.tensor([101, 102, 103, 900, 901, 902, 903, 904]),
+            query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+        )
+        for module in state._mmap_ple_modules:
+            module.prepare_deferred_mmap_rows = Mock()
+
+        state.set_deferred_ple_step(True)
+        state.prepare_inputs(batch, None)
+
+        for module in state._mmap_ple_modules:
+            module.prepare_deferred_mmap_rows.assert_called_once()
+            args = module.prepare_deferred_mmap_rows.call_args.args
+            self.assertEqual(args[0].tolist(), [101, 102, 103])
+            self.assertEqual(args[1].tolist(), [0, 1, 3])
+            self.assertEqual(tuple(args[2].shape), (2, 2))
+            self.assertEqual(args[3:], (3, 8))
+
+    def test_runner_deferred_eligibility_covers_small_full_batches(self):
+        eligible, modes = load_runner_ple_eligibility()
+
+        def check(
+            actual: int,
+            padded: int,
+            *,
+            dummy: bool = False,
+            mode: object = modes.FULL,
+            expected: bool,
+        ) -> None:
+            batch = SimpleNamespace(
+                num_tokens=actual,
+                num_tokens_after_padding=padded,
+                num_reqs=2,
+            )
+            descriptor = SimpleNamespace(cg_mode=mode)
+            self.assertIs(eligible(batch, descriptor, dummy), expected)
+
+        for width in (1, 2, 3, 8):
+            check(width, width, expected=True)
+        check(3, 8, expected=True)
+        check(0, 1, expected=False)
+        check(3, 2, expected=False)
+        check(9, 9, expected=False)
+        check(3, 8, dummy=True, expected=False)
+        check(3, 8, mode=modes.NONE, expected=False)
 
     def test_disabled_and_empty_have_no_effect(self):
         for state in (self.make_state(), self.make_state(0)):

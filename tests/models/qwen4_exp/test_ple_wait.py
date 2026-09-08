@@ -52,10 +52,55 @@ class _FakeExtension:
 def _bare_helper(rows: torch.Tensor) -> Any:
     helper = object.__new__(ple_wait.DeferredRows)
     helper.rows = rows
+    helper.capacity = int(rows.shape[0])
+    helper._active_rows = helper.capacity
+    helper._padded_rows = helper.capacity
     return helper
 
 
 class DeferredRowsTests(unittest.TestCase):
+    def test_complete_gathers_only_real_candidate_prefix(self) -> None:
+        calls: list[str] = []
+
+        class RecordingTable:
+            def __init__(self) -> None:
+                self.ids: list[int] | None = None
+
+            def gather(self, ids: Any) -> torch.Tensor:
+                self.ids = ids.reshape(-1).tolist()
+                return torch.arange(12, dtype=torch.float32).reshape(3, 2, 2)
+
+        table = RecordingTable()
+        rows = torch.full((8, 2, 2), -1.0)
+        helper = _bare_helper(rows)
+        helper.table = table
+        helper.ids = torch.zeros((8, 2), dtype=torch.int64)
+        helper.ids[:3].copy_(torch.tensor([[7, 7], [2, 7], [2, 5]], dtype=torch.int64))
+        helper.flag = torch.zeros(1, dtype=torch.int64)
+        helper._ext = _FakeExtension(calls)
+        helper._readback_event = _FakeEvent(calls)
+        helper._pending = True
+        helper._rows_ready = False
+        helper._active_rows = 3
+        helper._padded_rows = 8
+        helper._gate_armed = False
+        helper._reset_queued = True
+        helper._readback_recorded = True
+        helper._prepare_stream = None
+        helper._poisoned = False
+        helper._poison_reason = None
+
+        helper.complete()
+
+        self.assertEqual(table.ids, [7, 7, 2, 7, 2, 5])
+        self.assertTrue(
+            torch.equal(
+                rows[:3], torch.arange(12, dtype=torch.float32).reshape(3, 2, 2)
+            )
+        )
+        self.assertTrue(torch.equal(rows[3:], torch.zeros_like(rows[3:])))
+        self.assertEqual(calls, ["event", "signal"])
+
     def test_raw_uint8_rows_reinterpret_for_bfloat16_and_fp8(self) -> None:
         for dtype in (torch.bfloat16, torch.float8_e4m3fn):
             rows = torch.empty((1, 2, 3), dtype=dtype)
