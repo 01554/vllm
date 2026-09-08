@@ -1075,11 +1075,16 @@ class TensorTests(unittest.TestCase):
         # coalesced (rows 0 and 1 of the source are one run here).
         tier.settings = dataclasses.replace(tier.settings, prefill_stage_copy="memcpy")
         tier.cold_cpu = tier.cold
+        with self.assertRaises(RuntimeError):
+            tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
+        with patch.object(torch.Tensor, "is_pinned", lambda t: True):
+            tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
         for name in rt.TENSORS:
             scratch[name].fill_(-7)
         tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
         for name in rt.TENSORS:
             self.assertEqual(scratch[name][:2].tolist(), tier.cold[name][:2].tolist())
+        tier._stage_source_checked = False
         self.assertEqual(tier.prefill_stage_copies, len(rt.TENSORS))
         tier.settings = dataclasses.replace(tier.settings, prefill_stage_copy="kernel")
         # Marlin chains keep scales on the layer: no staging there.

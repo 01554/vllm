@@ -1322,6 +1322,16 @@ class TierLayer:
         """Host-to-device copies of the pinned source rows into scratch rows
         0..n-1, one copy per run of consecutive source rows, on the current
         stream (ordered before the kernel that reads the scratch)."""
+        if not getattr(self, "_stage_source_checked", False):
+            # A pageable source would silently degrade to a staged copy through
+            # a driver bounce buffer; require the loader's pinned bank.
+            for name in TENSORS:
+                source = self.cold_cpu[name]
+                if source.device.type == "cpu" and not source.is_pinned():
+                    raise RuntimeError(
+                        f"PREFILL_STAGE_COPY=memcpy needs a pinned host bank ({name})"
+                    )
+            self._stage_source_checked = True
         runs: list[list[int]] = []
         for i, row in enumerate(src_rows):
             if runs and row == runs[-1][1] + runs[-1][2]:
