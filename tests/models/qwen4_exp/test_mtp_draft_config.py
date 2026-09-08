@@ -43,10 +43,11 @@ class Config:
     quant_config: object
 
 
+@pytest.mark.parametrize("algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
 @pytest.mark.parametrize("start", [2, 48])
-def test_mixed_fp8_lookup_uses_runtime_mtp_prefix(start):
+def test_mixed_fp8_lookup_uses_runtime_mtp_prefix(start, algo, monkeypatch):
     original = {
-        "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO"},
+        "mtp.layers.0.mlp.experts": {"quant_algo": algo, "group_size": 128},
         "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
     }
     quant = SimpleNamespace(
@@ -88,8 +89,58 @@ def test_mixed_fp8_lookup_uses_runtime_mtp_prefix(start):
     ]
     quant.packed_modules_mapping = {}
     resolve = lookup["_resolve_quant_algo"]
-    assert resolve(quant, f"mtp.layers.{start}.mlp.experts") == "FP8_PB_WO"
+    assert resolve(quant, f"mtp.layers.{start}.mlp.experts") == algo
     assert resolve(quant, "model.layers.0.mlp.experts") == "NVFP4"
+
+    # Reproduce the constructor dispatch that previously returned None and
+    # selected UnquantizedFusedMoEMethod despite the block-FP8 checkpoint.
+    class Experts:
+        moe_config = SimpleNamespace(moe_backend="marlin")
+
+    class OtherLayer:
+        pass
+
+    config_ns = methods(
+        "vllm/model_executor/layers/quantization/fp8.py",
+        {"__init__"},
+        {
+            "super": lambda: SimpleNamespace(__init__=lambda: None),
+            "ACTIVATION_SCHEMES": ["static", "dynamic"],
+        },
+        "Fp8Config",
+    )
+    block_config_cls = type("BlockConfig", (), {"__init__": config_ns["__init__"]})
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.quantization.fp8",
+        SimpleNamespace(
+            Fp8Config=block_config_cls,
+            Fp8MoEMethod=lambda config, layer: (config, layer),
+        ),
+    )
+    dispatch = methods(
+        "vllm/model_executor/layers/quantization/modelopt.py",
+        {"get_quant_method", "has_blocked_weights"},
+        dict(
+            Attention=OtherLayer,
+            LinearBase=OtherLayer,
+            ParallelLMHead=OtherLayer,
+            RoutedExperts=Experts,
+        ),
+        "ModelOptMixedPrecisionConfig",
+    )
+    quant._resolve_quant_algo = lambda prefix: resolve(quant, prefix)
+    quant.is_layer_excluded = lambda prefix: False
+    layer = Experts()
+    block_config, selected_layer = dispatch["get_quant_method"](
+        quant, layer, f"mtp.layers.{start}.mlp.experts"
+    )
+    assert selected_layer is layer
+    assert layer.moe_config.moe_backend == "marlin"
+    assert block_config.is_checkpoint_fp8_serialized
+    assert block_config.weight_block_size == [128, 128]
+    assert block_config.activation_scheme == "dynamic"
+    assert dispatch["has_blocked_weights"](quant)
 
 
 @pytest.mark.parametrize("fail", [False, True])
