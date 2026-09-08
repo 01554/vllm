@@ -132,6 +132,11 @@ class Settings:
     # adapter's fallback); "grouped" calls native_prefill.prefill (grouped
     # GEMM over the same bank and workspace). Decode is unaffected.
     native_prefill: str = "gemv"
+    # Rows at or below this count take the decode GEMV even when the
+    # multi-token path is "grouped": a speculative verify step has
+    # 1 + k <= spec_rows rows and is decode, not prefill. Defaults to
+    # spec_rows (1 without speculation, so the plain decode step only).
+    native_gemv_rows: int = 1
     # Fused per-layer routing record (device observer only): one program
     # writes the observer records, counts, route totals, and the sticky
     # error (including the former device assertion) instead of ~30 small
@@ -211,6 +216,7 @@ class Settings:
             "GLOBAL_POOL",
             "MOE_KERNEL",
             "NATIVE_PREFILL",
+            "NATIVE_GEMV_ROWS",
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
@@ -300,6 +306,11 @@ class Settings:
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
         if native_prefill != "gemv" and moe_kernel != "native":
             raise ValueError("NATIVE_PREFILL requires MOE_KERNEL=native")
+        native_gemv_rows = int(
+            os.environ.get(PREFIX + "NATIVE_GEMV_ROWS", str(spec_rows))
+        )
+        if native_gemv_rows < 1:
+            raise ValueError("NATIVE_GEMV_ROWS must be at least 1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -375,6 +386,7 @@ class Settings:
             global_pool == "1",
             moe_kernel,
             native_prefill,
+            native_gemv_rows,
             record_kernel == "1",
             shared_gate,
             native_output,
@@ -1260,7 +1272,10 @@ class TierLayer:
 
         compute: Any = gemv
         workspace_for = self.native_workspace
-        if x.shape[0] > 1 and self.settings.native_prefill == "grouped":
+        if (
+            x.shape[0] > self.settings.native_gemv_rows
+            and self.settings.native_prefill == "grouped"
+        ):
             from .native_prefill import prefill
 
             compute, workspace_for = prefill, self.native_prefill_workspace
@@ -2976,6 +2991,7 @@ def initialize_model(model, model_config):
                 "source_bank_retained": settings.ram_backing,
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
+                "native_gemv_rows": settings.native_gemv_rows,
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
