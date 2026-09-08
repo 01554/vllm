@@ -314,6 +314,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        # Speculators that draft from the token history (n-gram) read the
+        # request state tensors at their fixed addresses.
+        bind = getattr(self.speculator, "bind_request_states", None)
+        if bind is not None:
+            bind(self.req_states)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
