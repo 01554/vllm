@@ -1834,6 +1834,7 @@ class TierCoordinator:
     def __init__(self, layers, settings, temporary, observer=None):
         self.layers, self.settings, self.temporary = layers, settings, temporary
         self.pool = None
+        self._control_rejected = None
         hot_slots = tuple(layer.hot_slots for layer in layers)
         self.policy = TierPolicy(
             len(layers),
@@ -2402,6 +2403,11 @@ class TierCoordinator:
                             "LAB_EXPERT_TIER_CONTROL %s",
                             json.dumps(applied, sort_keys=True),
                         )
+                    rejected = pool.control_error
+                    if rejected and rejected != self._control_rejected:
+                        # One line per rejected file version; values unchanged.
+                        LOGGER.warning("LAB_EXPERT_TIER_CONTROL_REJECTED %s", rejected)
+                    self._control_rejected = rejected
                 self.stats["pool_resident_per_layer"] = pool.snapshot()
                 self.stats["pool_control"] = pool.control()
             for layer in self.layers:

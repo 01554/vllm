@@ -245,6 +245,22 @@ class GlobalPoolTests(unittest.TestCase):
             os.utime(path, (2, 2))
             self.assertIsNone(pool.poll_control_file(path))
             self.assertEqual(pool.control()["promote_limit"], 2)
+            self.assertIn("control.json", pool.control_error)
+            # An int32 overflow in a later field rejects the whole file: no
+            # exception from the poll and every value unchanged.
+            with open(path, "w") as f:
+                json.dump({"promote_limit": 7, "promote_interval": 2**31}, f)
+            os.utime(path, (3, 3))
+            before = pool.control()
+            self.assertIsNone(pool.poll_control_file(path))
+            self.assertEqual(pool.control(), before)
+            self.assertIn("promote_interval", pool.control_error)
+            with self.assertRaises(ValueError):
+                gp.validate_control({"protect_recent": gp.CONTROL_MAX + 1})
+            self.assertEqual(
+                gp.validate_control({"protect_recent": gp.CONTROL_MAX}),
+                {"protect_recent": gp.CONTROL_MAX},
+            )
 
     def test_no_victim_falls_back_to_staging(self):
         pool, sources, buffers = self.setup(layers=1, experts=4, slots=(2,), staging=3)

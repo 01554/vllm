@@ -161,6 +161,7 @@ def set_gate(tables, enabled):
     tables.gate.fill_(1 if enabled else 0)
 
 
+CONTROL_MAX = 2**31 - 1  # device scalars are int32
 CONTROL_FIELDS = (
     "promote_limit",
     "promote_interval",
@@ -178,6 +179,8 @@ def validate_control(values):
             raise ValueError(f"Unknown pool control {name!r}")
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"Pool control {name} must be an integer")
+        if not 0 <= value <= CONTROL_MAX:
+            raise ValueError(f"Pool control {name} outside [0, {CONTROL_MAX}]")
         if name == "promote_limit" and value < 0:
             raise ValueError("promote_limit must be nonnegative")
         if name in ("promote_interval", "promote_min_misses") and value < 1:
@@ -670,8 +673,9 @@ class GlobalPool:
         """Apply a JSON control file if it changed and is valid.
 
         Returns the applied values, or None when unchanged, missing, or
-        invalid (invalid or partial content keeps the previous values and
-        is reported once per file version).
+        invalid (invalid or partial content keeps the previous values; the
+        reason is kept in `control_error` for the caller to report once per
+        file version).
         """
         import json
         import os
@@ -691,10 +695,14 @@ class GlobalPool:
                 raise ValueError("control file must hold a JSON object")
             validated = validate_control(values)
         except (OSError, ValueError) as error:
-            self._control_error = str(error)
+            self._control_error = f"{path}: {error}"
             return None
         self._control_error = None
         return set_control(self.tables, **validated)
+
+    @property
+    def control_error(self):
+        return self._control_error
 
 
 def copy_in(source, bank, buffers):
@@ -717,6 +725,7 @@ __all__ = [
     "copy_in",
     "resident_per_layer",
     "CONTROL_FIELDS",
+    "CONTROL_MAX",
     "read_control",
     "validate_control",
     "set_control",
