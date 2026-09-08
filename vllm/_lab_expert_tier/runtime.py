@@ -1212,7 +1212,11 @@ class TierLayer:
                 workspace_for(tensors),
                 activation=self.native_activation(),
             )
-            if len(partitions) == 1 and self.settings.native_output == "alias":
+            if (
+                len(partitions) == 1
+                and x.shape[0] == 1
+                and self.settings.native_output == "alias"
+            ):
                 # Consumed by the runner's out-of-place add (or the next
                 # layer's combine) before the next gemv rewrites it.
                 return out

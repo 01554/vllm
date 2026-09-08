@@ -1942,7 +1942,10 @@ class TensorTests(unittest.TestCase):
         )
         with patch.object(native_nvfp4, "gemv", fake_gemv):
             aliased = layer._run_marlin_chains(
-                x, weights, ids, ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),)
+                x[:1],
+                weights[:1],
+                ids[:1],
+                ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),),
             )
             two = layer._run_marlin_chains(
                 x,
@@ -1955,6 +1958,15 @@ class TensorTests(unittest.TestCase):
             )
         self.assertIs(aliased, output)
         self.assertIsNot(two, output)
+        # Only batch-1 decode aliases: a multi-row single-partition call copies.
+        with patch.object(native_nvfp4, "gemv", fake_gemv):
+            multi = layer._run_marlin_chains(
+                torch.ones(4, 3, dtype=torch.bfloat16),
+                torch.ones(4, 2),
+                torch.tensor([[0, 1]] * 4, dtype=torch.int32),
+                ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),),
+            )
+        self.assertIsNot(multi, output)
         env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_OUTPUT": "steal"}
         with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
