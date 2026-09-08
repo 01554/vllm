@@ -2098,6 +2098,17 @@ class TierCoordinator:
             raise ValueError("Token count changed within a model forward")
         self.adopt_stream(stream, tier.index == 0)
         if (
+            tier.index == 0
+            and getattr(self.settings, "verify_file", "")
+            and not _is_capturing(tier.device)
+        ):
+            # A pending verification runs here: after the stream is adopted
+            # and any in-flight exchange is settled, before this forward's
+            # pool step. Eager forwards only (a replay runs no layer Python);
+            # the probe request must force an eager prefill (unique prompt).
+            self.settle_pending(wait=True)
+            self.poll_verify_file(force_cadence=True, entry="begin_layer")
+        if (
             x.ndim != 2
             or ids.ndim != 2
             or weights.shape != ids.shape
@@ -2217,11 +2228,14 @@ class TierCoordinator:
         if result is not None:
             self._consume(result, plan)
 
-    def poll_verify_file(self):
-        """Run a pool verification when the trigger file's mtime changed
-        (checked every 16 forwards; the check itself is one stat call)."""
+    def poll_verify_file(self, force_cadence=False, entry="finish"):
+        """Run a pool verification when the trigger file's mtime changed.
+
+        Polled at the end of every 16th forward (one stat call) and, with
+        `force_cadence`, at layer 0 of every eager forward, so "touch, then
+        send any request" checks the state the previous request left."""
         path = getattr(self.settings, "verify_file", "")
-        if not path or self.stats["model_forwards"] % 16:
+        if not path or (not force_cadence and self.stats["model_forwards"] % 16):
             return None
         import os
 
@@ -2232,27 +2246,126 @@ class TierCoordinator:
         if version == self._verify_version:
             return None
         self._verify_version = version
-        return self.verify_pool()
+        return self.verify_pool(entry=entry, trigger_version=version)
 
-    def verify_pool(self):
-        """Compare every resident expert row of every layer's device bank with
-        the host source row (RAM backing: source row = expert id), bytewise,
-        on the current stream; log and return the per-layer mismatch counts.
-        Runs at a forward boundary only, never inside a capture."""
+    def verify_pool(self, entry="direct", trigger_version=None):
+        """Read-only steady-state check of the global pool at a forward
+        boundary. Ownership: every pool row holds exactly one key and the
+        maps agree (hot_phys / row_key bijection over the pool rows,
+        cold_phys consistent). Bytes: every resident expert row of the device
+        bank equals its host source row, compared as raw bytes (uint8 view:
+        NaN payloads compare equal only when identical, +0/-0 differ). Logs
+        LAB_EXPERT_TIER_VERIFY_POOL and returns the report with a status of
+        "pass" (all checks done on all pool rows, no finding), "fail"
+        (any finding), or "skipped" (preconditions not met). Nothing in the
+        bank or the tables is modified; nothing is repaired."""
         import torch
 
-        if _is_capturing(self.device):
-            raise RuntimeError("Pool verification cannot run during graph capture")
+        # entry: "begin_layer" = the state the previous request left (before
+        # this forward's pool step); "finish" = after the forward that hit the
+        # cadence; "direct" = called by code. ACK for a probe run: entry ==
+        # begin_layer, status == pass, checked_rows == pool_rows > 0.
         report: dict[str, Any] = {
             "forwards": int(self.stats["model_forwards"]),
-            "layers": {},
+            "entry": entry,
+            "trigger_version": trigger_version,
+            "status": "skipped",
         }
-        total = checked = 0
+        if _is_capturing(self.device):
+            raise RuntimeError("Pool verification cannot run during graph capture")
+        pool = getattr(self, "pool", None)
+        settings = self.settings
+        if pool is None or not getattr(settings, "global_pool", False):
+            report["reason"] = "global pool not active"
+            self._log_verify(report)
+            return report
+        if not getattr(settings, "ram_backing", False):
+            report["reason"] = "RAM_BACKING required (source row = expert id)"
+            self._log_verify(report)
+            return report
+        tables = pool.tables
+        num_layers, num_experts, P = (
+            tables.num_layers,
+            tables.num_experts,
+            int(tables.pool_rows),
+        )
+        K = num_layers * num_experts
+        # Table shapes/dtypes before any slicing: a wrong table is a finding,
+        # not something to reinterpret.
+        shape_ok = (
+            P > 0
+            and tuple(tables.hot_phys.shape) == (K,)
+            and tuple(tables.cold_phys.shape) == (K,)
+            and tables.row_key.dim() == 1
+            and tables.row_key.shape[0] >= P
+            and tables.hot_phys.dtype
+            == tables.cold_phys.dtype
+            == tables.row_key.dtype
+            == torch.int32
+        )
+        if not shape_ok:
+            report.update(
+                status="fail",
+                reason="pool table shape/dtype",
+                pool_rows=P,
+                shapes={
+                    "hot_phys": list(tables.hot_phys.shape),
+                    "cold_phys": list(tables.cold_phys.shape),
+                    "row_key": list(tables.row_key.shape),
+                },
+            )
+            self._log_verify(report)
+            self.stats["verify_pool_runs"] += 1
+            self.stats["verify_pool_failures"] += 1
+            return report
+        H = tables.hot_phys.long()
+        C = tables.cold_phys.long()
+        R = tables.row_key[:P].long()
+        staging_keys = tables.row_key[P:].long()
+        own: dict[str, int] = {}
+        own["staging_rows_nonfree"] = int((staging_keys != -1).sum())
+        own["hot_out_of_range"] = int(((H < -1) | (H >= P)).sum())
+        own["row_key_out_of_range"] = int(((R < 0) | (R >= K)).sum())
+        valid_R = R[(R >= 0) & (R < K)]
+        own["row_key_duplicates"] = int(valid_R.numel() - torch.unique(valid_R).numel())
+        own["unfilled_rows"] = int((R < 0).sum())
+        # forward: each filled row's key must point back at that row
+        filled = torch.nonzero((R >= 0) & (R < K)).flatten()
+        own["row_key_hot_mismatch"] = (
+            int((H[R[filled]] != filled).sum()) if filled.numel() else 0
+        )
+        # reverse: each resident key's row must hold that key
+        resident = torch.nonzero((H >= 0) & (H < P)).flatten()
+        own["resident_keys"] = int(resident.numel())
+        own["hot_row_key_mismatch"] = (
+            int((R[H[resident]] != resident).sum()) if resident.numel() else 0
+        )
+        expected_C = torch.where(
+            H >= 0,
+            torch.full_like(C, -1),
+            torch.arange(K, device=C.device) % num_experts,
+        )
+        own["cold_phys_mismatch"] = int((expected_C != C).sum())
+        report["ownership"] = own
+        ownership_ok = (
+            own["hot_out_of_range"] == 0
+            and own["row_key_out_of_range"] == 0
+            and own["row_key_duplicates"] == 0
+            and own["unfilled_rows"] == 0
+            and own["row_key_hot_mismatch"] == 0
+            and own["hot_row_key_mismatch"] == 0
+            and own["cold_phys_mismatch"] == 0
+            and own["resident_keys"] == P
+            and own["staging_rows_nonfree"] == 0
+        )
+        # bytes: per layer, resident experts vs host source rows, raw bytes
+        layers_report: dict[int, Any] = {}
+        checked = mismatched = tensors_done = 0
         for tier in self.layers:
             hot_map = tier.hot_map
             if hot_map is None:
                 continue
-            experts = torch.nonzero(hot_map >= 0).flatten()
+            experts = torch.nonzero((hot_map >= 0) & (hot_map < P)).flatten()
             if experts.numel() == 0:
                 continue
             rows = hot_map[experts].long()
@@ -2261,26 +2374,51 @@ class TierCoordinator:
                 bank = tier.hot
             bad = torch.zeros(experts.numel(), dtype=torch.bool, device=experts.device)
             for name in TENSORS:
-                # Read-only: index_select copies; nothing in the bank or the
-                # maps is touched, and no mismatch is repaired here.
-                device_rows = bank[name].index_select(0, rows)
-                source_rows = tier.cold[name].index_select(0, experts.long())
-                bad |= (device_rows != source_rows).flatten(1).any(1)
+                device_rows = bank[name].index_select(0, rows).contiguous()
+                source_rows = (
+                    tier.cold[name].index_select(0, experts.long()).contiguous()
+                )
+                db = device_rows.view(torch.uint8).reshape(device_rows.shape[0], -1)
+                sb = source_rows.view(torch.uint8).reshape(source_rows.shape[0], -1)
+                bad |= (db != sb).any(1)
+                tensors_done += 1
             count = int(bad.sum())
             checked += int(experts.numel())
-            total += count
+            mismatched += count
             if count:
-                report["layers"][tier.index] = {
+                layers_report[tier.index] = {
                     "mismatched": count,
                     "experts": experts[bad][:8].tolist(),
                     "rows": rows[bad][:8].tolist(),
                 }
-        report["checked_rows"] = checked
-        report["mismatched_rows"] = total
-        LOGGER.warning("LAB_EXPERT_TIER_VERIFY_POOL %s", json.dumps(report))
+        report.update(
+            pool_rows=P,
+            checked_rows=checked,
+            mismatched_rows=mismatched,
+            tensors_compared=tensors_done,
+            layers=layers_report,
+        )
+        bytes_ok = (
+            mismatched == 0
+            and checked == P
+            and tensors_done
+            == len(TENSORS)
+            * sum(
+                1
+                for t in self.layers
+                if t.hot_map is not None
+                and int(((t.hot_map >= 0) & (t.hot_map < P)).sum())
+            )
+        )
+        report["status"] = "pass" if (ownership_ok and bytes_ok) else "fail"
+        self._log_verify(report)
         self.stats["verify_pool_runs"] += 1
-        self.stats["verify_pool_mismatched_rows"] += total
+        self.stats["verify_pool_mismatched_rows"] += mismatched
+        self.stats["verify_pool_failures"] += int(report["status"] == "fail")
         return report
+
+    def _log_verify(self, report):
+        LOGGER.warning("LAB_EXPERT_TIER_VERIFY_POOL %s", json.dumps(report))
 
     def _finish_forward(self, rows, valid_rows=None, is_decode=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
