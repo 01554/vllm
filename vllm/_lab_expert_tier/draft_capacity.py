@@ -12,8 +12,11 @@ in for either:
   safetensors headers (tensors under the draft prefix), reported as the
   reservation;
 - `measure_resident_bytes`: after the draft loads, the unique device
-  storage of its parameters and buffers, with storage shared with the
-  target (embedding, lm_head) counted separately and not charged twice.
+  storage of its parameters (checked against the header estimate; backend
+  conversion such as Marlin scale expansion is the expected excess) and,
+  separately, of its buffers (rotary caches, routing scratch: resident but
+  not in the checkpoint), with storage shared with the target (embedding,
+  lm_head) counted apart and not charged twice.
 
 `VRAM_BUDGET_GIB` (optional) is a check, not a source of bytes: when set,
 tier bytes + the estimate must fit it before the draft loads.
@@ -79,9 +82,10 @@ def measure_resident_bytes(model: Any, shared_with: Any = None) -> dict[str, Any
             foreign.add(tensor.untyped_storage().data_ptr())
     seen: dict[int, int] = {}
     shared: dict[int, int] = {}
+    buffers: dict[int, int] = {}
     by_dtype: dict[str, int] = {}
     host = 0
-    for tensor in _tensors(model):
+    for tensor, is_buffer in _tensors(model, tagged=True):
         storage = tensor.untyped_storage()
         if tensor.device.type == "cpu":
             host += storage.nbytes()
@@ -89,12 +93,17 @@ def measure_resident_bytes(model: Any, shared_with: Any = None) -> dict[str, Any
         key = storage.data_ptr()
         if key in foreign:
             shared[key] = storage.nbytes()
+        elif is_buffer:
+            if key not in seen:
+                buffers[key] = storage.nbytes()
         elif key not in seen:
             seen[key] = storage.nbytes()
+            buffers.pop(key, None)
             dtype = str(tensor.dtype).removeprefix("torch.")
             by_dtype[dtype] = by_dtype.get(dtype, 0) + storage.nbytes()
     return {
         "unique_bytes": sum(seen.values()),
+        "buffer_bytes": sum(buffers.values()),
         "shared_bytes": sum(shared.values()),
         "host_bytes": host,
         "storages": len(seen),
@@ -102,14 +111,17 @@ def measure_resident_bytes(model: Any, shared_with: Any = None) -> dict[str, Any
     }
 
 
-def _tensors(module: Any) -> Iterable[Any]:
-    yield from module.parameters()
-    yield from module.buffers()
+def _tensors(module: Any, tagged: bool = False) -> Iterable[Any]:
+    for parameter in module.parameters():
+        yield (parameter, False) if tagged else parameter
+    for buffer in module.buffers():
+        yield (buffer, True) if tagged else buffer
 
 
 def check_estimate(estimate: dict[str, Any], measured: dict[str, Any], tolerance):
-    """Measured unique bytes must not exceed the reservation by more than
-    `tolerance` (fraction); a shortfall is reported, never an error."""
+    """Measured unique parameter bytes must not exceed the reservation by
+    more than `tolerance` (fraction); a shortfall is reported, never an
+    error. Buffers are resident on top of both and reported as such."""
     reserved = int(estimate["bytes"])
     unique = int(measured["unique_bytes"])
     excess = unique - reserved
@@ -117,7 +129,12 @@ def check_estimate(estimate: dict[str, Any], measured: dict[str, Any], tolerance
         raise RuntimeError(
             f"Draft resident bytes {unique} exceed the reservation {reserved}"
         )
-    return {"reserved_bytes": reserved, "excess_bytes": excess}
+    resident = unique + int(measured.get("buffer_bytes", 0))
+    return {
+        "reserved_bytes": reserved,
+        "excess_bytes": excess,
+        "resident_bytes": resident,
+    }
 
 
 __all__ = [

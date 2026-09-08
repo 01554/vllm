@@ -96,8 +96,10 @@ class EstimateTests(unittest.TestCase):
     def test_check_estimate_allows_tolerance_and_reports_shortfall(self):
         estimate = {"bytes": 1000}
         self.assertEqual(
-            dc.check_estimate(estimate, {"unique_bytes": 1040}, 0.05),
-            {"reserved_bytes": 1000, "excess_bytes": 40},
+            dc.check_estimate(
+                estimate, {"unique_bytes": 1040, "buffer_bytes": 500}, 0.05
+            ),
+            {"reserved_bytes": 1000, "excess_bytes": 40, "resident_bytes": 1540},
         )
         self.assertEqual(
             dc.check_estimate(estimate, {"unique_bytes": 900}, 0.0)["excess_bytes"],
@@ -122,9 +124,11 @@ class ResidentTests(unittest.TestCase):
             torch.Tensor, "device", property(lambda t: torch.device("meta"))
         ):
             measured = dc.measure_resident_bytes(draft, shared_with=target)
-        self.assertEqual(measured["unique_bytes"], 8 * 4 + 2 * 4)
+        self.assertEqual(measured["unique_bytes"], 8 * 4)
+        self.assertEqual(measured["buffer_bytes"], 2 * 4)
         self.assertEqual(measured["shared_bytes"], 16 * 4)
-        self.assertEqual(measured["storages"], 2)
+        self.assertEqual(measured["storages"], 1)
+        self.assertEqual(measured["by_dtype"], {"float32": 32})
         host = dc.measure_resident_bytes(draft, shared_with=target)
         self.assertEqual((host["unique_bytes"], host["host_bytes"]), (0, 104))
 
