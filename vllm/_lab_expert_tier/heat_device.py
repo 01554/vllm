@@ -181,6 +181,7 @@ class DeviceHeatAccumulator:
         *,
         decay: float = 0.999,
         sync_period: int = 50,
+        max_step_tokens: int = 1,
         initial_scores: Sequence[Sequence[float]] | torch.Tensor | None = None,
         device: torch.device | str | None = None,
         top_k: int | None = None,
@@ -198,6 +199,7 @@ class DeviceHeatAccumulator:
         if self.decay > 1.0:
             raise ValueError("decay must be <= 1")
         self.sync_period = _integer("sync_period", sync_period, 0)
+        self.max_step_tokens = _integer("max_step_tokens", max_step_tokens, 1)
         self.top_k = None if top_k is None else _integer("top_k", top_k, 1)
         self.max_rows = None if max_rows is None else _integer("max_rows", max_rows, 1)
         if not isinstance(enabled, bool):
@@ -658,7 +660,9 @@ class DeviceHeatAccumulator:
 
     def should_snapshot(self) -> bool:
         """Return whether a due snapshot may be emitted at this boundary."""
-        return self._host_due and self._host_last_step_tokens == 1
+        return (
+            self._host_due and 0 < self._host_last_step_tokens <= self.max_step_tokens
+        )
 
     def _copy_heat_to_tuple(self) -> tuple[tuple[float, ...], ...]:
         # This is the only heat D2H path.  The clone and nested tuples ensure
@@ -717,7 +721,7 @@ class DeviceHeatAccumulator:
         The default mode leaves cadence ownership with policy ``rebase`` for
         compatibility with the exchange observer.  Promote has no placement
         commit to advance that clock, so observation-only mode consumes a due
-        boundary only for an eligible single-token snapshot.  A later crossed
+        boundary only for an eligible bounded-row snapshot.  A later crossed
         boundary remains due when acknowledgement is delayed.
         """
         if snapshot.session_id != self.session_id:
@@ -730,7 +734,8 @@ class DeviceHeatAccumulator:
         if (
             self._observation_only
             and snapshot.resync_due is True
-            and snapshot.last_step_tokens == 1
+            and snapshot.last_step_tokens is not None
+            and 0 < snapshot.last_step_tokens <= self.max_step_tokens
             and self._host_due
             and self.sync_period > 0
         ):
@@ -790,6 +795,7 @@ class DeviceObserver:
         *,
         decay: float = 0.999,
         sync_period: int = 50,
+        max_step_tokens: int = 1,
         initial_scores: Sequence[Sequence[float]] | torch.Tensor | None = None,
         session_id: str | int | None = None,
         observation_only: bool = False,
@@ -802,6 +808,7 @@ class DeviceObserver:
         )
         self._decay = _number("decay", decay)
         self._sync_period = _integer("sync_period", sync_period, 0)
+        self._max_step_tokens = _integer("max_step_tokens", max_step_tokens, 1)
         self._initial_scores = initial_scores
         self._session_id = session_id
         if not isinstance(observation_only, bool):
@@ -896,6 +903,7 @@ class DeviceObserver:
                 self._num_experts,
                 decay=self._decay,
                 sync_period=self._sync_period,
+                max_step_tokens=self._max_step_tokens,
                 initial_scores=self._initial_scores,
                 device=device,
                 top_k=top_k,

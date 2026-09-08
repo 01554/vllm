@@ -267,6 +267,48 @@ class DeviceHeatTests(unittest.TestCase):
         self.assertEqual(accumulator.base_last_sync_tokens, 0)
         self.assertFalse(accumulator.resync_due)
 
+    def test_multirow_snapshot_cadence_consumes_only_eligible_boundaries(self):
+        for rows in (2, 3, 8):
+            with self.subTest(rows=rows):
+                accumulator = DeviceHeatAccumulator(
+                    1,
+                    2,
+                    sync_period=4,
+                    top_k=1,
+                    max_rows=8,
+                    max_step_tokens=rows,
+                    observation_only=True,
+                )
+                snapshots = []
+                for step in range(1, 13):
+                    _record(
+                        accumulator,
+                        [[[0]] * rows],
+                        [[[True]] * rows],
+                        [True] * rows,
+                        rows,
+                    )
+                    snapshot = accumulator.snapshot()
+                    previous = (step - 1) * rows // 4
+                    current = step * rows // 4
+                    self.assertEqual(snapshot is not None, current > previous)
+                    if snapshot is not None:
+                        snapshots.append(snapshot.tokens)
+                        accumulator.acknowledge_snapshot(snapshot)
+                        accumulator.rebase(
+                            tokens_total=step * rows, version=7, last_sync_tokens=0
+                        )
+                        self.assertFalse(accumulator.resync_due)
+                self.assertTrue(snapshots)
+
+    def test_default_snapshot_bound_still_defers_multirow(self):
+        accumulator = DeviceHeatAccumulator(
+            1, 2, sync_period=2, top_k=1, max_rows=2, observation_only=True
+        )
+        _record(accumulator, [[[0], [1]]], [[[True], [True]]], [True, True], 2)
+        self.assertIsNone(accumulator.snapshot())
+        self.assertTrue(accumulator.resync_due)
+
     def test_observation_only_prefill_flush_defers_due_until_first_decode(self):
         accumulator = DeviceHeatAccumulator(
             1,
