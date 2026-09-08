@@ -166,7 +166,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             )
             logger.info(
                 "PLE mmap deferred enabled: %d layers, pinned_bytes=%d; "
-                "FULL graph with one real token only, eager/prefill unchanged",
+                "FULL graph batches with padded rows <=8; "
+                "larger batches and eager use synchronous preparation",
                 len(deferred),
                 pinned_bytes,
             )
@@ -303,6 +304,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
                             actual_input_ids,
                             actual_query_start_loc,
                             actual_ngram_context,
+                            actual_tokens,
+                            padded_tokens,
                         )
                     else:
                         module.prepare_mmap_rows(
