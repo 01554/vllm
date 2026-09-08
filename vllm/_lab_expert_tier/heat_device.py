@@ -68,6 +68,7 @@ class DeviceSnapshot:
     route_total: int = 0
     verified: bool = True
     last_step_tokens: int | None = None
+    is_decode: bool | None = None
     base_tokens_total: int | None = None
     base_version: int | None = None
     base_last_sync_tokens: int | None = None
@@ -302,6 +303,7 @@ class DeviceHeatAccumulator:
         self._host_tokens_total = self._base_tokens_total
         self._host_last_sync_tokens = self._base_last_sync_tokens
         self._host_last_step_tokens = 0
+        self._host_is_decode: bool | None = None
         self._host_forwards = 0
         self._host_route_total = 0
         self._host_due = False
@@ -554,9 +556,18 @@ class DeviceHeatAccumulator:
             )
         self._expected_layer.add_(1)
 
-    def finish_step(self, num_tokens: int, *, heat_enabled: bool | None = None) -> None:
+    def finish_step(
+        self,
+        num_tokens: int,
+        *,
+        heat_enabled: bool | None = None,
+        is_decode: bool | None = None,
+    ) -> None:
         """Finish one complete model step using the known true-token count."""
         num_tokens = _integer("num_tokens", num_tokens, 0)
+        if is_decode is not None and not isinstance(is_decode, bool):
+            raise ValueError("is_decode must be bool or None")
+        self._host_is_decode = is_decode
         if heat_enabled is not None:
             self._set_gate(heat_enabled)
 
@@ -661,7 +672,11 @@ class DeviceHeatAccumulator:
     def should_snapshot(self) -> bool:
         """Return whether a due snapshot may be emitted at this boundary."""
         return (
-            self._host_due and 0 < self._host_last_step_tokens <= self.max_step_tokens
+            self._host_due
+            and self._host_is_decode is not False
+            and 0
+            < self._host_last_step_tokens
+            <= (self.max_step_tokens if self._host_is_decode is True else 1)
         )
 
     def _copy_heat_to_tuple(self) -> tuple[tuple[float, ...], ...]:
@@ -691,6 +706,7 @@ class DeviceHeatAccumulator:
             route_total=route_total_total,
             verified=not invalid,
             last_step_tokens=self._host_last_step_tokens,
+            is_decode=self._host_is_decode,
             base_tokens_total=self._base_tokens_total,
             base_version=self._base_version,
             base_last_sync_tokens=self._base_last_sync_tokens,
@@ -735,7 +751,10 @@ class DeviceHeatAccumulator:
             self._observation_only
             and snapshot.resync_due is True
             and snapshot.last_step_tokens is not None
-            and 0 < snapshot.last_step_tokens <= self.max_step_tokens
+            and snapshot.is_decode is not False
+            and 0
+            < snapshot.last_step_tokens
+            <= (self.max_step_tokens if snapshot.is_decode is True else 1)
             and self._host_due
             and self.sync_period > 0
         ):
@@ -1015,6 +1034,7 @@ class DeviceObserver:
         heat_enabled: bool,
         stream: Any = None,
         num_experts: int | None = None,
+        is_decode: bool | None = None,
     ) -> DeviceSnapshot | Deferred:
         """Finish a model boundary and return a snapshot, legacy result, or defer."""
         rows = _integer("rows", rows, 1)
@@ -1055,7 +1075,9 @@ class DeviceObserver:
                 )
         self._recorded_layers = 0
         self._hot_maps.clear()
-        accumulator.finish_step(valid_rows, heat_enabled=heat_enabled)
+        accumulator.finish_step(
+            valid_rows, heat_enabled=heat_enabled, is_decode=is_decode
+        )
         if not heat_enabled:
             return Deferred()
         if accumulator.should_snapshot():
