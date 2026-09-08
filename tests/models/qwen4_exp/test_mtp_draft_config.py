@@ -3,6 +3,7 @@
 """CPU contract tests using real methods without CUDA model imports."""
 
 import ast
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,10 +93,23 @@ def test_mixed_fp8_lookup_uses_runtime_mtp_prefix(start):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_mtp_load_scope_covers_loader_and_restores_on_error(fail):
+def test_mtp_load_scope_covers_loader_and_restores_on_error(fail, monkeypatch):
     from vllm._lab_expert_tier.draft_scope import is_draft_load_scope
 
     model = SimpleNamespace(model=SimpleNamespace())
+    target_model = object()
+    recorded = []
+
+    def record(target, draft):
+        assert not is_draft_load_scope()
+        assert target is target_model and draft is model
+        recorded.append(draft)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm._lab_expert_tier.runtime",
+        SimpleNamespace(record_draft_model=record),
+    )
 
     def load(target, config):
         assert is_draft_load_scope()
@@ -113,7 +127,8 @@ def test_mtp_load_scope_covers_loader_and_restores_on_error(fail):
     assert not is_draft_load_scope()
     if fail:
         with pytest.raises(ValueError, match="load failed"):
-            ns["load_draft_model"](speculator, object(), set())
+            ns["load_draft_model"](speculator, target_model, set())
     else:
-        assert ns["load_draft_model"](speculator, object(), set()) is model
+        assert ns["load_draft_model"](speculator, target_model, set()) is model
+    assert recorded == ([] if fail else [model])
     assert not is_draft_load_scope()
