@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
 
+import json
 from typing import Any
 
 import torch
@@ -263,6 +264,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
             for module in self._mmap_ple_modules:
                 assert module.deferred_rows is not None
                 module.deferred_rows.complete()
+            # Release every captured WAIT before diagnostic synchronization.
+            for module in self._mmap_ple_modules:
+                assert module.deferred_rows is not None
+                report = module.deferred_rows.verify_consumed_rows()
+                if report is not None:
+                    report["layer"] = module.layer_name
+                    logger.warning("LAB_PLE_DEFERRED_VERIFY %s", json.dumps(report))
         except BaseException:
             self.abort_deferred_ple()
             raise

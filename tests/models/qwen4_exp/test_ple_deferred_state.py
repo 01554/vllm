@@ -79,6 +79,8 @@ class DeferredStateTests(unittest.TestCase):
         state._mmap_ple_modules = tuple(
             SimpleNamespace(deferred_rows=Mock()) for _ in range(count)
         )
+        for module in state._mmap_ple_modules:
+            module.deferred_rows.verify_consumed_rows.return_value = None
         state._deferred_ple_step = False
         state._deferred_ple_poisoned = False
         return state
@@ -94,6 +96,22 @@ class DeferredStateTests(unittest.TestCase):
         state.set_deferred_ple_step(True)
         self.assertTrue(state._deferred_ple_step)
 
+    def test_verify_waits_until_all_fills_are_released(self):
+        state = self.make_state()
+        calls = []
+        for i, module in enumerate(state._mmap_ple_modules):
+            module.deferred_rows.complete.side_effect = lambda i=i: calls.append(
+                ("fill", i)
+            )
+            module.deferred_rows.verify_consumed_rows.side_effect = lambda i=i: (
+                calls.append(("verify", i))
+            )
+        state.set_deferred_ple_step(True)
+        state.complete_deferred_ple()
+        self.assertEqual(
+            calls, [("fill", i) for i in range(3)] + [("verify", i) for i in range(3)]
+        )
+
     def test_fill_failure_releases_unvisited_layers_and_poison_latches(self):
         state = self.make_state()
         state._mmap_ple_modules[0].deferred_rows.complete.side_effect = ValueError(
@@ -104,6 +122,7 @@ class DeferredStateTests(unittest.TestCase):
             state.complete_deferred_ple()
         for module in state._mmap_ple_modules:
             module.deferred_rows.abort.assert_called_once()
+            module.deferred_rows.verify_consumed_rows.assert_not_called()
         state._mmap_ple_modules[1].deferred_rows.complete.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "poisoned"):
             state.set_deferred_ple_step(False)

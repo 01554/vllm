@@ -17,7 +17,9 @@ FreeToken build.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 from contextlib import suppress
 from typing import Any
 
@@ -164,6 +166,9 @@ class DeferredRows:
         self._reset_queued = False
         self._readback_recorded = False
         self._prepare_stream: Any | None = None
+        self._verify_enabled = os.environ.get("VLLM_PLE_DEFERRED_VERIFY") == "1"
+        self._verify_ids: torch.Tensor | None = None
+        self._verify_step = 0
         self._poisoned = False
         self._poison_reason: BaseException | None = None
 
@@ -338,6 +343,9 @@ class DeferredRows:
             self._reset_queued = True
             self._active_rows = actual_rows
             self._padded_rows = padded_rows
+            if getattr(self, "_verify_enabled", False):
+                self._verify_ids = ids.detach().clone()
+                self._verify_step += 1
             self.ids[:actual_rows].copy_(ids, non_blocking=True)
             self.ids[actual_rows:].zero_()
             self._readback_event.record(stream)
@@ -454,6 +462,50 @@ class DeferredRows:
         except BaseException as exc:
             self._poison(exc)
             raise
+
+    def verify_consumed_rows(self) -> dict[str, Any] | None:
+        """Inspect staging after ALL layer fills have released their WAITs.
+
+        This opt-in synchronization changes timing; a pass cannot exclude races
+        in uninstrumented runs. Production rows/flags are never modified. ID
+        generation is shared with production, not independently validated.
+        """
+        if not getattr(self, "_verify_enabled", False):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PLE verification cannot run during capture")
+        if self._pending or self._verify_ids is None or self._active_rows <= 0:
+            raise RuntimeError("PLE verification has no completed real step")
+        torch.accelerator.synchronize(self.destination.device)
+        actual, padded = self._active_rows, self._padded_rows
+        ids = self._verify_ids.cpu().contiguous()
+        gathered = self.table.gather(ids.numpy().reshape(-1))
+        raw = torch.as_tensor(gathered).contiguous().view(torch.uint8).reshape(-1)
+        consumed = self.destination[:padded].cpu().contiguous()
+        observed = consumed[:actual].view(torch.uint8).reshape(actual, -1)
+        if raw.numel() != observed.numel():
+            raise RuntimeError("PLE verification raw byte size mismatch")
+        bad = (observed != raw.reshape_as(observed)).any(dim=1)
+        padding_bad = bool(consumed[actual:].view(torch.uint8).any())
+        id_bad = (ids != self.ids[:actual]).any(dim=1)
+        report = {
+            "status": "fail"
+            if bool(bad.any() or id_bad.any()) or padding_bad
+            else "pass",
+            "step": self._verify_step,
+            "actual_rows": actual,
+            "padded_rows": padded,
+            "checked_rows": actual,
+            "ids_sha256": hashlib.sha256(ids.numpy().tobytes()).hexdigest(),
+            "ids": ids.tolist(),
+            "id_mismatch_rows": id_bad.nonzero().flatten().tolist(),
+            "byte_mismatch_rows": bad.nonzero().flatten().tolist(),
+            "padding_mismatch": padding_bad,
+            "pending": self._pending,
+            "flag_after_sync": int(self.flag.item()),
+        }
+        self._verify_ids = None
+        return report
 
     def consume(
         self,
