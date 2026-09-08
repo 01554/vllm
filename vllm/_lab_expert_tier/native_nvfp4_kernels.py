@@ -332,26 +332,29 @@ def _build_aux_kernels() -> tuple[Any, Any]:
     def activation_kernel(
         gate_up_ptr,
         activated_ptr,
-        total,
         intermediate,
         compute_type: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < total
-        route = offs // intermediate
-        col = offs - route * intermediate
-        gate_up_row = route * (2 * intermediate)
-        gate = tl.load(gate_up_ptr + gate_up_row + col, mask=mask, other=0.0)
+        row = tl.program_id(0).to(tl.int64)
+        col_blk = tl.program_id(1)
+        cols = col_blk * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < intermediate
+        gate_up_row = row * (2 * intermediate)
+        gate = tl.load(gate_up_ptr + gate_up_row + cols, mask=mask, other=0.0)
         up = tl.load(
-            gate_up_ptr + gate_up_row + intermediate + col,
+            gate_up_ptr + gate_up_row + intermediate + cols,
             mask=mask,
             other=0.0,
         )
         gate = gate.to(tl.float32)
         up = up.to(tl.float32)
         value = gate / (1.0 + tl.exp(-gate)) * up
-        tl.store(activated_ptr + offs, value.to(compute_type), mask=mask)
+        tl.store(
+            activated_ptr + row * intermediate + cols,
+            value.to(compute_type),
+            mask=mask,
+        )
 
     @triton.jit
     def sum_routes_kernel(
@@ -474,25 +477,35 @@ def activation_inplace(
     if not gate_up.is_contiguous() or not activated.is_contiguous():
         raise ValueError("gate_up and activated must be contiguous")
 
+    intermediate = activated.shape[1]
+    total = activated.numel()
+    if total == 0:
+        return
+
     if gate_up.device.type != "cuda":
-        intermediate = activated.shape[1]
         gate = gate_up.reshape(-1, 2 * intermediate)[..., :intermediate]
         up = gate_up.reshape(-1, 2 * intermediate)[..., intermediate:]
         value = gate.float() / (1.0 + torch.exp(-gate.float())) * up.float()
         activated.copy_(value.to(dtype=activated.dtype))
         return
 
+    import triton
+
     activation_kernel, _ = _build_aux_kernels()
-    total = activated.numel()
-    block = 256
-    activation_kernel[(triton_cdiv(total, block),)](
+    rows = activated.shape[0]
+    block = min(
+        triton.next_power_of_2(intermediate),
+        512 if rows < 4096 else 1024,
+    )
+    grid = lambda meta: (rows, triton.cdiv(intermediate, meta["BLOCK"]))
+    activation_kernel[grid](
         gate_up,
         activated,
-        total,
-        activated.shape[1],
+        intermediate,
         compute_type=_triton_compute_type(activated.dtype, tl_module=None),
         BLOCK=block,
         num_warps=4,
+        num_stages=2 if block == 1024 else 3,
     )
 
 

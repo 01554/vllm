@@ -298,6 +298,6 @@ if __name__ == "__main__":
         run_case(17, 64, 32, grouped=True, uva=True)
     else:
         run_case(1, 32, 16, physical_rows=560)
-        run_case(3, 32, 16)
+        run_case(3, 32, 528)
         run_case(1, 2064, 32)  # FreeToken deep-K launch configuration.
         run_case(1, 32, 16, routes_ready=True)
