@@ -30,6 +30,9 @@ _EXTENSION_CALLS = (
     "memop_wait_geq",
     "signal_flag",
 )
+# Keep the small deferred capacity separate from the model's potentially much
+# larger mmap staging allocation so deferred pinned memory stays bounded.
+PLE_DEFERRED_MAX_TOKENS = 8
 _extension: Any | None = None
 
 
@@ -83,21 +86,22 @@ def _check_memop_status(status: Any, operation: str) -> None:
 
 
 class DeferredRows:
-    """Stage one fixed-shape PLE row batch across a captured forward.
+    """Stage a small fixed-capacity PLE row batch across a captured forward.
 
     ``destination`` is the stable device staging tensor consumed by the
-    captured model.  It must be shaped ``[1, heads, head_dim]`` and remain
-    alive for the lifetime of this object.  ``table`` must provide
+    captured model.  It must be shaped ``[rows, heads, head_dim]`` and remain
+    alive for the lifetime of this object. ``rows`` is normally at most
+    :data:`PLE_DEFERRED_MAX_TOKENS`. ``table`` must provide
     ``gather(np.ndarray)`` and return one row per flattened ID.  The table is
     intentionally kept on the host side: no table read or allocation occurs
     during capture.
 
     The normal sequence is::
 
-        rows.prepare(ids_cuda)
+        rows.prepare(ids_cuda, padded_rows=graph_rows)
         dispatch_forward()
         rows.complete()
-        rows.consume()  # called by the captured forward
+        rows.consume(output)  # called by the captured forward
 
     ``prepare_dummy`` supplies zero rows and a pre-signaled flag for warmup or
     graph capture.  ``abort`` unblocks a pending consumer before poisoning the
@@ -115,9 +119,10 @@ class DeferredRows:
             raise TypeError("DeferredRows destination must be a torch.Tensor")
         if destination.device.type != "cuda":
             raise ValueError("DeferredRows destination must be a CUDA tensor")
-        if destination.ndim != 3 or destination.shape[0] != 1:
+        if destination.ndim != 3 or destination.shape[0] <= 0:
             raise ValueError(
-                "DeferredRows destination must have shape [1, heads, head_dim]"
+                "DeferredRows destination must have shape "
+                "[rows, heads, head_dim] with rows > 0"
             )
         if any(int(size) <= 0 for size in destination.shape[1:]):
             raise ValueError("DeferredRows destination dimensions must be positive")
@@ -132,11 +137,12 @@ class DeferredRows:
         self._ext = _load_extension()
         self.destination = destination
         self.table = table
+        self.capacity = int(destination.shape[0])
         self._stream_override = stream
         self.stream = _stream_for(destination.device, stream)
         shape = tuple(int(size) for size in destination.shape)
         self.ids = torch.empty(
-            (1, shape[1]), dtype=torch.int64, device="cpu", pin_memory=True
+            (self.capacity, shape[1]), dtype=torch.int64, device="cpu", pin_memory=True
         )
         self.rows = torch.empty(
             shape, dtype=destination.dtype, device="cpu", pin_memory=True
@@ -152,6 +158,8 @@ class DeferredRows:
         self._readback_event = torch.cuda.Event()
         self._pending = False
         self._rows_ready = True
+        self._active_rows = self.capacity
+        self._padded_rows = self.capacity
         self._gate_armed = False
         self._reset_queued = False
         self._readback_recorded = False
@@ -205,7 +213,7 @@ class DeferredRows:
             detail = f": {self._poison_reason}" if self._poison_reason else ""
             raise RuntimeError(f"DeferredRows is permanently poisoned{detail}")
 
-    def _validate_ids(self, ids: torch.Tensor) -> None:
+    def _validate_ids(self, ids: torch.Tensor) -> int:
         if not isinstance(ids, torch.Tensor):
             raise TypeError("DeferredRows IDs must be a torch.Tensor")
         if ids.device != self.destination.device:
@@ -213,37 +221,58 @@ class DeferredRows:
                 f"DeferredRows IDs device {ids.device} != "
                 f"destination device {self.destination.device}"
             )
-        expected = (1, int(self.destination.shape[1]))
-        if tuple(ids.shape) != expected:
+        if ids.ndim != 2 or ids.shape[1] != self.destination.shape[1]:
             raise ValueError(
-                f"DeferredRows IDs shape {tuple(ids.shape)} != expected {expected}"
+                "DeferredRows IDs must have shape "
+                f"[1..{self.capacity}, {int(self.destination.shape[1])}], "
+                f"got {tuple(ids.shape)}"
+            )
+        actual_rows = int(ids.shape[0])
+        if not 0 < actual_rows <= self.capacity:
+            raise ValueError(
+                f"DeferredRows IDs row count {actual_rows} outside [1, {self.capacity}]"
             )
         if ids.dtype != torch.int64:
             raise ValueError(f"DeferredRows IDs must be torch.int64, got {ids.dtype}")
         if not ids.is_contiguous():
             raise ValueError("DeferredRows IDs must be contiguous")
+        return actual_rows
 
     def _validate_destination(self, destination: torch.Tensor) -> None:
         if not isinstance(destination, torch.Tensor):
             raise TypeError("DeferredRows destination must be a torch.Tensor")
-        if destination is not self.destination:
-            if destination.device != self.destination.device:
-                raise ValueError(
-                    f"DeferredRows destination device {destination.device} != "
-                    f"{self.destination.device}"
-                )
-            if tuple(destination.shape) != tuple(self.destination.shape):
-                raise ValueError(
-                    f"DeferredRows destination shape {tuple(destination.shape)} "
-                    f"!= {tuple(self.destination.shape)}"
-                )
-            if destination.dtype != self.destination.dtype:
-                raise ValueError(
-                    f"DeferredRows destination dtype {destination.dtype} != "
-                    f"{self.destination.dtype}"
-                )
-            if not destination.is_contiguous():
-                raise ValueError("DeferredRows destination must be contiguous")
+        if destination.device != self.destination.device:
+            raise ValueError(
+                f"DeferredRows destination device {destination.device} != "
+                f"{self.destination.device}"
+            )
+        if destination.ndim != 3 or destination.shape[0] <= 0:
+            raise ValueError(
+                "DeferredRows destination must have shape "
+                "[rows, heads, head_dim] with rows > 0"
+            )
+        if destination.shape[0] > self.capacity:
+            raise ValueError(
+                f"DeferredRows destination has {int(destination.shape[0])} rows, "
+                f"capacity is {self.capacity}"
+            )
+        if tuple(destination.shape[1:]) != tuple(self.destination.shape[1:]):
+            raise ValueError(
+                f"DeferredRows destination shape {tuple(destination.shape)} "
+                f"has incompatible row shape {tuple(self.destination.shape)}"
+            )
+        if destination.shape[0] < self._padded_rows:
+            raise ValueError(
+                f"DeferredRows destination has {int(destination.shape[0])} rows, "
+                f"but the prepared graph requires {self._padded_rows}"
+            )
+        if destination.dtype != self.destination.dtype:
+            raise ValueError(
+                f"DeferredRows destination dtype {destination.dtype} != "
+                f"{self.destination.dtype}"
+            )
+        if not destination.is_contiguous():
+            raise ValueError("DeferredRows destination must be contiguous")
 
     def _signal(self) -> None:
         """Signal the host flag, accepting only the extension's API."""
@@ -274,24 +303,43 @@ class DeferredRows:
                 "FreeToken PLE stream memop probe did not publish its value"
             )
 
-    def prepare(self, ids: torch.Tensor) -> None:
-        """Queue the fixed-shape ID readback before dispatching the forward.
+    def prepare(self, ids: torch.Tensor, padded_rows: int | None = None) -> None:
+        """Queue actual ID readback before dispatching the padded forward.
 
         The stream write of zero is deliberately queued before the D2H copy.
         A host ``flag.zero_`` would race an earlier graph replay and can leave
         the next replay waiting on a value that belongs to the wrong batch.
+        ``ids`` contains only real candidate rows. ``padded_rows`` describes
+        the graph output width and is used for validation; padding IDs are
+        never copied or passed to the mmap table.
         """
         self._ensure_healthy()
         if self._pending:
             raise RuntimeError("DeferredRows.prepare called while a batch is pending")
-        self._validate_ids(ids)
+        actual_rows = self._validate_ids(ids)
+        if padded_rows is None:
+            padded_rows = actual_rows
+        padded_rows = int(padded_rows)
+        if not 0 < padded_rows <= self.capacity:
+            raise ValueError(
+                f"DeferredRows padded row count {padded_rows} outside "
+                f"[1, {self.capacity}]"
+            )
+        if actual_rows > padded_rows:
+            raise ValueError(
+                f"DeferredRows actual row count {actual_rows} exceeds "
+                f"padded row count {padded_rows}"
+            )
         stream = self._operation_stream()
         try:
             status = self._ext.memop_write(_stream_ptr(stream), self.flag_ptr, 0)
             _check_memop_status(status, "memop_write(flag, 0)")
             self._prepare_stream = stream
             self._reset_queued = True
-            self.ids.copy_(ids, non_blocking=True)
+            self._active_rows = actual_rows
+            self._padded_rows = padded_rows
+            self.ids[:actual_rows].copy_(ids, non_blocking=True)
+            self.ids[actual_rows:].zero_()
             self._readback_event.record(stream)
             self._readback_recorded = True
             self._pending = True
@@ -301,8 +349,18 @@ class DeferredRows:
             self._poison(exc)
             raise
 
-    def _as_rows_tensor(self, gathered: Any) -> torch.Tensor:
-        """Convert a table result to the destination's dtype and fixed shape."""
+    def _as_rows_tensor(
+        self, gathered: Any, num_rows: int | None = None
+    ) -> torch.Tensor:
+        """Convert a table result to the destination's dtype and row shape."""
+        if num_rows is None:
+            num_rows = self.capacity
+        num_rows = int(num_rows)
+        if not 0 < num_rows <= self.capacity:
+            raise ValueError(
+                f"DeferredRows row count {num_rows} outside [1, {self.capacity}]"
+            )
+        target = self.rows[:num_rows]
         if isinstance(gathered, torch.Tensor):
             source = gathered.detach()
             if source.device.type != "cpu":
@@ -316,7 +374,7 @@ class DeferredRows:
             # device allocation during the deferred completion callback.
             source = torch.as_tensor(gathered, device="cpu")
         source = source.contiguous()
-        target_nbytes = self.rows.numel() * self.rows.element_size()
+        target_nbytes = target.numel() * target.element_size()
         source_nbytes = source.numel() * source.element_size()
         if source_nbytes != target_nbytes:
             raise ValueError(
@@ -328,15 +386,15 @@ class DeferredRows:
         # its element count. A tensor table result is converted only when it
         # already has the destination element count.
         if source.dtype == torch.uint8:
-            source = source.reshape(-1).view(self.rows.dtype)
-        elif source.numel() == self.rows.numel():
-            source = source.to(dtype=self.rows.dtype)
+            source = source.reshape(-1).view(target.dtype)
+        elif source.numel() == target.numel():
+            source = source.to(dtype=target.dtype)
         else:
             raise ValueError(
                 "DeferredRows table returned a non-byte result with an "
                 "incompatible element count"
             )
-        return source.reshape(self.rows.shape)
+        return source.reshape(target.shape)
 
     def complete(self) -> None:
         """Finish the host gather and release the captured consumer."""
@@ -345,9 +403,14 @@ class DeferredRows:
             raise RuntimeError("DeferredRows.complete called without prepare")
         try:
             self._readback_event.synchronize()
-            ids = self.ids.numpy().reshape(-1)
+            ids = self.ids[: self._active_rows].numpy().reshape(-1)
             gathered = self.table.gather(ids)
-            self.rows.copy_(self._as_rows_tensor(gathered))
+            self.rows[: self._active_rows].copy_(
+                self._as_rows_tensor(gathered, self._active_rows)
+            )
+            # Clear every row outside the real candidate prefix. This avoids
+            # exposing a larger batch's rows when the next graph is smaller.
+            self.rows[self._active_rows :].zero_()
             self._signal()
             self._reset_queued = False
             self._readback_recorded = False
@@ -400,7 +463,7 @@ class DeferredRows:
         capture: bool | None = None,
         wait: bool = True,
     ) -> torch.Tensor:
-        """Copy the completed or dummy rows into the fixed device staging.
+        """Copy completed or dummy rows into the graph's device staging.
 
         Under CUDA graph capture, the wait/reset is emitted before the H2D
         copy.  ``wait=False`` is available when a caller already invoked
@@ -411,7 +474,8 @@ class DeferredRows:
             raise RuntimeError("DeferredRows.consume called while a batch is pending")
         if not self._rows_ready:
             raise RuntimeError("DeferredRows.consume has no completed rows")
-        destination = self.destination if destination is None else destination
+        if destination is None:
+            destination = self.destination[: self._padded_rows]
         self._validate_destination(destination)
         stream = self._operation_stream(stream)
         if capture is None:
@@ -426,23 +490,33 @@ class DeferredRows:
                     # Keep the eager path harmless after a caller reused a
                     # helper without a preceding captured wait.
                     self._signal()
-            destination.copy_(self.rows, non_blocking=True)
+            destination.copy_(self.rows[: destination.shape[0]], non_blocking=True)
             return destination
         except BaseException as exc:
             self._poison(exc)
             raise
 
-    def prepare_dummy(self) -> None:
+    def prepare_dummy(self, padded_rows: int | None = None) -> None:
         """Reset pinned rows for warmup/capture after the prior copy finishes."""
         self._ensure_healthy()
         if self._pending:
             raise RuntimeError("DeferredRows.prepare_dummy called while pending")
+        if padded_rows is None:
+            padded_rows = self.capacity
+        padded_rows = int(padded_rows)
+        if not 0 < padded_rows <= self.capacity:
+            raise ValueError(
+                f"DeferredRows padded row count {padded_rows} outside "
+                f"[1, {self.capacity}]"
+            )
         try:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("DeferredRows.prepare_dummy cannot run in capture")
             self._operation_stream().synchronize()
             self.rows.zero_()
             self._signal()
+            self._active_rows = 0
+            self._padded_rows = padded_rows
             self._rows_ready = True
             self._gate_armed = False
         except BaseException as exc:
@@ -502,6 +576,7 @@ PLEDeferredStaging = DeferredRows
 
 __all__ = [
     "DeferredRows",
+    "PLE_DEFERRED_MAX_TOKENS",
     "PLEDeferredStaging",
     "PLEWait",
 ]

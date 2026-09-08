@@ -179,6 +179,11 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
+# Deferred PLE keeps a bounded pinned host batch. Eight rows cover the initial
+# speculative verification graph sizes while keeping the pinned allocation
+# independent of the model's larger mmap staging buffer.
+_PLE_DEFERRED_MAX_TOKENS = 8
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -359,6 +364,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+
+    @staticmethod
+    def _is_deferred_ple_eligible(
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+        dummy_run: bool,
+    ) -> bool:
+        """Select the small full-graph batches supported by deferred PLE.
+
+        The helper gathers only the real prefix while the graph consumes its
+        padded output width. Applying the same rule to every small FULL batch
+        is required: a captured graph cannot switch between the deferred
+        custom op and the synchronous staging path based on Python state.
+        """
+        return bool(
+            not dummy_run
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and (
+                0
+                < input_batch.num_tokens
+                <= input_batch.num_tokens_after_padding
+                <= _PLE_DEFERRED_MAX_TOKENS
+            )
+        )
 
     def init_routed_experts_capturer(self) -> None:
         """Initialize target-model capture on every participating worker."""
@@ -1766,11 +1795,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         deferred_ple_setter = getattr(self.model_state, "set_deferred_ple_step", None)
         if deferred_ple_setter is not None:
             deferred_ple_setter(
-                not dummy_run
-                and batch_desc.cg_mode == CUDAGraphMode.FULL
-                and input_batch.num_tokens == 1
-                and input_batch.num_tokens_after_padding == 1
-                and input_batch.num_reqs == 1
+                self._is_deferred_ple_eligible(input_batch, batch_desc, dummy_run)
             )
 
         model_inputs = {
