@@ -201,6 +201,12 @@ def gemv(
 
         route_ids = routes if routes_ready else ids
         route_map = None if routes_ready else step_map
+        route_output = None
+        if not routes_ready and not any(
+            kernels._buffers_overlap(routes, tensor)
+            for tensor in (x, weights, ids, step_map)
+        ):
+            route_output = routes
         kernels.launch_decode_gemm(
             x,
             bank["w13_weight"],
@@ -215,8 +221,11 @@ def gemv(
             expert_to_row=route_map,
             num_experts=workspace.num_experts if route_map is not None else None,
             error=workspace.error,
+            route_output=route_output,
         )
         kernels.activation_inplace(gu, act)
+        down_route_ids = routes if route_output is not None else route_ids
+        down_route_map = None if route_output is not None else route_map
         kernels.launch_decode_gemm(
             act,
             bank["w2_weight"],
@@ -224,13 +233,13 @@ def gemv(
             bank["w2_weight_scale_2"],
             down,
             weights,
-            route_ids,
+            down_route_ids,
             mul_routed_weight=True,
             a_row_is_route=True,
             num_rows=workspace.num_rows,
-            expert_to_row=route_map,
-            num_experts=workspace.num_experts if route_map is not None else None,
-            error=workspace.error if route_map is not None else None,
+            expert_to_row=down_route_map,
+            num_experts=(workspace.num_experts if down_route_map is not None else None),
+            error=workspace.error if down_route_map is not None else None,
             write_error=False,
         )
         kernels.sum_routes_inplace(down, out)
