@@ -1929,6 +1929,35 @@ class TensorTests(unittest.TestCase):
         )
         self.assertIsNot(single, output)
         self.assertTrue(torch.equal(single, output))
+        # NATIVE_OUTPUT=alias returns the workspace output itself for the
+        # single-partition (decode) call and still copies for two partitions.
+        layer.settings = rt.Settings(
+            32 * 2**30,
+            staging=True,
+            promote=True,
+            planner="reference",
+            ram_backing=True,
+            moe_kernel="native",
+            native_output="alias",
+        )
+        with patch.object(native_nvfp4, "gemv", fake_gemv):
+            aliased = layer._run_marlin_chains(
+                x, weights, ids, ((rt.NATIVE_KERNEL, layer.bank, hot_map, 6),)
+            )
+            two = layer._run_marlin_chains(
+                x,
+                weights,
+                ids,
+                (
+                    (rt.NATIVE_KERNEL, layer.bank, hot_map, 6),
+                    (rt.NATIVE_KERNEL, layer.cold_cpu, cold_map, 6),
+                ),
+            )
+        self.assertIs(aliased, output)
+        self.assertIsNot(two, output)
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_OUTPUT": "steal"}
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
 
     def test_grouped_native_prefill_is_used_for_multi_token_rows_only(self):
         """NATIVE_PREFILL=grouped routes rows > 1 to native_prefill.prefill
