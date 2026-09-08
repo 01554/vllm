@@ -2183,12 +2183,12 @@ class TensorTests(unittest.TestCase):
         from lab_expert_tier import native_nvfp4
 
         torch.manual_seed(0)
-        parts = [torch.randn(4, 16) * 3 for _ in range(3)]
-        exact = sum(p.float() for p in parts).to(torch.bfloat16)
+        parts = [(torch.randn(4, 16) * 3).to(torch.bfloat16) for _ in range(3)]
+        exact = sum(p.float() for p in parts).to(torch.bfloat16)  # one rounding
         seen: list[Any] = []
 
         def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
-            out = parts[len(seen) % 3].to(torch.bfloat16)
+            out = parts[len(seen) % 3]
             seen.append(out)
             return out
 
@@ -2225,9 +2225,7 @@ class TensorTests(unittest.TestCase):
         # bf16 path: sequential BF16 adds; may differ from the once-rounded sum.
         b = run("bf16", (0, 1, 2))
         self.assertEqual(b.dtype, torch.bfloat16)
-        double_rounded = (
-            parts[0].to(torch.bfloat16) + parts[1].to(torch.bfloat16)
-        ) + parts[2].to(torch.bfloat16)
+        double_rounded = (parts[0] + parts[1]) + parts[2]  # BF16 adds, two roundings
         self.assertTrue(torch.equal(b, double_rounded))
         base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_COMBINE": "fp64"}
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
