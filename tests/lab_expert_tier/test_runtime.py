@@ -1092,6 +1092,93 @@ class TensorTests(unittest.TestCase):
         ):
             self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
 
+    def test_double_buffered_prefetch_alternates_banks_and_discards_stale(self):
+        """PREFILL_STAGE_BUFFERS=2: layer l consumes the prefetch issued by
+        layer l-1 into bank l%2 (whole cold set, ascending ids, up to the
+        scratch rows), then prefetches layer l+1; a forward that starts with
+        a stale pending prefetch copies for itself; decode is untouched."""
+        settings = dataclasses.replace(
+            rt.Settings(32 * 2**30),
+            prefill_stage_rows=2,
+            prefill_stage_buffers=2,
+            native_gemv_rows=1,
+        )
+        seen: list[Any] = []
+        layers = []
+        for index in range(3):
+            tier = object.__new__(rt.TierLayer)
+            tier.settings, tier.device, tier.index = (
+                settings,
+                torch.device("cpu"),
+                index,
+            )
+            tier.num_experts, tier.hot_slots, tier.cold_slots = 6, 3, 3
+            tier.hot_map = torch.tensor([0, 1, 2, -1, -1, -1], dtype=torch.int32)
+            # Cold experts 3, 4, 5 sit at rows 2, 0, 1 of this layer's bank.
+            tier.cold_map = torch.tensor([-1, -1, -1, 2, 0, 1], dtype=torch.int32)
+            tier.hot = {
+                name: torch.zeros(3, 4, dtype=torch.int32) for name in rt.TENSORS
+            }
+            tier.cold = {
+                name: (torch.arange(12, dtype=torch.int32).reshape(3, 4) + 100 * index)
+                for name in rt.TENSORS
+            }
+            tier.hot_kernel = SimpleNamespace(fused_experts="hot")
+            tier.cold_kernel = SimpleNamespace(fused_experts="cold")
+            tier.native = True
+            tier._run_marlin_chains = lambda x, w, ids, parts, index=index: seen.append(
+                (
+                    index,
+                    parts,
+                    parts[1][1][rt.TENSORS[0]].clone() if len(parts) == 3 else None,
+                )
+            )
+            layers.append(tier)
+        coordinator = SimpleNamespace(layers=layers)
+        for tier in layers:
+            tier.coordinator = coordinator
+        rt._PREFILL_PREFETCH.clear()
+        ids = torch.tensor([[3, 5], [4, 0], [3, -1]], dtype=torch.int32)
+        x, w = torch.ones(3, 4), torch.ones(3, 2)
+        for tier in layers:
+            tier.split_fused(x, w, ids)
+        state = layers[0].prefetch_state()
+        self.assertEqual([i for i, _, _ in seen], [0, 1, 2])
+        for index, parts, snapshot in seen:
+            hot, (kernel, bank, scratch_map, count), overflow = parts
+            self.assertIs(bank, state.buffers[index % 2])
+            self.assertEqual((kernel, count), ("cold", 2))
+            # Lowest cold ids 3 and 4 staged (bank rows 2 and 0), 5 overflows.
+            self.assertEqual(scratch_map.tolist(), [-1, -1, -1, 0, 1, -1])
+            self.assertEqual(overflow[2].tolist(), [-1, -1, -1, -1, -1, 1])
+            self.assertEqual(
+                snapshot[0].tolist(),
+                (torch.arange(8, 12) + 100 * index).tolist(),
+            )
+            self.assertEqual(
+                snapshot[1].tolist(),
+                (torch.arange(0, 4) + 100 * index).tolist(),
+            )
+        # No prefetch beyond the last layer; nothing pending for the next forward.
+        self.assertIsNone(state.pending)
+        # A stale pending prefetch (e.g. left by an interrupted forward) is
+        # not consumed by a different layer: layer 0 copies for itself.
+        state.pending = (2, 0, torch.tensor([3, 4]), 2)
+        seen.clear()
+        layers[0].split_fused(x, w, ids)
+        _, parts, snapshot = seen[-1]
+        self.assertEqual(parts[1][1][rt.TENSORS[0]][0].tolist(), [8, 9, 10, 11])
+        self.assertEqual(state.pending[0], 1)
+        # Decode rows: plain two-partition split, prefetch state untouched.
+        seen.clear()
+        layers[1].split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
+        self.assertEqual(len(seen[-1][1]), 2)
+        self.assertEqual(state.pending[0], 1)
+        rt._PREFILL_PREFETCH.clear()
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PREFILL_STAGE_BUFFERS": "2"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
         tier.settings = rt.Settings(32 * 2**30)

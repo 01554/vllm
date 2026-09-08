@@ -67,6 +67,7 @@ NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
 _NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
 _NATIVE_PREFILL_WORKSPACES: dict[tuple[str, int], Any] = {}
 _PREFILL_SCRATCH: dict[tuple[Any, ...], Any] = {}
+_PREFILL_PREFETCH: dict[tuple[Any, ...], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -145,6 +146,11 @@ class Settings:
     # gathering host rows through UVA inside the kernel. Experts beyond the
     # scratch rows stay on the UVA partition. 0 = off (default).
     prefill_stage_rows: int = 0
+    # 2 = FreeToken-style double buffering: two scratch banks alternate by
+    # layer, and layer l+1's whole cold set is copied on the tier's copy
+    # stream while layer l computes (routing-independent, no host sync).
+    # 1 = one scratch, routed rows copied synchronously (default).
+    prefill_stage_buffers: int = 1
     # Fused per-layer routing record (device observer only): one program
     # writes the observer records, counts, route totals, and the sticky
     # error (including the former device assertion) instead of ~30 small
@@ -233,6 +239,7 @@ class Settings:
             "NATIVE_PREFILL",
             "NATIVE_GEMV_ROWS",
             "PREFILL_STAGE_ROWS",
+            "PREFILL_STAGE_BUFFERS",
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
@@ -336,6 +343,13 @@ class Settings:
         prefill_stage_rows = int(os.environ.get(PREFIX + "PREFILL_STAGE_ROWS", "0"))
         if prefill_stage_rows < 0:
             raise ValueError("PREFILL_STAGE_ROWS must be nonnegative (0 = off)")
+        prefill_stage_buffers = int(
+            os.environ.get(PREFIX + "PREFILL_STAGE_BUFFERS", "1")
+        )
+        if prefill_stage_buffers not in (1, 2):
+            raise ValueError("PREFILL_STAGE_BUFFERS must be 1 or 2")
+        if prefill_stage_buffers == 2 and not prefill_stage_rows:
+            raise ValueError("PREFILL_STAGE_BUFFERS=2 requires PREFILL_STAGE_ROWS")
         if prefill_stage_rows and (ram_backing != "1" or moe_kernel != "native"):
             # Only the native chain reads every bank tensor (weights and
             # scales) from the partition it is handed; the Marlin chain keeps
@@ -420,6 +434,7 @@ class Settings:
             native_prefill,
             native_gemv_rows,
             prefill_stage_rows,
+            prefill_stage_buffers,
             record_kernel == "1",
             shared_gate,
             native_output,
@@ -1254,6 +1269,138 @@ class TierLayer:
             _PREFILL_SCRATCH[key] = scratch
         return scratch
 
+    def prefetch_state(self):
+        """Two scratch banks, their ready/release events and the copy stream,
+        shared by every layer of this bank signature on this device."""
+        rows = self.settings.prefill_stage_rows
+        signature = tuple(
+            (name, tuple(self.cold[name].shape[1:]), str(self.cold[name].dtype))
+            for name in TENSORS
+        )
+        key = (str(self.device), rows, signature)
+        state = _PREFILL_PREFETCH.get(key)
+        if state is None:
+            import torch
+
+            from .async_migration import _migration_stream
+
+            def bank():
+                return {
+                    name: torch.empty(
+                        (rows, *self.cold[name].shape[1:]),
+                        dtype=self.cold[name].dtype,
+                        device=self.device,
+                    )
+                    for name in TENSORS
+                }
+
+            state = SimpleNamespace(
+                buffers=(bank(), bank()),
+                ready=[None, None],
+                release=[None, None],
+                pending=None,  # (layer index, buffer) of an issued prefetch
+                stream=_migration_stream(self.device),
+            )
+            _PREFILL_PREFETCH[key] = state
+        return state
+
+    def cold_set(self, rows):
+        """This layer's cold experts (ascending id, at most `rows`) from the
+        live device map, without a host sync: the count is the layer's cold
+        slot count, so a partial scratch takes the lowest ids."""
+        import torch
+
+        cold_map = self.cold_map
+        if cold_map is None:
+            raise RuntimeError("Staged prefill needs the cold map")
+        count = min(int(rows), int(self.cold_slots))
+        order = torch.argsort((cold_map < 0).to(torch.int8), stable=True)
+        take = order[:count]
+        return take, count
+
+    def issue_prefetch(self, state, index, buffer):
+        """Queue the copy of layer `index`'s cold set into `buffer` on the
+        copy stream, after that buffer's last reader; record its ready event."""
+        import torch
+
+        from .async_migration import _on_stream, _record_event, _stream_wait_event
+        from .promote import copy_rows
+
+        coordinator = self.coordinator
+        if coordinator is None:
+            raise RuntimeError("Staged prefill needs the coordinator")
+        tier = coordinator.layers[index]
+        bank = state.buffers[buffer]
+        take, count = tier.cold_set(bank[TENSORS[0]].shape[0])
+        cold_map = tier.cold_map
+        if cold_map is None:
+            raise RuntimeError("Staged prefill needs the cold map")
+        src_rows = cold_map[take].to(torch.int32)
+        dst_rows = torch.arange(count, dtype=torch.int32, device=src_rows.device)
+        stream = state.stream
+        _stream_wait_event(stream, state.release[buffer])
+        with _on_stream(stream):
+            copy_rows(
+                tier.cold,
+                bank,
+                src_rows,
+                dst_rows,
+                torch.tensor([count], dtype=torch.int32, device=src_rows.device),
+            )
+        state.ready[buffer] = _record_event(stream)
+        state.pending = (index, buffer, take, count)
+
+    def stage_prefetched_partition(self):
+        """Double-buffered staging for this layer: consume the prefetch issued
+        by the previous layer (or copy now), and return the partitions."""
+        import torch
+
+        from .async_migration import _stream_wait_event
+
+        state = self.prefetch_state()
+        buffer = self.index % 2
+        pending = state.pending
+        if pending is None or pending[0] != self.index or pending[1] != buffer:
+            # No prefetch for this layer (first layer of a forward, or a stale
+            # one left by an interrupted forward): copy now, in order after
+            # any stale copy on the same stream.
+            self.issue_prefetch(state, self.index, buffer)
+            pending = state.pending
+        _, _, take, count = pending
+        state.pending = None
+        compute = _current_stream(self.device)
+        _stream_wait_event(compute, state.ready[buffer])
+        bank = state.buffers[buffer]
+        cold_map = self.cold_map
+        if cold_map is None:
+            raise RuntimeError("Staged prefill needs the cold map")
+        scratch_map = torch.full_like(cold_map, -1)
+        scratch_map[take] = torch.arange(
+            count, dtype=cold_map.dtype, device=cold_map.device
+        )
+        overflow_map = cold_map.clone()
+        overflow_map[take] = -1
+        self.prefill_staged_rows = count
+        self.prefill_overflow_rows = int(self.cold_slots) - count
+        kernel = self.cold_kernel.fused_experts
+        staged = (kernel, bank, scratch_map, count)
+        overflow = (kernel, self.cold, overflow_map, self.prefill_overflow_rows)
+        return state, buffer, staged, overflow
+
+    def finish_prefetched_partition(self, state, buffer, rows):
+        """After this layer's kernels are queued: release the buffer to the
+        copy stream and prefetch the next layer's cold set."""
+        from .async_migration import _record_event
+
+        state.release[buffer] = _record_event(_current_stream(self.device))
+        nxt = self.index + 1
+        coordinator = self.coordinator
+        if coordinator is None:
+            raise RuntimeError("Staged prefill needs the coordinator")
+        layers = coordinator.layers
+        if nxt < len(layers) and getattr(layers[nxt], "native", False):
+            self.issue_prefetch(state, nxt, nxt % 2)
+
     def stage_cold_partition(self, ids, scratch):
         """Copy this forward's routed cold experts into `scratch` and return
         the (staged, overflow) partitions replacing the UVA cold partition.
@@ -1331,8 +1478,18 @@ class TierLayer:
                 getattr(self, "cold_local", self.cold_slots),
             ),
         )
-        scratch = self.prefill_scratch() if getattr(self, "native", False) else None
-        if scratch is not None and x.shape[0] > self.settings.native_gemv_rows:
+        native = getattr(self, "native", False)
+        prefill = x.shape[0] > self.settings.native_gemv_rows
+        if native and prefill and self.settings.prefill_stage_buffers == 2:
+            if _is_capturing(self.device):
+                raise RuntimeError("Staged prefill cannot run during graph capture")
+            state, buffer, staged, overflow = self.stage_prefetched_partition()
+            partitions = (partitions[0], staged, overflow)
+            result = self._run_marlin_chains(x, weights, ids, partitions)
+            self.finish_prefetched_partition(state, buffer, x.shape[0])
+            return result
+        scratch = self.prefill_scratch() if native else None
+        if scratch is not None and prefill:
             staged, overflow = self.stage_cold_partition(ids, scratch)
             partitions = (partitions[0], staged, overflow)
         return self._run_marlin_chains(x, weights, ids, partitions)
@@ -3199,8 +3356,11 @@ def initialize_model(model, model_config):
                 "native_prefill": settings.native_prefill,
                 "native_gemv_rows": settings.native_gemv_rows,
                 "prefill_stage_rows": settings.prefill_stage_rows,
+                "prefill_stage_buffers": settings.prefill_stage_buffers,
                 "prefill_stage_bytes": (
-                    settings.prefill_stage_rows * row_sizes[0]
+                    settings.prefill_stage_rows
+                    * row_sizes[0]
+                    * settings.prefill_stage_buffers
                     if settings.prefill_stage_rows
                     else 0
                 ),
