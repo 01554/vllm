@@ -151,6 +151,23 @@ class GlobalPoolTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pool.snapshot()
 
+    def test_multi_row_step_deduplicates_across_rows_and_routes_every_lane(self):
+        """A verify step: rows x top_k lanes; an expert selected by two rows is
+        promoted once and both lanes route to its row; padding rows stay -1."""
+        pool, sources, buffers = self.setup(layers=1, experts=8, slots=(3,), staging=6)
+        gp.set_gate(pool.tables, True)
+        ids = torch.tensor([[0, 5], [5, 6], [-1, -1]])
+        gp.step(pool.tables, 0, ids, buffers[0])
+        gp.copy_in(sources[0], pool.bank, buffers[0])
+        b = buffers[0]
+        # Residents 0,1,2; 0 is a hit; 5 and 6 miss and evict 1 then 2.
+        self.assertEqual(int(b.promoted_count[0]), 2)
+        self.assertEqual(int(b.staged_count[0]), 0)
+        hot = pool.tables.hot_phys.tolist()
+        self.assertEqual(b.routes.tolist(), [0, hot[5], hot[5], hot[6], -1, -1])
+        self.assertEqual(pool.snapshot(), [3])
+        self.assert_bank_holds_owners(pool)
+
     def test_no_victim_falls_back_to_staging(self):
         pool, sources, buffers = self.setup(layers=1, experts=4, slots=(2,), staging=3)
         gp.set_gate(pool.tables, True)

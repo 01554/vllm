@@ -58,6 +58,7 @@ SCALE_PROPERTIES = {
 }
 VERIFY_RTOL, VERIFY_ATOL = 2e-2, 2e-2
 SPLIT_MODES = ("fused", "modular")
+MAX_SPEC_ROWS = 8
 # moe_align_block_size histograms by *mapped* id in a buffer of its
 # num_experts argument (+1) entries, so a mapped row must stay below the
 # logical expert count; a bank with more physical rows than experts is
@@ -151,6 +152,13 @@ class Settings:
     # (FreeToken's fast_index_copy_multi shape: 8 programs x 32 warps per
     # bank over (row, chunk) pairs). See promote.COPY_SHAPES.
     copy_shape: str = "stripe"
+    # Rows the pool decode fast path serves in one step (1 + speculative
+    # tokens): staging holds spec_rows * top_k rows and the step program is
+    # that wide, so a verify step with 1 + k <= spec_rows rows stays on the
+    # captured decode path; wider batches take the eager path with every row
+    # processed. Needs GLOBAL_POOL=1 when above 1. The tier admits vLLM
+    # speculation only for method "ngram" with 1 + k <= spec_rows.
+    spec_rows: int = 1
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -192,6 +200,7 @@ class Settings:
             "SHARED_GATE",
             "NATIVE_OUTPUT",
             "COPY_SHAPE",
+            "SPEC_ROWS",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -240,6 +249,11 @@ class Settings:
         copy_shape = os.environ.get(PREFIX + "COPY_SHAPE", "stripe")
         if copy_shape not in ("stripe", "chunks"):
             raise ValueError("COPY_SHAPE must be stripe or chunks")
+        spec_rows = int(os.environ.get(PREFIX + "SPEC_ROWS", "1"))
+        if not 1 <= spec_rows <= MAX_SPEC_ROWS:
+            raise ValueError(f"SPEC_ROWS must be in [1, {MAX_SPEC_ROWS}]")
+        if spec_rows > 1 and global_pool != "1":
+            raise ValueError("SPEC_ROWS above 1 requires GLOBAL_POOL=1")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -324,6 +338,7 @@ class Settings:
             shared_gate,
             native_output,
             copy_shape,
+            spec_rows,
         )
 
 
@@ -615,7 +630,9 @@ class TierLayer:
         # Staging rows follow the hot rows in one bank so a single expert
         # map can address both; they hold transient copies of selected cold
         # experts during batch-1 decode and are outside the swap slot range.
-        self.staging_slots = method.moe.experts_per_token if settings.staging else 0
+        self.staging_slots = (
+            method.moe.experts_per_token * settings.spec_rows if settings.staging else 0
+        )
         # Spare rows for asynchronous exchanges follow the staging rows in
         # VRAM and the cold rows in RAM; logical slots map to physical rows
         # through hot_rows / cold_rows, which flip when a transfer commits.
@@ -2543,6 +2560,28 @@ def _validate_sources(name, layer):
     return sources
 
 
+def check_speculation(speculative_config, spec_rows):
+    """Admit vLLM speculation only in the agreed first form.
+
+    Draft-model methods (MTP, DFlash, EAGLE, ...) run their own MoE layers
+    and are rejected until their tier connection lands; n-gram has no draft
+    model. Every verify step has 1 + num_speculative_tokens rows per request
+    and must fit the pool decode path (`spec_rows`).
+    """
+    if speculative_config is None:
+        return
+    method = getattr(speculative_config, "method", None)
+    if method != "ngram":
+        raise NotImplementedError(
+            f"Expert tier admits speculation with method ngram only, got {method!r}"
+        )
+    tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    if tokens < 1 or tokens + 1 > spec_rows:
+        raise NotImplementedError(
+            f"num_speculative_tokens={tokens} needs SPEC_ROWS >= {tokens + 1}"
+        )
+
+
 def _compact_one(
     index, name, layer, method, slots, settings, temporary, pool=None, max_tokens=None
 ):
@@ -2625,8 +2664,9 @@ def initialize_model(model, model_config):
         raise RuntimeError(
             "Init verification requires the existing unlocked workspace manager"
         )
-    if config.speculative_config is not None or config.lora_config is not None:
-        raise NotImplementedError("Speculation and LoRA are unsupported")
+    if config.lora_config is not None:
+        raise NotImplementedError("LoRA is unsupported")
+    check_speculation(config.speculative_config, settings.spec_rows)
     if config.parallel_config.pipeline_parallel_size != 1:
         raise NotImplementedError("Pipeline parallelism is unsupported")
     candidates, row_sizes = [], []
@@ -2671,7 +2711,11 @@ def initialize_model(model, model_config):
         raise NotImplementedError(
             f"Expected all 48 FlashNext MoE layers, found {len(candidates)}"
         )
-    staging_rows = candidates[0][2].moe.experts_per_token if settings.staging else 0
+    staging_rows = (
+        candidates[0][2].moe.experts_per_token * settings.spec_rows
+        if settings.staging
+        else 0
+    )
     spare_rows = (
         settings.temp_slots if (settings.async_migration or settings.promote) else 0
     )
@@ -2864,6 +2908,7 @@ def initialize_model(model, model_config):
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
                 "copy_shape": settings.copy_shape,
+                "spec_rows": settings.spec_rows,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,

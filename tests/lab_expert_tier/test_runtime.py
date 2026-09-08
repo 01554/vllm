@@ -1812,6 +1812,67 @@ class TensorTests(unittest.TestCase):
         for name in rt.TENSORS:
             self.assertTrue(torch.equal(second.cold_cpu[name], ram_before[name]))
 
+    def test_spec_rows_setting_and_speculation_admission(self):
+        base = {
+            rt.PREFIX + "GIB": "32",
+            rt.PREFIX + "PROMOTE": "1",
+            rt.PREFIX + "STAGING": "1",
+            rt.PREFIX + "RAM_BACKING": "1",
+            rt.PREFIX + "GLOBAL_POOL": "1",
+        }
+        with patch.dict(os.environ, {**base, rt.PREFIX + "SPEC_ROWS": "4"}, clear=True):
+            self.assertEqual(rt.Settings.from_env().spec_rows, 4)
+        for bad in ({rt.PREFIX + "SPEC_ROWS": "0"}, {rt.PREFIX + "SPEC_ROWS": "9"}):
+            with (
+                patch.dict(os.environ, {**base, **bad}, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                rt.Settings.from_env()
+        no_pool = {k: v for k, v in base.items() if "GLOBAL_POOL" not in k}
+        with (
+            patch.dict(
+                os.environ, {**no_pool, rt.PREFIX + "SPEC_ROWS": "2"}, clear=True
+            ),
+            self.assertRaises(ValueError),
+        ):
+            rt.Settings.from_env()
+        rt.check_speculation(None, 1)
+        rt.check_speculation(
+            SimpleNamespace(method="ngram", num_speculative_tokens=3), 4
+        )
+        with self.assertRaises(NotImplementedError):
+            rt.check_speculation(
+                SimpleNamespace(method="mtp", num_speculative_tokens=1), 8
+            )
+        with self.assertRaises(NotImplementedError):
+            rt.check_speculation(
+                SimpleNamespace(method="ngram", num_speculative_tokens=4), 4
+            )
+
+    def test_pool_layers_serve_a_verify_step_on_the_decode_path(self):
+        """rows x top_k <= staging keeps a multi-row step on split_global."""
+        pool, (first, second) = self.make_pool_layers(staging=4)
+        chains: list[Any] = []
+        first._run_marlin_chains = lambda x, w, ids, parts: chains.append(parts)
+        first.set_promote_gate(True)
+        x = torch.ones(2, 3, dtype=torch.bfloat16)
+        first.split(x, torch.ones(2, 2), torch.tensor([[4, 1], [5, 4]]))
+        ((experts, tensors, step_map, rows),) = chains[-1]
+        self.assertEqual((experts, rows), ("bank", pool.rows))
+        self.assertGreaterEqual(min(step_map.tolist()[i] for i in (1, 4, 5)), 0)
+        self.assertEqual(
+            first.step_buffers.routes.tolist()[:4],
+            [step_map[4], step_map[1], step_map[5], step_map[4]],
+        )
+        # Three rows exceed the staging width and take the eager path.
+        first.split_fused = lambda x, w, ids: chains.append("eager")
+        first.split(
+            torch.ones(3, 3, dtype=torch.bfloat16),
+            torch.ones(3, 2),
+            torch.tensor([[0, 1]] * 3),
+        )
+        self.assertEqual(chains[-1], "eager")
+
     def test_pool_scratch_width_is_a_power_of_two_above_top_k(self):
         pool, (first, second) = self.make_pool_layers(staging=3)
         self.assertEqual(first.step_buffers.gather_src.shape[0], 4)
