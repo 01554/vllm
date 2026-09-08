@@ -319,6 +319,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        # Speculators that draft from the token history (n-gram) read the
+        # request state tensors at their fixed addresses.
+        bind = getattr(self.speculator, "bind_request_states", None)
+        if bind is not None:
+            bind(self.req_states)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -861,7 +866,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                # None when the target keeps no buffer (e.g. n-gram drafting).
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.propose(
                     input_batch=input_batch,
@@ -1907,7 +1914,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lab expert tier: the host-side routing/migration boundary must run
         # after replays too, which execute no Python inside the model.
         finish_model_forward(
-            self.model, input_batch.num_tokens_after_padding, input_batch.num_tokens
+            self.model,
+            input_batch.num_tokens_after_padding,
+            input_batch.num_tokens,
+            is_decode=not dummy_run and not input_batch.has_prefill,
         )
 
         if self.is_last_pp_rank:
@@ -2077,7 +2087,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                # None when the target keeps no buffer (e.g. n-gram drafting).
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,

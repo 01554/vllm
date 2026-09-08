@@ -132,6 +132,11 @@ class Settings:
     # adapter's fallback); "grouped" calls native_prefill.prefill (grouped
     # GEMM over the same bank and workspace). Decode is unaffected.
     native_prefill: str = "gemv"
+    # Rows at or below this count take the decode GEMV even when the
+    # multi-token path is "grouped": a speculative verify step has
+    # 1 + k <= spec_rows rows and is decode, not prefill. Defaults to
+    # spec_rows (1 without speculation, so the plain decode step only).
+    native_gemv_rows: int = 1
     # Fused per-layer routing record (device observer only): one program
     # writes the observer records, counts, route totals, and the sticky
     # error (including the former device assertion) instead of ~30 small
@@ -211,6 +216,7 @@ class Settings:
             "GLOBAL_POOL",
             "MOE_KERNEL",
             "NATIVE_PREFILL",
+            "NATIVE_GEMV_ROWS",
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
@@ -300,6 +306,11 @@ class Settings:
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
         if native_prefill != "gemv" and moe_kernel != "native":
             raise ValueError("NATIVE_PREFILL requires MOE_KERNEL=native")
+        native_gemv_rows = int(
+            os.environ.get(PREFIX + "NATIVE_GEMV_ROWS", str(spec_rows))
+        )
+        if native_gemv_rows < 1:
+            raise ValueError("NATIVE_GEMV_ROWS must be at least 1")
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -375,6 +386,7 @@ class Settings:
             global_pool == "1",
             moe_kernel,
             native_prefill,
+            native_gemv_rows,
             record_kernel == "1",
             shared_gate,
             native_output,
@@ -1262,7 +1274,10 @@ class TierLayer:
 
         compute: Any = gemv
         workspace_for = self.native_workspace
-        if x.shape[0] > 1 and self.settings.native_prefill == "grouped":
+        if (
+            x.shape[0] > self.settings.native_gemv_rows
+            and self.settings.native_prefill == "grouped"
+        ):
             from .native_prefill import prefill
 
             compute, workspace_for = prefill, self.native_prefill_workspace
@@ -1784,8 +1799,12 @@ class RecordObserver:
         # Graph-safe: a fixed destination written on the forward's stream.
         self.records[:rows, layer_index].copy_(packed)
 
-    def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+    def finish(
+        self, rows, valid_rows, heat_enabled, stream, num_experts, is_decode=None
+    ):
         # One batched D2H at the model boundary, matching update_from_graph.
+        # `is_decode` only steers device snapshot timing; legacy records
+        # observe every forward the same way.
         # This also completes all hot/cold uses before any RAM TEMP migration.
         self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
         stream.synchronize()
@@ -2023,7 +2042,7 @@ class TierCoordinator:
             self.stats["captured_forwards"] += 1
             self.forward_rows = None
 
-    def finish_forward(self, rows, valid_rows=None):
+    def finish_forward(self, rows, valid_rows=None, is_decode=None):
         """Runner-side model boundary: the one host copy per forward.
 
         Called after eager forwards and CUDA Graph replays alike. A replay
@@ -2031,13 +2050,16 @@ class TierCoordinator:
         row count and the static records carry this forward's routing/mask.
         `valid_rows` is the runner's real token count (None when unknown); it
         is an upper bound for observers that defer host readback, never a
-        substitute for the device padding mask.
+        substitute for the device padding mask. `is_decode` is the runner's
+        statement that this forward held no prefill (None when unknown):
+        device observers may snapshot a multi-row decode (verify) step, but
+        never a small prefill.
         """
         with self.lock:
             if self.poisoned:
                 raise RuntimeError("Expert tier is poisoned by a previous failure")
             try:
-                self._finish_forward(rows, valid_rows)
+                self._finish_forward(rows, valid_rows, is_decode)
             except Exception:
                 self.poisoned = True
                 raise
@@ -2065,7 +2087,7 @@ class TierCoordinator:
         if result is not None:
             self._consume(result, plan)
 
-    def _finish_forward(self, rows, valid_rows=None):
+    def _finish_forward(self, rows, valid_rows=None, is_decode=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
             raise ValueError("Runner valid token count exceeds the padded rows")
         if self.device is None or not self.observer.capacity:
@@ -2091,7 +2113,12 @@ class TierCoordinator:
         # the flip and the policy commit precede any new observation or plan.
         self.settle_pending(wait=True)
         result = self.observer.finish(
-            rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
+            rows,
+            valid_rows,
+            self.heat_enabled,
+            stream,
+            self.layers[0].num_experts,
+            is_decode=is_decode,
         )
         # One real forward, counted exactly once whatever the observer returns.
         self.stats["model_forwards"] += 1
@@ -2542,14 +2569,15 @@ def enable_model_heat(model):
     coordinator.enable_heat()
 
 
-def finish_model_forward(model, rows, valid_rows=None):
+def finish_model_forward(model, rows, valid_rows=None, is_decode=None):
     """Runner hook after every model forward: eager, dummy, or graph replay.
 
-    Cheap when the tier is disabled; never reads the environment.
+    Cheap when the tier is disabled; never reads the environment. `is_decode`
+    is the runner's "no prefill in this forward" (None when not stated).
     """
     coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
     if coordinator is not None:
-        coordinator.finish_forward(rows, valid_rows)
+        coordinator.finish_forward(rows, valid_rows, is_decode)
 
 
 def unpack_routes(packed, num_experts):
@@ -2624,7 +2652,7 @@ def _validate_sources(name, layer):
     return sources
 
 
-SPECULATION_METHODS = ("ngram", "mtp")
+SPECULATION_METHODS = ("ngram", "ngram_gpu", "mtp")
 
 
 def check_speculation(speculative_config, spec_rows):
@@ -2910,6 +2938,7 @@ def initialize_model(model, model_config):
             num_experts=tiers[0].num_experts,
             decay=settings.decay,
             sync_period=settings.sync_tokens,
+            max_step_tokens=settings.spec_rows,
             session_id=os.getpid(),
         ),
     )
@@ -2988,6 +3017,7 @@ def initialize_model(model, model_config):
                 "source_bank_retained": settings.ram_backing,
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
+                "native_gemv_rows": settings.native_gemv_rows,
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "native_output": settings.native_output,
