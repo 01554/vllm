@@ -2176,10 +2176,11 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
 
-    def test_native_combine_fp32_is_partition_order_invariant(self):
-        """NATIVE_COMBINE=fp32 accumulates partition outputs in FP32 and rounds
-        once, so the sum does not depend on how experts are split across
-        partitions; the default bf16 path keeps the existing double rounding."""
+    def test_native_combine_fp32_rounds_once_across_partitions(self):
+        """NATIVE_COMBINE=fp32 accumulates the partition outputs in FP32 and
+        rounds once, removing the sequential BF16 roundings between
+        partitions (each partition's own BF16 output is unchanged); the
+        default bf16 path keeps the sequential BF16 adds."""
         from lab_expert_tier import native_nvfp4
 
         torch.manual_seed(0)
@@ -2187,12 +2188,15 @@ class TensorTests(unittest.TestCase):
         exact = sum(p.float() for p in parts).to(torch.bfloat16)  # one rounding
         seen: list[Any] = []
 
+        current_order = [0, 1, 2]
+
         def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
-            out = parts[len(seen) % 3]
+            out = parts[current_order[len(seen) % 3]]
             seen.append(out)
             return out
 
         def run(mode, order):
+            current_order[:] = list(order)
             layer = object.__new__(rt.TierLayer)
             layer.settings = dataclasses.replace(
                 rt.Settings(32 * 2**30), moe_kernel="native", native_combine=mode
@@ -2222,6 +2226,9 @@ class TensorTests(unittest.TestCase):
         a = run("fp32", (0, 1, 2))
         self.assertEqual(a.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(a, exact))
+        # For these BF16 partials the FP32 sum is exact, so the partition order
+        # does not change it here (not a general invariance claim).
+        self.assertTrue(torch.equal(run("fp32", (2, 0, 1)), exact))
         # bf16 path: sequential BF16 adds; may differ from the once-rounded sum.
         b = run("bf16", (0, 1, 2))
         self.assertEqual(b.dtype, torch.bfloat16)
