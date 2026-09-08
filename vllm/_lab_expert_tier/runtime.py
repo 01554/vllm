@@ -174,6 +174,13 @@ class Settings:
     # Copy launch grid: programs per bank and int32 words per iteration.
     copy_programs: int = 0  # 0 = the shape's default (32 stripe / 8 chunks)
     copy_words: int = 4096
+    # Optional whole-device check: tier bytes + the draft reservation must
+    # fit this many GiB before the draft loads (0 = no check). Never a
+    # source of bytes; the reservation comes from the checkpoint headers.
+    vram_budget_gib: float = 0.0
+    # Draft resident bytes may exceed the reservation by this fraction
+    # (load-time buffers, alignment) before the post-load check fails.
+    draft_tolerance: float = 0.05
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -223,6 +230,8 @@ class Settings:
             "CONTROL_FILE",
             "COPY_PROGRAMS",
             "COPY_WORDS",
+            "VRAM_BUDGET_GIB",
+            "DRAFT_TOLERANCE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -290,6 +299,10 @@ class Settings:
             raise ValueError("COPY_PROGRAMS must be nonnegative (0 = default)")
         if copy_words < 32 or copy_words & (copy_words - 1):
             raise ValueError("COPY_WORDS must be a power of two >= 32")
+        vram_budget_gib = float(os.environ.get(PREFIX + "VRAM_BUDGET_GIB", "0"))
+        draft_tolerance = float(os.environ.get(PREFIX + "DRAFT_TOLERANCE", "0.05"))
+        if vram_budget_gib < 0 or not 0 <= draft_tolerance <= 1:
+            raise ValueError("VRAM_BUDGET_GIB >= 0 and 0 <= DRAFT_TOLERANCE <= 1")
         spec_rows = int(os.environ.get(PREFIX + "SPEC_ROWS", "1"))
         if not 1 <= spec_rows <= MAX_SPEC_ROWS:
             raise ValueError(f"SPEC_ROWS must be in [1, {MAX_SPEC_ROWS}]")
@@ -387,6 +400,8 @@ class Settings:
             control_file,
             copy_programs,
             copy_words,
+            vram_budget_gib,
+            draft_tolerance,
         )
 
 
@@ -1868,6 +1883,8 @@ class TierCoordinator:
         # One asynchronous exchange plan in flight, at most.
         self.pending: Any = None
         self.stats = cast("dict[str, int | float]", Counter())
+        self.draft_reserve: dict[str, Any] | None = None
+        self.draft_resident: dict[str, Any] | None = None
         self.per_layer_swaps = [0] * len(layers)
         # MRv2 builtin kernel warmup uses fake requests with mask=False.
         # Only the successful compile_or_warm_up_model tail enables heat.
@@ -2464,6 +2481,7 @@ class TierCoordinator:
         if not route_hot_available:
             snapshot["route_hot"] = None
         snapshot["route_hot_available"] = route_hot_available
+        snapshot["draft_resident"] = self.draft_resident
         snapshot.update(
             {
                 "timestamp_ns": time.time_ns(),
@@ -2681,6 +2699,57 @@ def _compact_one(
     )
     # No original kernel, Parameters, or full source dictionaries escape.
     return tier, refs
+
+
+DRAFT_PREFIXES = {"mtp": "mtp."}
+
+
+def reserve_draft(speculative_config, settings, tier_bytes):
+    """Estimate the draft's checkpoint bytes before it loads (None without a
+    draft model) and, when VRAM_BUDGET_GIB is set, check tier + draft fit."""
+    method = getattr(speculative_config, "method", None)
+    prefix = DRAFT_PREFIXES.get(str(method)) if method is not None else None
+    if prefix is None:
+        return None
+    from .draft_capacity import estimate_draft_bytes
+
+    draft_config = speculative_config.draft_model_config
+    estimate = estimate_draft_bytes(draft_config.model, prefix)
+    estimate["checkpoint"] = draft_config.model
+    budget = int(settings.vram_budget_gib * 2**30)
+    estimate["budget_bytes"] = budget or None
+    estimate["tier_bytes"] = int(tier_bytes)
+    LOGGER.warning("LAB_EXPERT_TIER_DRAFT_RESERVE %s", json.dumps(estimate))
+    if budget and tier_bytes + estimate["bytes"] > budget:
+        raise RuntimeError(
+            f"Tier bytes {tier_bytes} + draft reservation {estimate['bytes']} "
+            f"exceed VRAM_BUDGET_GIB ({budget} bytes)"
+        )
+    return estimate
+
+
+def record_draft_model(target_model, draft_model):
+    """Draft loader hook after the draft is loaded and shares the target's
+    embedding/head: measure unique resident bytes against the reservation.
+
+    No-op without the tier. Shared storage is reported, never charged.
+    """
+    coordinator = getattr(target_model, "_lab_expert_tier_coordinator", None)
+    if coordinator is None:
+        return None
+    from .draft_capacity import check_estimate, measure_resident_bytes
+
+    measured = measure_resident_bytes(draft_model, shared_with=target_model)
+    estimate = coordinator.draft_reserve
+    if estimate is None:
+        raise RuntimeError("Draft model loaded without a tier reservation")
+    result = {
+        **measured,
+        **check_estimate(estimate, measured, coordinator.settings.draft_tolerance),
+    }
+    coordinator.draft_resident = result
+    LOGGER.warning("LAB_EXPERT_TIER_DRAFT_RESIDENT %s", json.dumps(result))
+    return result
 
 
 def initialize_model(model, model_config):
@@ -2922,6 +2991,9 @@ def initialize_model(model, model_config):
     model._lab_expert_tiers = tiers
     model._lab_expert_tier_coordinator = coordinator
     coordinator.pool = pool
+    coordinator.draft_reserve = reserve_draft(
+        config.speculative_config, settings, expected_bytes
+    )
     atexit.register(coordinator.report)
     atexit.register(coordinator.flush)  # LIFO: deliver deferred work first
     actual_bytes = sum(t.hot_bytes + t.staging_bytes + t.spare_bytes for t in tiers)
@@ -2993,6 +3065,7 @@ def initialize_model(model, model_config):
                 "native_output": settings.native_output,
                 "copy_shape": settings.copy_shape,
                 "spec_rows": settings.spec_rows,
+                "draft_reserve": coordinator.draft_reserve,
                 "pool_control": None if pool is None else pool.control(),
                 "control_file": settings.control_file or None,
                 "copy_programs": settings.copy_programs or None,
