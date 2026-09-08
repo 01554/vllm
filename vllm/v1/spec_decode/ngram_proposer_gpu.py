@@ -16,6 +16,7 @@ from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.forward_context import set_forward_context
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -253,13 +254,16 @@ class NgramProposerGPU:
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.device = device
 
-        self.kernel = NgramGPUKernel(
-            vllm_config=self.vllm_config, prefix="ngram_gpu_kernel", device=device
-        )
-        self.kernel.to(device)
-        self.kernel.eval()
+        # The compile wrapper reads the current (global) config, which may
+        # be the uncompiled target's; build and warm the kernel under ours.
+        with set_current_vllm_config(self.vllm_config):
+            self.kernel = NgramGPUKernel(
+                vllm_config=self.vllm_config, prefix="ngram_gpu_kernel", device=device
+            )
+            self.kernel.to(device)
+            self.kernel.eval()
 
-        self._dummy_run()
+            self._dummy_run()
 
     def _dummy_run(self):
         token_ids, num_tokens, sampled_flags, valid_mask = self._generate_dummy_data(
