@@ -285,6 +285,18 @@ boundaries:
   `native_prefill.prefill` (separate ownership) with the same arguments
   and that module's own workspace (allocated at init per physical row
   count) for rows > 1; decode is unaffected either way.
+- **Fused routing record** (`VLLM_LAB_EXPERT_TIER_RECORD_KERNEL`, default 0;
+  needs `OBSERVER=device`). The per-layer routing record was about thirty
+  small kernels per layer (the runtime's routing checks and device
+  assertion, the observer's three record copies, and the accumulator's
+  masks, `any`, `index_add_`, and sums). `device_record.py` writes the
+  same observer tensors with the same meaning in one program per layer
+  (`DeviceObserver.kernel_targets` lends them, `note_kernel_record` does
+  the host bookkeeping); the former device assertion becomes part of the
+  sticky error flag. Rows beyond the fused width (1024 routes) keep the
+  classic path. The torch reference is held equal to the observer's own
+  path by `test_device_record`. FreeToken keeps this bookkeeping inside
+  its LRU kernel. Not verified on a GPU.
 - **Fused shared-expert gate** (`VLLM_LAB_EXPERT_TIER_SHARED_GATE=fused`,
   default `torch`). The Qwen4 exp shared expert's gate,
   `sigmoid(x @ w) * out`, is a cuBLAS dot (two kernels), a sigmoid, and a

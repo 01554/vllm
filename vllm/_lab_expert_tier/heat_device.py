@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 
@@ -836,6 +836,47 @@ class DeviceObserver:
         # Device observers intentionally never own a per-forward host record.
         return None
 
+    def kernel_targets(self):
+        """The tensors a fused per-layer record writes (`device_record`).
+
+        Same meaning as `record_layer` + the accumulator's `record_layer`;
+        the caller owns the semantics, this observer only lends the state.
+        """
+        from .device_record import RecordTargets
+
+        acc = self._accumulator
+        if self._ids_record is None or acc is None:
+            raise RuntimeError("device observer records are not allocated")
+        return RecordTargets(
+            num_layers=cast(int, self._num_layers),
+            num_experts=acc.num_experts,
+            top_k=self._top_k,
+            ids_record=self._ids_record,
+            activity_record=self._activity_record,
+            valid_record=self._valid_record,
+            counts=acc.counts,
+            step_route_total=acc._step_route_total,
+            step_route_hot=acc._step_route_hot,
+            step_valid_tokens=acc._step_valid_tokens,
+            expected_layer=acc._expected_layer,
+            error_flag=acc._error_flag,
+            step_hot_map_seen=acc._step_hot_map_seen,
+            step_hot_map_missing=acc._step_hot_map_missing,
+        )
+
+    def note_kernel_record(self, layer_index: int, rows: int, hot_map: Any) -> None:
+        """Host bookkeeping of `record_layer` after a fused device record."""
+        layer_index = _integer("layer_index", layer_index, 0)
+        rows = _integer("rows", rows, 0)
+        if self._ids_record is None:
+            raise RuntimeError("device observer records are not allocated")
+        if layer_index >= cast(int, self._num_layers) or rows > self._capacity:
+            raise ValueError("record exceeds the observer allocation")
+        if layer_index == 0:
+            self._hot_maps.clear()
+        self._hot_maps[layer_index] = hot_map
+        self._recorded_layers += 1
+
     def _configure_accumulator(
         self,
         device: torch.device,
@@ -934,12 +975,10 @@ class DeviceObserver:
         if self._ids_record is None:
             raise RuntimeError("device observer records are not allocated")
         layer_index = _integer("layer_index", layer_index, 0)
-        ids, activity_flags, valid_mask, rows, hot_map = (
-            DeviceHeatAccumulator._normalise_record_args(
-                self, ids, activity_flags, valid_mask, rows, hot_map
-            )
-        )
-        if layer_index >= self._num_layers or rows > self._capacity:
+        ids, activity_flags, valid_mask, rows, hot_map = cast(
+            Any, DeviceHeatAccumulator
+        )._normalise_record_args(self, ids, activity_flags, valid_mask, rows, hot_map)
+        if layer_index >= cast(int, self._num_layers) or rows > self._capacity:
             raise ValueError("record exceeds the observer allocation")
         if ids.ndim != 2 or ids.shape[1] != self._top_k:
             raise ValueError("routing width does not match the observer allocation")
@@ -949,10 +988,10 @@ class DeviceObserver:
             self._hot_maps.clear()
         self._hot_maps[layer_index] = hot_map
         self._ids_record[:rows, layer_index].copy_(ids[:rows], non_blocking=True)
-        self._activity_record[:rows, layer_index].copy_(
+        cast(Any, self._activity_record)[:rows, layer_index].copy_(
             activity_flags[:rows].ne(0), non_blocking=True
         )
-        self._valid_record[:rows, layer_index].copy_(
+        cast(Any, self._valid_record)[:rows, layer_index].copy_(
             valid_mask[:rows], non_blocking=True
         )
         self._recorded_layers += 1
@@ -997,12 +1036,12 @@ class DeviceObserver:
             # configured, direct records own the layer sequence; a partial
             # sequence is left for ``finish_step`` to flag rather than being
             # counted a second time from the mirror buffers.
-            for layer in range(self._num_layers):
+            for layer in range(cast(int, self._num_layers)):
                 accumulator.record_layer(
                     layer,
                     self._ids_record[:rows, layer],
-                    self._activity_record[:rows, layer],
-                    self._valid_record[:rows, layer],
+                    cast(Any, self._activity_record)[:rows, layer],
+                    cast(Any, self._valid_record)[:rows, layer],
                     rows,
                     self._hot_maps.get(layer),
                 )

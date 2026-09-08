@@ -1992,6 +1992,51 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
 
+    def test_fused_record_setting_and_fallbacks(self):
+        """RECORD_KERNEL needs the device observer; observers without kernel
+        targets and rows beyond the fused width keep the classic path."""
+        from lab_expert_tier import device_record as dr
+
+        env = {rt.PREFIX + "GIB": "32", rt.PREFIX + "RECORD_KERNEL": "1"}
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+        with patch.dict(
+            os.environ, {**env, rt.PREFIX + "OBSERVER": "device"}, clear=True
+        ):
+            self.assertTrue(rt.Settings.from_env().record_kernel)
+        coordinator = self.make_coordinator()
+        tier = SimpleNamespace(index=0, hot_map=None)
+        ids = torch.zeros(1, 2, dtype=torch.int32)
+        self.assertFalse(
+            coordinator._fused_record(tier, 1, ids, torch.ones(1, 2), torch.zeros(1))
+        )
+        calls: list[Any] = []
+        coordinator.observer = SimpleNamespace(
+            kernel_targets=lambda: "targets",
+            note_kernel_record=lambda layer, rows, hot_map: calls.append(
+                ("note", layer, rows, hot_map)
+            ),
+        )
+        with patch.object(
+            dr, "record", lambda *a: calls.append(("record", a[1], a[2]))
+        ):
+            self.assertTrue(
+                coordinator._fused_record(
+                    tier, 1, ids, torch.ones(1, 2), torch.zeros(1, dtype=torch.bool)
+                )
+            )
+            wide = torch.zeros(dr.MAX_LANES, 2, dtype=torch.int32)
+            self.assertFalse(
+                coordinator._fused_record(
+                    tier,
+                    dr.MAX_LANES,
+                    wide,
+                    torch.ones(dr.MAX_LANES, 2),
+                    torch.zeros(dr.MAX_LANES, dtype=torch.bool),
+                )
+            )
+        self.assertEqual(calls, [("record", 0, 1), ("note", 0, 1, None)])
+
     def test_promote_mode_coordinator_observes_only_and_opens_gates(self):
         settings = rt.Settings(
             32 * 2**30, sync_tokens=1, staging=True, promote=True, planner="reference"

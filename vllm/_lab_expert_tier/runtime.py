@@ -131,6 +131,11 @@ class Settings:
     # adapter's fallback); "grouped" calls native_prefill.prefill (grouped
     # GEMM over the same bank and workspace). Decode is unaffected.
     native_prefill: str = "gemv"
+    # Fused per-layer routing record (device observer only): one program
+    # writes the observer records, counts, route totals, and the sticky
+    # error (including the former device assertion) instead of ~30 small
+    # kernels per layer. Rows beyond the fused width take the old path.
+    record_kernel: bool = False
     # Shared-expert gate of the Qwen4 exp MoE block: "torch" (cuBLAS dot,
     # sigmoid, multiply) or "fused" (one Triton program per token,
     # `shared_gate.py`, FreeToken's gate kernel taken one step further).
@@ -172,6 +177,7 @@ class Settings:
             "GLOBAL_POOL",
             "MOE_KERNEL",
             "NATIVE_PREFILL",
+            "RECORD_KERNEL",
             "SHARED_GATE",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
@@ -209,6 +215,9 @@ class Settings:
             raise ValueError("MOE_KERNEL must be marlin or native")
         if moe_kernel == "native" and ram_backing != "1":
             raise ValueError("MOE_KERNEL=native requires RAM_BACKING=1")
+        record_kernel = os.environ.get(PREFIX + "RECORD_KERNEL", "0")
+        if record_kernel not in ("0", "1"):
+            raise ValueError("RECORD_KERNEL must be 0 or 1")
         shared_gate = os.environ.get(PREFIX + "SHARED_GATE", "torch")
         if shared_gate not in ("torch", "fused"):
             raise ValueError("SHARED_GATE must be torch or fused")
@@ -230,6 +239,8 @@ class Settings:
         observer = os.environ.get(PREFIX + "OBSERVER", "records")
         if not observer.isidentifier():
             raise ValueError("OBSERVER must be an observer registry name")
+        if record_kernel == "1" and observer != "device":
+            raise ValueError("RECORD_KERNEL requires OBSERVER=device")
         layer_slots = os.environ.get(PREFIX + "LAYER_SLOTS", "uniform").strip()
         if layer_slots != "uniform":
             try:
@@ -290,6 +301,7 @@ class Settings:
             global_pool == "1",
             moe_kernel,
             native_prefill,
+            record_kernel == "1",
             shared_gate,
         )
 
@@ -1862,6 +1874,11 @@ class TierCoordinator:
             or mask.device != x.device
         ):
             raise ValueError("Expected one boolean padding flag per routing row")
+        if self.settings.record_kernel and self._fused_record(
+            tier, rows, ids, weights, mask
+        ):
+            self.recorded += 1
+            return
         valid = ~mask
         allowed = ((ids >= 0) & (ids < tier.num_experts)) | (
             (ids == -1) & mask[:, None]
@@ -1883,6 +1900,22 @@ class TierCoordinator:
             hot_map=getattr(tier, "hot_map", None),
         )
         self.recorded += 1
+
+    def _fused_record(self, tier, rows, ids, weights, mask):
+        """One-launch record through the device observer's tensors.
+
+        Returns False (caller takes the old path) when the observer has no
+        kernel targets or the rows exceed the fused width.
+        """
+        from .device_record import MAX_LANES, record
+
+        targets = getattr(self.observer, "kernel_targets", None)
+        if targets is None or rows * ids.shape[1] > MAX_LANES:
+            return False
+        hot_map = getattr(tier, "hot_map", None)
+        record(targets(), tier.index, rows, ids, weights, mask, hot_map)
+        cast(Any, self.observer).note_kernel_record(tier.index, rows, hot_map)
+        return True
 
     def end_layer(self, tier):
         if tier.index + 1 != len(self.layers):
@@ -2795,6 +2828,7 @@ def initialize_model(model, model_config):
                 "source_bank_retained": settings.ram_backing,
                 "moe_kernel": settings.moe_kernel,
                 "native_prefill": settings.native_prefill,
+                "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
                 "routing_host_copies_per_model_step": 1,
             },
