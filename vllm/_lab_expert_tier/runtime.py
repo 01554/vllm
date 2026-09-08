@@ -336,8 +336,13 @@ class Settings:
         prefill_stage_rows = int(os.environ.get(PREFIX + "PREFILL_STAGE_ROWS", "0"))
         if prefill_stage_rows < 0:
             raise ValueError("PREFILL_STAGE_ROWS must be nonnegative (0 = off)")
-        if prefill_stage_rows and ram_backing != "1":
-            raise ValueError("PREFILL_STAGE_ROWS requires RAM_BACKING=1")
+        if prefill_stage_rows and (ram_backing != "1" or moe_kernel != "native"):
+            # Only the native chain reads every bank tensor (weights and
+            # scales) from the partition it is handed; the Marlin chain keeps
+            # scales on the layer, so a compact scratch would misindex them.
+            raise ValueError(
+                "PREFILL_STAGE_ROWS requires RAM_BACKING=1 and MOE_KERNEL=native"
+            )
         planner = os.environ.get(PREFIX + "PLANNER", "device")
         if planner not in ("reference", "device"):
             raise ValueError("PLANNER must be reference or device")
@@ -1261,7 +1266,12 @@ class TierLayer:
         valid = (ids >= 0) & (ids < self.num_experts)
         safe = torch.where(valid, ids, torch.zeros_like(ids)).long()
         routed = valid & (cold_map[safe] >= 0)
-        experts = torch.unique(safe[routed])
+        # One dynamic-shape op (unique) per layer: unrouted slots map to a
+        # sentinel past the last expert and are dropped after the sort.
+        sentinel = torch.full_like(safe, self.num_experts)
+        experts = torch.unique(torch.where(routed, safe, sentinel))
+        if experts.numel() and int(experts[-1]) == self.num_experts:
+            experts = experts[:-1]
         rows = scratch[TENSORS[0]].shape[0]
         take = experts[:rows]
         count = int(take.numel())
@@ -1311,7 +1321,7 @@ class TierLayer:
                 getattr(self, "cold_local", self.cold_slots),
             ),
         )
-        scratch = self.prefill_scratch()
+        scratch = self.prefill_scratch() if getattr(self, "native", False) else None
         if scratch is not None and x.shape[0] > self.settings.native_gemv_rows:
             staged, overflow = self.stage_cold_partition(ids, scratch)
             partitions = (partitions[0], staged, overflow)

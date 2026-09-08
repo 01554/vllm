@@ -1042,6 +1042,7 @@ class TensorTests(unittest.TestCase):
         }
         tier.hot_kernel = SimpleNamespace(fused_experts="hot")
         tier.cold_kernel = SimpleNamespace(fused_experts="cold")
+        tier.native = True
         seen: list[Any] = []
         tier._run_marlin_chains = lambda x, w, ids, parts: seen.append(parts)
         rt._PREFILL_SCRATCH.clear()
@@ -1064,10 +1065,26 @@ class TensorTests(unittest.TestCase):
         # Decode row count: the plain two-partition split.
         tier.split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
         self.assertEqual(len(seen[-1]), 2)
+        # Marlin chains keep scales on the layer: no staging there.
+        tier.native = False
+        tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
+        self.assertEqual(len(seen[-1]), 2)
         rt._PREFILL_SCRATCH.clear()
         base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "PREFILL_STAGE_ROWS": "8"}
         with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
+        marlin = {
+            **base,
+            rt.PREFIX + "PROMOTE": "1",
+            rt.PREFIX + "STAGING": "1",
+            rt.PREFIX + "RAM_BACKING": "1",
+        }
+        with patch.dict(os.environ, marlin, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+        with patch.dict(
+            os.environ, {**marlin, rt.PREFIX + "MOE_KERNEL": "native"}, clear=True
+        ):
+            self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
 
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
