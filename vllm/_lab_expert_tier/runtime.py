@@ -164,8 +164,11 @@ class Settings:
     native_output: str = "clone"
     # How a multi-partition native forward combines its partitions (prefill:
     # hot + staged/cold). "bf16": each partition's BF16 output is added in
-    # BF16, so the rounding depends on which experts are resident (state-
-    # dependent numerics). "fp32": accumulate in FP32 and round once.
+    # BF16, adding one rounding per partition that follows the current
+    # placement. "fp32": accumulate the partition outputs in FP32 and round
+    # once at the end. This removes the sequential inter-partition BF16
+    # roundings only; each partition's own BF16 route sum still depends on
+    # which experts it holds, so the result is not placement-invariant.
     native_combine: str = "bf16"
     # Expert row copy launch shape: "stripe" (current) or "chunks"
     # (FreeToken's fast_index_copy_multi shape: 8 programs x 32 warps per
@@ -1451,9 +1454,8 @@ class TierLayer:
                 return out
             # The output aliases the workspace: own it before the next call.
             if self.settings.native_combine == "fp32":
-                # Accumulate in FP32 and round once, so the result does not
-                # depend on how the experts happen to be split across
-                # partitions (resident vs staged/cold) at this moment.
+                # Accumulate in FP32 and round once: fewer placement-dependent
+                # roundings (the per-partition BF16 route sums remain).
                 total = out.float() if total is None else total.add_(out.float())
             else:
                 total = out.clone() if total is None else total.add_(out)
