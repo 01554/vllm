@@ -1763,6 +1763,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        deferred_ple_setter = getattr(self.model_state, "set_deferred_ple_step", None)
+        if deferred_ple_setter is not None:
+            deferred_ple_setter(
+                not dummy_run
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+                and input_batch.num_tokens == 1
+                and input_batch.num_tokens_after_padding == 1
+                and input_batch.num_reqs == 1
+            )
+
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -1816,8 +1826,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            try:
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+                # Host fills must release graph WAITs before any observer,
+                # connector or output path can synchronize the compute stream.
+                complete_ple = getattr(self.model_state, "complete_deferred_ple", None)
+                if complete_ple is not None:
+                    complete_ple()
+            except BaseException:
+                abort_ple = getattr(self.model_state, "abort_deferred_ple", None)
+                if abort_ple is not None:
+                    abort_ple()
+                raise
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
