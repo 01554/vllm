@@ -2351,9 +2351,10 @@ class TierCoordinator:
         # Placement identity: sha256 of the contiguous CPU int32 bytes of each
         # table over the pool-resident range only (hot_phys[K], cold_phys[K],
         # row_key[:P]). The staging sentinel range row_key[P:] and the moving
-        # staging bank contents are excluded. Equal hashes at two points mean
-        # no row moved or exchanged, including same-layer exchanges that a
-        # per-layer resident count cannot see.
+        # staging bank contents are excluded. Equal hashes mean the two
+        # checkpoint placements are identical (including same-layer exchanges
+        # that a per-layer resident count cannot see); they say nothing about
+        # movement between the checkpoints.
         placement: dict[str, Any] = {}
         for name, table in (
             ("hot_phys", tables.hot_phys),
