@@ -2741,6 +2741,12 @@ def record_draft_model(target_model, draft_model):
 
     measured = measure_resident_bytes(draft_model, shared_with=target_model)
     estimate = coordinator.draft_reserve
+    # The measurement is logged before any check so a rejected load still
+    # leaves its breakdown (by dtype, against the header estimate by dtype).
+    LOGGER.warning(
+        "LAB_EXPERT_TIER_DRAFT_MEASURED %s",
+        json.dumps({**measured, "estimate": estimate}),
+    )
     if estimate is None:
         raise RuntimeError("Draft model loaded without a tier reservation")
     result = {

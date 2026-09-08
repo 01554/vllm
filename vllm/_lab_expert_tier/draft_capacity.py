@@ -79,6 +79,7 @@ def measure_resident_bytes(model: Any, shared_with: Any = None) -> dict[str, Any
             foreign.add(tensor.untyped_storage().data_ptr())
     seen: dict[int, int] = {}
     shared: dict[int, int] = {}
+    by_dtype: dict[str, int] = {}
     host = 0
     for tensor in _tensors(model):
         storage = tensor.untyped_storage()
@@ -86,12 +87,18 @@ def measure_resident_bytes(model: Any, shared_with: Any = None) -> dict[str, Any
             host += storage.nbytes()
             continue
         key = storage.data_ptr()
-        (shared if key in foreign else seen)[key] = storage.nbytes()
+        if key in foreign:
+            shared[key] = storage.nbytes()
+        elif key not in seen:
+            seen[key] = storage.nbytes()
+            dtype = str(tensor.dtype).removeprefix("torch.")
+            by_dtype[dtype] = by_dtype.get(dtype, 0) + storage.nbytes()
     return {
         "unique_bytes": sum(seen.values()),
         "shared_bytes": sum(shared.values()),
         "host_bytes": host,
         "storages": len(seen),
+        "by_dtype": dict(sorted(by_dtype.items())),
     }
 
 
