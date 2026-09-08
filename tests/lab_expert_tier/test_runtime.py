@@ -1062,6 +1062,12 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(overflow[2].tolist(), [-1, -1, -1, -1, 2, 3])
         self.assertEqual((tier.prefill_staged_rows, tier.prefill_overflow_rows), (2, 1))
         self.assertIs(tier.prefill_scratch(), scratch)
+        # A layer with a different bank signature gets its own scratch.
+        other = object.__new__(rt.TierLayer)
+        other.settings, other.device = tier.settings, tier.device
+        other.cold = {name: torch.zeros(4, 8, dtype=torch.int32) for name in rt.TENSORS}
+        self.assertIsNot(other.prefill_scratch(), scratch)
+        self.assertEqual(other.prefill_scratch()[rt.TENSORS[0]].shape, (2, 8))
         # Decode row count: the plain two-partition split.
         tier.split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
         self.assertEqual(len(seen[-1]), 2)

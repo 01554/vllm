@@ -66,7 +66,7 @@ MAX_SPEC_ROWS = 8
 NATIVE_KERNEL = SimpleNamespace(fused_experts="native")
 _NATIVE_WORKSPACES: dict[tuple[str, int], Any] = {}
 _NATIVE_PREFILL_WORKSPACES: dict[tuple[str, int], Any] = {}
-_PREFILL_SCRATCH: dict[tuple[str, int], Any] = {}
+_PREFILL_SCRATCH: dict[tuple[Any, ...], Any] = {}
 _CAPTURE_COUNT = 0
 # Never attach CPU owners to Parameter.__dict__: reload metadata copies it.
 _CPU_SOURCES: dict[int, tuple[weakref.ReferenceType[Any], Any]] = {}
@@ -1232,7 +1232,13 @@ class TierLayer:
         rows = self.settings.prefill_stage_rows
         if not rows:
             return None
-        key = (str(self.device), rows)
+        # Keyed by the bank signature too: layers with different row shapes
+        # or dtypes must not share one scratch.
+        signature = tuple(
+            (name, tuple(self.cold[name].shape[1:]), str(self.cold[name].dtype))
+            for name in TENSORS
+        )
+        key = (str(self.device), rows, signature)
         scratch = _PREFILL_SCRATCH.get(key)
         if scratch is None:
             import torch
@@ -1266,12 +1272,16 @@ class TierLayer:
         valid = (ids >= 0) & (ids < self.num_experts)
         safe = torch.where(valid, ids, torch.zeros_like(ids)).long()
         routed = valid & (cold_map[safe] >= 0)
+        if _is_capturing(self.device):
+            raise RuntimeError("Staged prefill cannot run during graph capture")
         # One dynamic-shape op (unique) per layer: unrouted slots map to a
-        # sentinel past the last expert and are dropped after the sort.
+        # sentinel past the last expert; one sentinel is always appended so
+        # the sorted result always ends with it and no scalar is read back.
         sentinel = torch.full_like(safe, self.num_experts)
-        experts = torch.unique(torch.where(routed, safe, sentinel))
-        if experts.numel() and int(experts[-1]) == self.num_experts:
-            experts = experts[:-1]
+        marked = torch.cat(
+            [torch.where(routed, safe, sentinel).reshape(-1), sentinel.reshape(-1)[:1]]
+        )
+        experts = torch.unique(marked)[:-1]
         rows = scratch[TENSORS[0]].shape[0]
         take = experts[:rows]
         count = int(take.numel())
