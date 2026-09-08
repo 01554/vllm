@@ -327,6 +327,17 @@ boundaries:
   rows; contribution not measured. The pool step also skips its pool-wide
   recency load on all-hit layers (FreeToken scans its cache only when
   there is something to fetch).
+- **Speculative rows** (`VLLM_LAB_EXPERT_TIER_SPEC_ROWS`, default 1, max
+  8; above 1 needs `GLOBAL_POOL=1`). The pool decode fast path serves a
+  step of up to `spec_rows` rows: the shared staging holds
+  `spec_rows x top_k` rows and the step program is that wide, so a
+  speculative verify step (1 + k rows per request) stays on the captured
+  decode path with every lane routed (duplicates across rows resolve to
+  one promotion); a wider batch takes the eager path with every row
+  processed, never dropped. vLLM speculation is admitted only for method
+  `ngram` with `1 + num_speculative_tokens <= spec_rows`; draft-model
+  methods (MTP, DFlash, EAGLE) stay rejected until their tier connection
+  lands. Not verified on a GPU.
 - **Supported modes.** Compilation mode must be NONE (no torch.compile), and
   the cudagraph mode must be NONE, FULL_DECODE_ONLY, or FULL. Piecewise
   cudagraphs and `VLLM_USE_BREAKABLE_CUDAGRAPH` are rejected.

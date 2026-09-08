@@ -11,6 +11,7 @@ import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -38,7 +39,10 @@ def tensor_fields(obj):
     }
 
 
-def run_case(gp, graph_mode, cpu_only):
+def run_case(gp, graph_mode, cpu_only, rows=1):
+    """rows > 1: a speculative verify step (rows x top_k lanes per layer)."""
+    lanes = 10 * rows
+    width = 1 << (lanes - 1).bit_length()
     sources = []
     for layer in range(3):
         sources.append(
@@ -54,7 +58,7 @@ def run_case(gp, graph_mode, cpu_only):
                 )
             }
         )
-    cpu = gp.GlobalPool(torch.device("cpu"), sources[0], [250] * 3, 10)
+    cpu = gp.GlobalPool(torch.device("cpu"), sources[0], [250] * 3, lanes)
     for layer in range(3):
         for name in gp.TENSORS:
             cpu.bank[name][layer * 250 : (layer + 1) * 250].copy_(
@@ -62,7 +66,7 @@ def run_case(gp, graph_mode, cpu_only):
             )
     cpu.tables.row_use[:550] = 1
     cpu.tables.clock.fill_(1)
-    cb = [gp.allocate_step_buffers(torch.device("cpu"), 512, 16) for _ in range(3)]
+    cb = [gp.allocate_step_buffers(torch.device("cpu"), 512, width) for _ in range(3)]
     original = [{n: t.clone() for n, t in s.items()} for s in sources]
     gpu = None
     graphs = {}
@@ -74,10 +78,13 @@ def run_case(gp, graph_mode, cpu_only):
             {n: get_accelerator_view_from_cpu_tensor(t) for n, t in s.items()}
             for s in pinned
         ]
-        gpu = gp.GlobalPool(torch.device("cuda"), sources[0], [250] * 3, 10)
-        gb = [gp.allocate_step_buffers(torch.device("cuda"), 512, 16) for _ in range(3)]
+        gpu = gp.GlobalPool(torch.device("cuda"), sources[0], [250] * 3, lanes)
+        gb = [
+            gp.allocate_step_buffers(torch.device("cuda"), 512, width) for _ in range(3)
+        ]
         ids_device = [
-            torch.full((1, 10), -1, dtype=torch.int32, device="cuda") for _ in range(3)
+            torch.full((rows, 10), -1, dtype=torch.int32, device="cuda")
+            for _ in range(3)
         ]
 
         def forward(layer):
@@ -103,20 +110,50 @@ def run_case(gp, graph_mode, cpu_only):
         for name in gp.TENSORS:
             gpu.bank[name].copy_(cpu.bank[name])
 
-    sequence = [
+    sequence: list[tuple[bool, int, Any, str]] = [
         (False, 0, list(range(500, 510)), "staging750"),
         (True, 0, list(range(500, 510)), "physical550"),
         (True, 2, list(range(50, 60)), "cross-layer-return"),
         (True, 0, [500, 500, 501, -1, 502, 509, -1, 500, 508, 508], "duplicates"),
         (True, 1, [-1] * 10, "padding"),
     ]
+    if rows > 1:
+        # Verify-step shapes: every row has its own routes, rows share
+        # experts (deduplicated across rows), and trailing rows are padding.
+        # Expert ids stay below 512 for every row (rows <= 8).
+        base = [
+            (
+                False,
+                0,
+                [list(range(400 + 10 * r, 410 + 10 * r)) for r in range(rows)],
+                "rows-staged",
+            ),
+            (
+                True,
+                0,
+                [list(range(400 + 10 * r, 410 + 10 * r)) for r in range(rows)],
+                "rows-promote",
+            ),
+            (True, 1, [list(range(60, 70))] * rows, "rows-shared"),
+            (
+                True,
+                2,
+                [list(range(100, 110))] + [[-1] * 10] * (rows - 1),
+                "rows-tail-padding",
+            ),
+        ]
+        sequence = [(e, lyr, i, f"{label}[{rows}]") for e, lyr, i, label in base]
     for repeat in range(3):
         for enabled, layer, ids, label in sequence:
-            host_ids = torch.tensor([ids], dtype=torch.int32)
+            host_ids = torch.tensor(ids if rows > 1 else [ids], dtype=torch.int32)
             gp.set_gate(cpu.tables, enabled)
             gp.step(cpu.tables, layer, host_ids, cb[layer])
             gp.copy_in(sources[layer], cpu.bank, cb[layer])
             cpu.snapshot()
+            if repeat == 0 and label.startswith("rows-promote"):
+                # Every lane (rows x top_k) resolves to a row: promoted or staged.
+                for lane in range(lanes):
+                    assert int(cb[layer].routes[lane]) >= 0, (label, lane)
             if repeat == 0 and label == "physical550":
                 assert cpu.tables.hot_phys[500:510].tolist() == list(range(550, 560))
             if label == "staging750" and repeat == 0:
@@ -175,15 +212,16 @@ def run_case(gp, graph_mode, cpu_only):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--rows", type=int, default=1)
     parser.add_argument(
         "--repo", type=Path, default=Path(__file__).resolve().parents[2]
     )
     args = parser.parse_args()
     module = load_pool(args.repo)
     if args.cpu_only:
-        run_case(module, False, True)
+        run_case(module, False, True, args.rows)
     else:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA required; run only as the GPU integration owner")
         for mode in (False, True):
-            run_case(module, mode, False)
+            run_case(module, mode, False, args.rows)
