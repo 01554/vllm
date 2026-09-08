@@ -140,6 +140,13 @@ class Settings:
     # sigmoid, multiply) or "fused" (one Triton program per token,
     # `shared_gate.py`, FreeToken's gate kernel taken one step further).
     shared_gate: str = "torch"
+    # Native decode output: "clone" copies the adapter's workspace output
+    # (one copy per layer) or "alias" returns it directly. The alias is
+    # consumed within the layer by the MoE runner's out-of-place
+    # `shared_output + fused_output` (or by the next layer's hyper-connection
+    # combine without a shared expert), before the next layer's gemv
+    # rewrites the workspace; the two-partition path keeps its own copy.
+    native_output: str = "clone"
 
     def policy_kwargs(self):
         # sync=0 freezes the initial partition, while heat/token credit still
@@ -179,6 +186,7 @@ class Settings:
             "NATIVE_PREFILL",
             "RECORD_KERNEL",
             "SHARED_GATE",
+            "NATIVE_OUTPUT",
         }
         unknown = {k[len(PREFIX) :] for k in os.environ if k.startswith(PREFIX)} - known
         if unknown:
@@ -221,6 +229,9 @@ class Settings:
         shared_gate = os.environ.get(PREFIX + "SHARED_GATE", "torch")
         if shared_gate not in ("torch", "fused"):
             raise ValueError("SHARED_GATE must be torch or fused")
+        native_output = os.environ.get(PREFIX + "NATIVE_OUTPUT", "clone")
+        if native_output not in ("clone", "alias"):
+            raise ValueError("NATIVE_OUTPUT must be clone or alias")
         native_prefill = os.environ.get(PREFIX + "NATIVE_PREFILL", "gemv")
         if native_prefill not in ("gemv", "grouped"):
             raise ValueError("NATIVE_PREFILL must be gemv or grouped")
@@ -303,6 +314,7 @@ class Settings:
             native_prefill,
             record_kernel == "1",
             shared_gate,
+            native_output,
         )
 
 
@@ -1200,6 +1212,14 @@ class TierLayer:
                 workspace_for(tensors),
                 activation=self.native_activation(),
             )
+            if (
+                len(partitions) == 1
+                and x.shape[0] == 1
+                and self.settings.native_output == "alias"
+            ):
+                # Consumed by the runner's out-of-place add (or the next
+                # layer's combine) before the next gemv rewrites it.
+                return out
             # The output aliases the workspace: own it before the next call.
             total = out.clone() if total is None else total.add_(out)
         return total
@@ -2830,6 +2850,7 @@ def initialize_model(model, model_config):
                 "native_prefill": settings.native_prefill,
                 "record_kernel": settings.record_kernel,
                 "shared_gate": settings.shared_gate,
+                "native_output": settings.native_output,
                 "routing_host_copies_per_model_step": 1,
             },
             sort_keys=True,
