@@ -2373,14 +2373,23 @@ class TierCoordinator:
             if bank is None:
                 bank = tier.hot
             bad = torch.zeros(experts.numel(), dtype=torch.bool, device=experts.device)
+            # Row chunks bound the transient device memory to about three
+            # chunk-sized buffers whatever the pool's per-layer balance; each
+            # chunk's copies are dropped before the next one is made.
+            chunk = 32
             for name in TENSORS:
-                device_rows = bank[name].index_select(0, rows).contiguous()
-                source_rows = (
-                    tier.cold[name].index_select(0, experts.long()).contiguous()
-                )
-                db = device_rows.view(torch.uint8).reshape(device_rows.shape[0], -1)
-                sb = source_rows.view(torch.uint8).reshape(source_rows.shape[0], -1)
-                bad |= (db != sb).any(1)
+                for start in range(0, experts.numel(), chunk):
+                    sel = slice(start, start + chunk)
+                    device_rows = bank[name].index_select(0, rows[sel]).contiguous()
+                    source_rows = (
+                        tier.cold[name]
+                        .index_select(0, experts[sel].long())
+                        .contiguous()
+                    )
+                    db = device_rows.view(torch.uint8).reshape(device_rows.shape[0], -1)
+                    sb = source_rows.view(torch.uint8).reshape(source_rows.shape[0], -1)
+                    bad[sel] |= (db != sb).any(1)
+                    del device_rows, source_rows, db, sb
                 tensors_done += 1
             count = int(bad.sum())
             checked += int(experts.numel())
