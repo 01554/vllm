@@ -2176,6 +2176,63 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
 
+    def test_native_combine_fp32_is_partition_order_invariant(self):
+        """NATIVE_COMBINE=fp32 accumulates partition outputs in FP32 and rounds
+        once, so the sum does not depend on how experts are split across
+        partitions; the default bf16 path keeps the existing double rounding."""
+        from lab_expert_tier import native_nvfp4
+
+        torch.manual_seed(0)
+        parts = [torch.randn(4, 16) * 3 for _ in range(3)]
+        exact = sum(p.float() for p in parts).to(torch.bfloat16)
+        seen: list[Any] = []
+
+        def fake_gemv(x, weights, ids, bank, step_map, workspace, *, activation):
+            out = parts[len(seen) % 3].to(torch.bfloat16)
+            seen.append(out)
+            return out
+
+        def run(mode, order):
+            layer = object.__new__(rt.TierLayer)
+            layer.settings = dataclasses.replace(
+                rt.Settings(32 * 2**30), moe_kernel="native", native_combine=mode
+            )
+            layer.native = True
+            layer.num_experts = 6
+            layer.layer = SimpleNamespace(activation="silu")
+            layer.native_workspace = lambda tensors: "ws"
+            seen.clear()
+            partitions = tuple(
+                (
+                    rt.NATIVE_KERNEL,
+                    {"w": None},
+                    torch.full((6,), -1, dtype=torch.int32),
+                    2,
+                )
+                for _ in order
+            )
+            with patch.object(native_nvfp4, "gemv", fake_gemv):
+                return layer._run_native_chains(
+                    torch.ones(4, 16, dtype=torch.bfloat16),
+                    torch.ones(4, 2),
+                    torch.zeros(4, 2, dtype=torch.int32),
+                    partitions,
+                )
+
+        a = run("fp32", (0, 1, 2))
+        self.assertEqual(a.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(a, exact))
+        # bf16 path: sequential BF16 adds; may differ from the once-rounded sum.
+        b = run("bf16", (0, 1, 2))
+        self.assertEqual(b.dtype, torch.bfloat16)
+        double_rounded = (
+            parts[0].to(torch.bfloat16) + parts[1].to(torch.bfloat16)
+        ) + parts[2].to(torch.bfloat16)
+        self.assertTrue(torch.equal(b, double_rounded))
+        base = {rt.PREFIX + "GIB": "32", rt.PREFIX + "NATIVE_COMBINE": "fp64"}
+        with patch.dict(os.environ, base, clear=True), self.assertRaises(ValueError):
+            rt.Settings.from_env()
+
     def test_grouped_native_prefill_is_used_for_multi_token_rows_only(self):
         """NATIVE_PREFILL=grouped routes rows > 1 to native_prefill.prefill
         with the same arguments as gemv; batch-1 decode still uses gemv."""
