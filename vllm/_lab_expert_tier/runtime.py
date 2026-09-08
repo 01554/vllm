@@ -145,6 +145,11 @@ class Settings:
     # gathering host rows through UVA inside the kernel. Experts beyond the
     # scratch rows stay on the UVA partition. 0 = off (default).
     prefill_stage_rows: int = 0
+    # How staged rows reach the scratch: "kernel" = the bank copy kernel
+    # reading the UVA source; "memcpy" = one asynchronous host-to-device copy
+    # per run of consecutive source rows from the pinned host bank (DMA
+    # engine, no SM involvement), with the row list read to the host once.
+    prefill_stage_copy: str = "kernel"
     # Fused per-layer routing record (device observer only): one program
     # writes the observer records, counts, route totals, and the sticky
     # error (including the former device assertion) instead of ~30 small
@@ -233,6 +238,7 @@ class Settings:
             "NATIVE_PREFILL",
             "NATIVE_GEMV_ROWS",
             "PREFILL_STAGE_ROWS",
+            "PREFILL_STAGE_COPY",
             "RECORD_KERNEL",
             "SHARED_GATE",
             "NATIVE_OUTPUT",
@@ -336,6 +342,9 @@ class Settings:
         prefill_stage_rows = int(os.environ.get(PREFIX + "PREFILL_STAGE_ROWS", "0"))
         if prefill_stage_rows < 0:
             raise ValueError("PREFILL_STAGE_ROWS must be nonnegative (0 = off)")
+        prefill_stage_copy = os.environ.get(PREFIX + "PREFILL_STAGE_COPY", "kernel")
+        if prefill_stage_copy not in ("kernel", "memcpy"):
+            raise ValueError("PREFILL_STAGE_COPY must be kernel or memcpy")
         if prefill_stage_rows and (ram_backing != "1" or moe_kernel != "native"):
             # Only the native chain reads every bank tensor (weights and
             # scales) from the partition it is handed; the Marlin chain keeps
@@ -420,6 +429,7 @@ class Settings:
             native_prefill,
             native_gemv_rows,
             prefill_stage_rows,
+            prefill_stage_copy,
             record_kernel == "1",
             shared_gate,
             native_output,
@@ -1287,13 +1297,16 @@ class TierLayer:
         count = int(take.numel())
         src_rows = cold_map[take].to(torch.int32)
         dst_rows = torch.arange(count, dtype=torch.int32, device=ids.device)
-        copy_rows(
-            self.cold,
-            scratch,
-            src_rows,
-            dst_rows,
-            torch.tensor([count], dtype=torch.int32, device=ids.device),
-        )
+        if self.settings.prefill_stage_copy == "memcpy":
+            self._stage_memcpy(scratch, src_rows.tolist())
+        else:
+            copy_rows(
+                self.cold,
+                scratch,
+                src_rows,
+                dst_rows,
+                torch.tensor([count], dtype=torch.int32, device=ids.device),
+            )
         scratch_map = torch.full_like(cold_map, -1)
         scratch_map[take] = dst_rows.to(cold_map.dtype)
         overflow_map = cold_map.clone()
@@ -1304,6 +1317,24 @@ class TierLayer:
         staged = (kernel, scratch, scratch_map, count)
         overflow = (kernel, self.cold, overflow_map, self.prefill_overflow_rows)
         return staged, overflow
+
+    def _stage_memcpy(self, scratch, src_rows):
+        """Host-to-device copies of the pinned source rows into scratch rows
+        0..n-1, one copy per run of consecutive source rows, on the current
+        stream (ordered before the kernel that reads the scratch)."""
+        runs: list[list[int]] = []
+        for i, row in enumerate(src_rows):
+            if runs and row == runs[-1][1] + runs[-1][2]:
+                runs[-1][2] += 1
+            else:
+                runs.append([i, row, 1])
+        for name in TENSORS:
+            source, target = self.cold_cpu[name], scratch[name]
+            for dst, src, length in runs:
+                target[dst : dst + length].copy_(
+                    source[src : src + length], non_blocking=True
+                )
+        self.prefill_stage_copies = len(runs) * len(TENSORS)
 
     def split_fused(self, x, weights, ids):
         """Both partitions into one per-slot row buffer, reduced once.
@@ -3199,6 +3230,7 @@ def initialize_model(model, model_config):
                 "native_prefill": settings.native_prefill,
                 "native_gemv_rows": settings.native_gemv_rows,
                 "prefill_stage_rows": settings.prefill_stage_rows,
+                "prefill_stage_copy": settings.prefill_stage_copy,
                 "prefill_stage_bytes": (
                     settings.prefill_stage_rows * row_sizes[0]
                     if settings.prefill_stage_rows

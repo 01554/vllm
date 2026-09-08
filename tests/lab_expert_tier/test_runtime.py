@@ -1071,6 +1071,17 @@ class TensorTests(unittest.TestCase):
         # Decode row count: the plain two-partition split.
         tier.split_fused(torch.ones(1, 4), torch.ones(1, 2), ids[:1])
         self.assertEqual(len(seen[-1]), 2)
+        # memcpy copy path: same scratch contents, runs of consecutive rows
+        # coalesced (rows 0 and 1 of the source are one run here).
+        tier.settings = dataclasses.replace(tier.settings, prefill_stage_copy="memcpy")
+        tier.cold_cpu = tier.cold
+        for name in rt.TENSORS:
+            scratch[name].fill_(-7)
+        tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
+        for name in rt.TENSORS:
+            self.assertEqual(scratch[name][:2].tolist(), tier.cold[name][:2].tolist())
+        self.assertEqual(tier.prefill_stage_copies, len(rt.TENSORS))
+        tier.settings = dataclasses.replace(tier.settings, prefill_stage_copy="kernel")
         # Marlin chains keep scales on the layer: no staging there.
         tier.native = False
         tier.split_fused(torch.ones(3, 4), torch.ones(3, 2), ids)
@@ -1091,6 +1102,15 @@ class TensorTests(unittest.TestCase):
             os.environ, {**marlin, rt.PREFIX + "MOE_KERNEL": "native"}, clear=True
         ):
             self.assertEqual(rt.Settings.from_env().prefill_stage_rows, 8)
+        with (
+            patch.dict(
+                os.environ,
+                {**base, rt.PREFIX + "PREFILL_STAGE_COPY": "dma"},
+                clear=True,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            rt.Settings.from_env()
 
     def test_fused_split_writes_disjoint_rows_once_and_zeros_padding(self):
         tier = object.__new__(rt.TierLayer)
