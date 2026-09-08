@@ -168,6 +168,84 @@ class GlobalPoolTests(unittest.TestCase):
         self.assertEqual(pool.snapshot(), [3])
         self.assert_bank_holds_owners(pool)
 
+    def test_promote_limit_and_interval_stage_the_rest(self):
+        """Limit caps promotions per layer call; interval promotes on every
+        N-th forward only; both keep every miss served from staging."""
+        pool, sources, buffers = self.setup(layers=1, experts=8, slots=(3,), staging=4)
+        gp.set_gate(pool.tables, True)
+        gp.set_control(pool.tables, promote_limit=1)
+        b = self.run_step(pool, sources, buffers, 0, [3, 4, 5, 6])
+        self.assertEqual((int(b.promoted_count[0]), int(b.staged_count[0])), (1, 3))
+        self.assertTrue(all(int(r) >= 0 for r in b.routes.tolist()))
+        gp.set_control(pool.tables, promote_limit=0, promote_interval=2)
+        # Forward 2 is outside the interval (forwards 1, 3, 5, ... promote):
+        # everything staged, placement frozen.
+        before = pool.tables.hot_phys.clone()
+        b = self.run_step(pool, sources, buffers, 0, [4, 5, -1, -1])
+        self.assertEqual((int(b.promoted_count[0]), int(b.staged_count[0])), (0, 2))
+        self.assertTrue(torch.equal(pool.tables.hot_phys, before))
+        self.assertEqual(int(pool.tables.forwards[0]), 2)
+        # Forward 3: promotion allowed again.
+        b = self.run_step(pool, sources, buffers, 0, [6, 7, -1, -1])
+        self.assertEqual(int(b.promoted_count[0]), 2)
+        pool.snapshot()
+
+    def test_min_misses_and_protect_recent(self):
+        pool, sources, buffers = self.setup(layers=1, experts=8, slots=(3,), staging=4)
+        gp.set_gate(pool.tables, True)
+        gp.set_control(pool.tables, promote_min_misses=2)
+        # First miss of expert 5 is staged; the second promotes it.
+        b = self.run_step(pool, sources, buffers, 0, [5, -1, -1, -1])
+        self.assertEqual(int(b.promoted_count[0]), 0)
+        b = self.run_step(pool, sources, buffers, 0, [5, -1, -1, -1])
+        self.assertEqual(int(b.promoted_count[0]), 1)
+        self.assertEqual(int(pool.tables.miss_count[5]), 0)
+        # Residents now: row 0 = expert 5 (used in the previous forward),
+        # rows 1 and 2 = experts 1 and 2 (never used). With protect_recent=1
+        # the previous forward's row is not a victim: hits on 1 and 2 leave
+        # no victim, so both misses are staged; without protection, 6 takes
+        # row 0.
+        gp.set_control(pool.tables, promote_min_misses=1, protect_recent=1)
+        b = self.run_step(pool, sources, buffers, 0, [1, 2, 6, 7])
+        self.assertEqual((int(b.promoted_count[0]), int(b.staged_count[0])), (0, 2))
+        self.assertEqual(int(pool.tables.hot_phys[5]), 0)
+        gp.set_control(pool.tables, protect_recent=0)
+        b = self.run_step(pool, sources, buffers, 0, [1, 2, 6, 7])
+        self.assertEqual(int(b.promoted_count[0]), 1)
+        self.assertEqual(int(pool.tables.hot_phys[6]), 0)
+        pool.snapshot()
+        with self.assertRaises(ValueError):
+            gp.set_control(pool.tables, promote_interval=0)
+        with self.assertRaises(ValueError):
+            gp.set_control(pool.tables, unknown=1)
+
+    def test_control_file_is_validated_whole_and_applied_on_change(self):
+        import json
+        import os
+        import tempfile
+
+        pool, sources, buffers = self.setup()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.json")
+            self.assertIsNone(pool.poll_control_file(path))  # missing
+            with open(path, "w") as f:
+                json.dump({"promote_limit": 2, "gate": 1}, f)
+            self.assertEqual(
+                pool.poll_control_file(path), {"promote_limit": 2, "gate": 1}
+            )
+            self.assertIsNone(pool.poll_control_file(path))  # unchanged
+            self.assertEqual(pool.control()["promote_limit"], 2)
+            with open(path, "w") as f:
+                json.dump({"promote_limit": 3, "promote_interval": 0}, f)
+            os.utime(path, (1, 1))
+            self.assertIsNone(pool.poll_control_file(path))  # rejected whole
+            self.assertEqual(pool.control()["promote_limit"], 2)
+            with open(path, "w") as f:
+                f.write("{not json")
+            os.utime(path, (2, 2))
+            self.assertIsNone(pool.poll_control_file(path))
+            self.assertEqual(pool.control()["promote_limit"], 2)
+
     def test_no_victim_falls_back_to_staging(self):
         pool, sources, buffers = self.setup(layers=1, experts=4, slots=(2,), staging=3)
         gp.set_gate(pool.tables, True)

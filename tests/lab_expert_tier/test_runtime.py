@@ -1940,6 +1940,35 @@ class TensorTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
             rt.Settings.from_env()
 
+    def test_pool_control_settings(self):
+        base = {rt.PREFIX + "GIB": "32"}
+        env = {
+            **base,
+            rt.PREFIX + "PROMOTE_LIMIT": "4",
+            rt.PREFIX + "PROMOTE_INTERVAL": "3",
+            rt.PREFIX + "PROMOTE_MIN_MISSES": "2",
+            rt.PREFIX + "PROTECT_RECENT": "5",
+            rt.PREFIX + "CONTROL_FILE": "/tmp/ctl.json",
+            rt.PREFIX + "COPY_PROGRAMS": "16",
+            rt.PREFIX + "COPY_WORDS": "2048",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = rt.Settings.from_env()
+        self.assertEqual((settings.promote_limit, settings.promote_interval), (4, 3))
+        self.assertEqual((settings.promote_min_misses, settings.protect_recent), (2, 5))
+        self.assertEqual(settings.control_file, "/tmp/ctl.json")
+        self.assertEqual((settings.copy_programs, settings.copy_words), (16, 2048))
+        for bad in (
+            {rt.PREFIX + "PROMOTE_INTERVAL": "0"},
+            {rt.PREFIX + "PROMOTE_LIMIT": "-1"},
+            {rt.PREFIX + "COPY_WORDS": "3000"},
+        ):
+            with (
+                patch.dict(os.environ, {**base, **bad}, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                rt.Settings.from_env()
+
     def test_pool_host_swap_while_gated_copies_in_and_restores(self):
         pool, (first, second) = self.make_pool_layers()
         temp = {name: torch.zeros(3, dtype=torch.int32) for name in rt.TENSORS}
