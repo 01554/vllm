@@ -68,6 +68,7 @@ class DeviceSnapshot:
     route_total: int = 0
     verified: bool = True
     last_step_tokens: int | None = None
+    is_decode: bool | None = None
     base_tokens_total: int | None = None
     base_version: int | None = None
     base_last_sync_tokens: int | None = None
@@ -181,6 +182,7 @@ class DeviceHeatAccumulator:
         *,
         decay: float = 0.999,
         sync_period: int = 50,
+        max_step_tokens: int = 1,
         initial_scores: Sequence[Sequence[float]] | torch.Tensor | None = None,
         device: torch.device | str | None = None,
         top_k: int | None = None,
@@ -198,6 +200,7 @@ class DeviceHeatAccumulator:
         if self.decay > 1.0:
             raise ValueError("decay must be <= 1")
         self.sync_period = _integer("sync_period", sync_period, 0)
+        self.max_step_tokens = _integer("max_step_tokens", max_step_tokens, 1)
         self.top_k = None if top_k is None else _integer("top_k", top_k, 1)
         self.max_rows = None if max_rows is None else _integer("max_rows", max_rows, 1)
         if not isinstance(enabled, bool):
@@ -300,6 +303,7 @@ class DeviceHeatAccumulator:
         self._host_tokens_total = self._base_tokens_total
         self._host_last_sync_tokens = self._base_last_sync_tokens
         self._host_last_step_tokens = 0
+        self._host_is_decode: bool | None = None
         self._host_forwards = 0
         self._host_route_total = 0
         self._host_due = False
@@ -552,9 +556,18 @@ class DeviceHeatAccumulator:
             )
         self._expected_layer.add_(1)
 
-    def finish_step(self, num_tokens: int, *, heat_enabled: bool | None = None) -> None:
+    def finish_step(
+        self,
+        num_tokens: int,
+        *,
+        heat_enabled: bool | None = None,
+        is_decode: bool | None = None,
+    ) -> None:
         """Finish one complete model step using the known true-token count."""
         num_tokens = _integer("num_tokens", num_tokens, 0)
+        if is_decode is not None and not isinstance(is_decode, bool):
+            raise ValueError("is_decode must be bool or None")
+        self._host_is_decode = is_decode
         if heat_enabled is not None:
             self._set_gate(heat_enabled)
 
@@ -658,7 +671,13 @@ class DeviceHeatAccumulator:
 
     def should_snapshot(self) -> bool:
         """Return whether a due snapshot may be emitted at this boundary."""
-        return self._host_due and self._host_last_step_tokens == 1
+        return (
+            self._host_due
+            and self._host_is_decode is not False
+            and 0
+            < self._host_last_step_tokens
+            <= (self.max_step_tokens if self._host_is_decode is True else 1)
+        )
 
     def _copy_heat_to_tuple(self) -> tuple[tuple[float, ...], ...]:
         # This is the only heat D2H path.  The clone and nested tuples ensure
@@ -687,6 +706,7 @@ class DeviceHeatAccumulator:
             route_total=route_total_total,
             verified=not invalid,
             last_step_tokens=self._host_last_step_tokens,
+            is_decode=self._host_is_decode,
             base_tokens_total=self._base_tokens_total,
             base_version=self._base_version,
             base_last_sync_tokens=self._base_last_sync_tokens,
@@ -717,7 +737,7 @@ class DeviceHeatAccumulator:
         The default mode leaves cadence ownership with policy ``rebase`` for
         compatibility with the exchange observer.  Promote has no placement
         commit to advance that clock, so observation-only mode consumes a due
-        boundary only for an eligible single-token snapshot.  A later crossed
+        boundary only for an eligible bounded-row snapshot.  A later crossed
         boundary remains due when acknowledgement is delayed.
         """
         if snapshot.session_id != self.session_id:
@@ -730,7 +750,11 @@ class DeviceHeatAccumulator:
         if (
             self._observation_only
             and snapshot.resync_due is True
-            and snapshot.last_step_tokens == 1
+            and snapshot.last_step_tokens is not None
+            and snapshot.is_decode is not False
+            and 0
+            < snapshot.last_step_tokens
+            <= (self.max_step_tokens if snapshot.is_decode is True else 1)
             and self._host_due
             and self.sync_period > 0
         ):
@@ -790,6 +814,7 @@ class DeviceObserver:
         *,
         decay: float = 0.999,
         sync_period: int = 50,
+        max_step_tokens: int = 1,
         initial_scores: Sequence[Sequence[float]] | torch.Tensor | None = None,
         session_id: str | int | None = None,
         observation_only: bool = False,
@@ -802,6 +827,7 @@ class DeviceObserver:
         )
         self._decay = _number("decay", decay)
         self._sync_period = _integer("sync_period", sync_period, 0)
+        self._max_step_tokens = _integer("max_step_tokens", max_step_tokens, 1)
         self._initial_scores = initial_scores
         self._session_id = session_id
         if not isinstance(observation_only, bool):
@@ -896,6 +922,7 @@ class DeviceObserver:
                 self._num_experts,
                 decay=self._decay,
                 sync_period=self._sync_period,
+                max_step_tokens=self._max_step_tokens,
                 initial_scores=self._initial_scores,
                 device=device,
                 top_k=top_k,
@@ -1007,6 +1034,7 @@ class DeviceObserver:
         heat_enabled: bool,
         stream: Any = None,
         num_experts: int | None = None,
+        is_decode: bool | None = None,
     ) -> DeviceSnapshot | Deferred:
         """Finish a model boundary and return a snapshot, legacy result, or defer."""
         rows = _integer("rows", rows, 1)
@@ -1047,7 +1075,9 @@ class DeviceObserver:
                 )
         self._recorded_layers = 0
         self._hot_maps.clear()
-        accumulator.finish_step(valid_rows, heat_enabled=heat_enabled)
+        accumulator.finish_step(
+            valid_rows, heat_enabled=heat_enabled, is_decode=is_decode
+        )
         if not heat_enabled:
             return Deferred()
         if accumulator.should_snapshot():

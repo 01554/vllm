@@ -1914,7 +1914,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lab expert tier: the host-side routing/migration boundary must run
         # after replays too, which execute no Python inside the model.
         finish_model_forward(
-            self.model, input_batch.num_tokens_after_padding, input_batch.num_tokens
+            self.model,
+            input_batch.num_tokens_after_padding,
+            input_batch.num_tokens,
+            is_decode=not dummy_run and not input_batch.has_prefill,
         )
 
         if self.is_last_pp_rank:

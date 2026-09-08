@@ -1841,6 +1841,9 @@ class TensorTests(unittest.TestCase):
         rt.check_speculation(
             SimpleNamespace(method="ngram", num_speculative_tokens=3), 4
         )
+        rt.check_speculation(
+            SimpleNamespace(method="ngram_gpu", num_speculative_tokens=3), 4
+        )
         with self.assertRaises(NotImplementedError):
             rt.check_speculation(
                 SimpleNamespace(method="mtp", num_speculative_tokens=1), 8
@@ -2330,11 +2333,15 @@ class TensorTests(unittest.TestCase):
         rt.finish_model_forward(
             SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8
         )
-        coordinator.finish_forward.assert_called_once_with(8, None)
+        coordinator.finish_forward.assert_called_once_with(8, None, None)
         rt.finish_model_forward(
             SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8, 1
         )
-        coordinator.finish_forward.assert_called_with(8, 1)
+        coordinator.finish_forward.assert_called_with(8, 1, None)
+        rt.finish_model_forward(
+            SimpleNamespace(_lab_expert_tier_coordinator=coordinator), 8, 2, True
+        )
+        coordinator.finish_forward.assert_called_with(8, 2, True)
 
     def test_observer_seam_dispatches_legacy_deferred_and_device_snapshots(self):
         class Observer(rt.RecordObserver):
@@ -2352,7 +2359,15 @@ class TensorTests(unittest.TestCase):
             def rebase(self, **state):
                 self.rebased.append(state)
 
-            def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+            def finish(
+                self,
+                rows,
+                valid_rows,
+                heat_enabled,
+                stream,
+                num_experts,
+                is_decode=None,
+            ):
                 self.calls.append((rows, valid_rows, heat_enabled))
                 result = self.results.pop(0)
                 if result == "legacy":

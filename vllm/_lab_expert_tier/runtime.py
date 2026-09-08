@@ -1797,8 +1797,12 @@ class RecordObserver:
         # Graph-safe: a fixed destination written on the forward's stream.
         self.records[:rows, layer_index].copy_(packed)
 
-    def finish(self, rows, valid_rows, heat_enabled, stream, num_experts):
+    def finish(
+        self, rows, valid_rows, heat_enabled, stream, num_experts, is_decode=None
+    ):
         # One batched D2H at the model boundary, matching update_from_graph.
+        # `is_decode` only steers device snapshot timing; legacy records
+        # observe every forward the same way.
         # This also completes all hot/cold uses before any RAM TEMP migration.
         self.records_host[:rows].copy_(self.records[:rows], non_blocking=True)
         stream.synchronize()
@@ -2036,7 +2040,7 @@ class TierCoordinator:
             self.stats["captured_forwards"] += 1
             self.forward_rows = None
 
-    def finish_forward(self, rows, valid_rows=None):
+    def finish_forward(self, rows, valid_rows=None, is_decode=None):
         """Runner-side model boundary: the one host copy per forward.
 
         Called after eager forwards and CUDA Graph replays alike. A replay
@@ -2044,13 +2048,16 @@ class TierCoordinator:
         row count and the static records carry this forward's routing/mask.
         `valid_rows` is the runner's real token count (None when unknown); it
         is an upper bound for observers that defer host readback, never a
-        substitute for the device padding mask.
+        substitute for the device padding mask. `is_decode` is the runner's
+        statement that this forward held no prefill (None when unknown):
+        device observers may snapshot a multi-row decode (verify) step, but
+        never a small prefill.
         """
         with self.lock:
             if self.poisoned:
                 raise RuntimeError("Expert tier is poisoned by a previous failure")
             try:
-                self._finish_forward(rows, valid_rows)
+                self._finish_forward(rows, valid_rows, is_decode)
             except Exception:
                 self.poisoned = True
                 raise
@@ -2078,7 +2085,7 @@ class TierCoordinator:
         if result is not None:
             self._consume(result, plan)
 
-    def _finish_forward(self, rows, valid_rows=None):
+    def _finish_forward(self, rows, valid_rows=None, is_decode=None):
         if valid_rows is not None and not 0 <= valid_rows <= rows:
             raise ValueError("Runner valid token count exceeds the padded rows")
         if self.device is None or not self.observer.capacity:
@@ -2104,7 +2111,12 @@ class TierCoordinator:
         # the flip and the policy commit precede any new observation or plan.
         self.settle_pending(wait=True)
         result = self.observer.finish(
-            rows, valid_rows, self.heat_enabled, stream, self.layers[0].num_experts
+            rows,
+            valid_rows,
+            self.heat_enabled,
+            stream,
+            self.layers[0].num_experts,
+            is_decode=is_decode,
         )
         # One real forward, counted exactly once whatever the observer returns.
         self.stats["model_forwards"] += 1
@@ -2555,14 +2567,15 @@ def enable_model_heat(model):
     coordinator.enable_heat()
 
 
-def finish_model_forward(model, rows, valid_rows=None):
+def finish_model_forward(model, rows, valid_rows=None, is_decode=None):
     """Runner hook after every model forward: eager, dummy, or graph replay.
 
-    Cheap when the tier is disabled; never reads the environment.
+    Cheap when the tier is disabled; never reads the environment. `is_decode`
+    is the runner's "no prefill in this forward" (None when not stated).
     """
     coordinator = getattr(model, "_lab_expert_tier_coordinator", None)
     if coordinator is not None:
-        coordinator.finish_forward(rows, valid_rows)
+        coordinator.finish_forward(rows, valid_rows, is_decode)
 
 
 def unpack_routes(packed, num_experts):
@@ -2648,7 +2661,7 @@ def check_speculation(speculative_config, spec_rows):
     if speculative_config is None:
         return
     method = getattr(speculative_config, "method", None)
-    if method != "ngram":
+    if method not in ("ngram", "ngram_gpu"):
         raise NotImplementedError(
             f"Expert tier admits speculation with method ngram only, got {method!r}"
         )
@@ -2913,6 +2926,7 @@ def initialize_model(model, model_config):
             num_experts=tiers[0].num_experts,
             decay=settings.decay,
             sync_period=settings.sync_tokens,
+            max_step_tokens=settings.spec_rows,
             session_id=os.getpid(),
         ),
     )
