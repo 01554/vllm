@@ -23,6 +23,9 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # model-level post-load hook, so target offloading cannot capture MTP.
         with draft_load_scope():
             draft_model = load_eagle_model(target_model, self.vllm_config)
+        from vllm._lab_expert_tier.runtime import record_draft_model
+
+        record_draft_model(target_model, draft_model)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config
