@@ -30,11 +30,15 @@ from collections import OrderedDict
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     ExpertWeightResult,
     MoECacheSplit,
     _pinned_cpu_copy,
 )
+
+logger = init_logger(__name__)
+_STATS_LOG_INTERVAL = 1000
 
 
 class RowCacheWeightProvider:
@@ -162,7 +166,21 @@ class RowCacheWeightProvider:
             "prepare_calls": self._prepare_calls,
             "generation": self._generation,
             "last_copies": len(self._in_flight),
+            "slot_bytes": self.slot_bytes(),
+            "host_bytes": self.host_bytes(),
         }
+
+    def slot_bytes(self) -> int:
+        """Device bytes held by the slot buffers (all six tensors)."""
+        return sum(
+            t.numel() * t.element_size() for t in self._buf.values() if t is not None
+        )
+
+    def host_bytes(self) -> int:
+        """Pinned host bytes of the source (aliased when the input was pinned)."""
+        return sum(
+            t.numel() * t.element_size() for t in self._cpu.values() if t is not None
+        )
 
     def invalidate(self, expert_id: int) -> None:
         self._check_owner_stream()
@@ -243,6 +261,19 @@ class RowCacheWeightProvider:
         self._check_owner_stream()
         self._prepare_calls += 1
         self._generation += 1
+        if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
+            st = self.stats()
+            logger.info(
+                "Row expert cache: %d hits, %d misses, %d evictions, "
+                "%d/%d slots resident, slot %.1f MiB, host %.1f MiB",
+                st["hits"],
+                st["misses"],
+                st["evictions"],
+                len(self._lru),
+                self.capacity,
+                st["slot_bytes"] / 2**20,
+                st["host_bytes"] / 2**20,
+            )
         cuda = self.device.type == "cuda"
         if cuda:
             owner = torch.cuda.current_stream(self.device)
