@@ -1123,6 +1123,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         assert not self.is_monolithic
         assert self.moe_kernel is not None
 
+        pool_layer = layer.expert_pool_layer
+        if pool_layer is not None:
+            if shared_experts is not None:
+                raise NotImplementedError(
+                    "expert pool does not overlap shared experts inside apply()"
+                )
+            return pool_layer.apply(x, topk_weights, topk_ids)
+        if layer.expert_pool_pending:
+            raise RuntimeError(
+                f"{layer.layer_name}: expert pool was requested but not installed"
+            )
+
         provider = layer.expert_weight_provider
         if provider is not None:
 

@@ -187,6 +187,10 @@ class RoutedExperts(PluggableLayer):
         self._moe_expert_cache_size = offload_config.moe_expert_cache_size
         self._moe_expert_cache_split = offload_config.moe_expert_cache_split
         self._moe_expert_cache_provider = offload_config.moe_expert_cache_provider
+        # Pool provider: set after loading (pending) and bound by
+        # expert_pool.install_expert_pool at the model level.
+        self.expert_pool_pending = False
+        self.expert_pool_layer: Any = None
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
@@ -219,10 +223,12 @@ class RoutedExperts(PluggableLayer):
             )
         vllm_config = get_current_vllm_config()
         # No model_config: a layer built directly (unit tests); VllmConfig
-        # applies the same guard when it configures splitting_ops.
+        # applies the same guard when it configures splitting_ops. The pool
+        # provider runs no host code in the forward and needs no split.
         if (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
+            and self._moe_expert_cache_provider != "pool"
         ):
             from vllm.compilation.breakable_cudagraph import (
                 is_breakable_cudagraph_enabled,
@@ -288,6 +294,11 @@ class RoutedExperts(PluggableLayer):
                 "not supported (moe_expert_cache_size > 0)."
             )
         if self._moe_expert_cache_size == 0:
+            return
+        if self._moe_expert_cache_provider == "pool":
+            # The layer keeps its pinned host tensors as the pool's source;
+            # the bank and the consumer are bound at the model level.
+            self.expert_pool_pending = True
             return
         if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
             raise ValueError(

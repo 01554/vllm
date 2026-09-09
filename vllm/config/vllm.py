@@ -1704,6 +1704,7 @@ class VllmConfig:
             self.model_config is not None
             and self.offload_config.moe_expert_cache_size > 0
             and not self.model_config.enforce_eager
+            and self.offload_config.moe_expert_cache_provider != "pool"
         ):
             from vllm.compilation.breakable_cudagraph import (
                 is_breakable_cudagraph_enabled,
