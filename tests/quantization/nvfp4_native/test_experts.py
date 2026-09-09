@@ -32,6 +32,9 @@ def make_experts(gemv_rows=1, max_num_tokens=8):
         experts_per_token=4, max_num_tokens=max_num_tokens
     )
     experts.gemv_rows = gemv_rows
+    experts.quant_config = SimpleNamespace(
+        gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None
+    )
     experts._bank = None
     experts._step_map = None
     experts._decode_workspace = None
@@ -141,6 +144,37 @@ class NativeExpertsTests(unittest.TestCase):
         c = make_experts(max_num_tokens=16)
         c.process_weights_after_loading(self.layer)
         self.assertIsNot(a._prefill_workspace, c._prefill_workspace)
+
+    def test_unsupported_configurations_are_rejected_explicitly(self):
+        ok = SimpleNamespace(
+            in_dtype=torch.bfloat16,
+            is_lora_enabled=False,
+            has_bias=False,
+            swiglu_limit=None,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+        )
+        self.assertIsNone(NativeNvFp4Experts._unsupported_reason(ok))
+        for field, value in (
+            ("in_dtype", torch.float16),
+            ("is_lora_enabled", True),
+            ("has_bias", True),
+            ("swiglu_limit", 7.0),
+            ("swiglu_alpha", 1.702),
+            ("swiglu_beta", 1.0),
+        ):
+            bad = SimpleNamespace(**{**vars(ok), field: value})
+            reason = NativeNvFp4Experts._unsupported_reason(bad)
+            self.assertIsNotNone(reason, field)
+            self.assertIn(field.split("_")[0], reason.replace("activations", "in"))
+
+    def test_quant_config_activation_parameters_are_rejected(self):
+        experts = make_experts()
+        experts.quant_config = SimpleNamespace(
+            gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=7.0
+        )
+        with self.assertRaises(ValueError):
+            experts.process_weights_after_loading(self.layer)
 
     def test_rejects_unsupported_calls(self):
         experts = make_experts()

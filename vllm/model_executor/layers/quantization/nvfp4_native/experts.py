@@ -90,6 +90,9 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         super().__init__(moe_config, quant_config)
         if gemv_rows < 1:
             raise ValueError("gemv_rows must be positive")
+        problem = self._unsupported_reason(moe_config)
+        if problem is not None:
+            raise ValueError(f"native NVFP4 experts: {problem}")
         self.gemv_rows = gemv_rows
         self._bank: native_bank.Bank | None = None
         self._step_map: torch.Tensor | None = None
@@ -97,6 +100,36 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         self._prefill_workspace: native_prefill.Workspace | None = None
 
     # --- capability statics -------------------------------------------------
+
+    @staticmethod
+    def _unsupported_reason(moe_config: FusedMoEConfig) -> str | None:
+        """Configurations the kernels cannot honour; rejected explicitly
+        rather than silently computing something else."""
+        if moe_config.in_dtype != torch.bfloat16:
+            return f"activations must be bfloat16, got {moe_config.in_dtype}"
+        if getattr(moe_config, "is_lora_enabled", False):
+            return "LoRA is not supported"
+        if getattr(moe_config, "has_bias", False):
+            return "expert bias is not supported"
+        for name in ("swiglu_limit", "swiglu_alpha", "swiglu_beta"):
+            if getattr(moe_config, name, None) is not None:
+                return f"{name} is not supported (plain SiLU only)"
+        return None
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        problem = NativeNvFp4Experts._unsupported_reason(moe_config)
+        if problem is not None:
+            return False, f"kernel does not support {problem}"
+        return mk.FusedMoEExpertsModular.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -140,6 +173,11 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
     # --- weights ------------------------------------------------------------
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            if getattr(self.quant_config, name, None) is not None:
+                raise ValueError(
+                    f"native NVFP4 experts: {name} is not supported (plain SiLU only)"
+                )
         bank = {name: getattr(layer, name).data for name in BANK_TENSORS}
         rows, _hidden, _intermediate = native_bank.validate_bank(bank)
         top_k = self.moe_config.experts_per_token
