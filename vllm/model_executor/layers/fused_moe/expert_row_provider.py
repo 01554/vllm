@@ -176,7 +176,7 @@ class RowCacheWeightProvider:
         if slot is not None:
             self._free.append(slot)
             self._map_host[expert_id] = -1
-            self._map[expert_id] = -1
+            self._upload_map(self._map, self._map_host)
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -270,13 +270,17 @@ class RowCacheWeightProvider:
                 )
                 del self._lru[victim]
                 self._map_host[victim] = -1
-                self._map[victim] = -1
                 self.evictions += 1
             copies.append((e, slot))
             self._lru[e] = slot
             self._map_host[e] = slot
-            self._map[e] = slot
             self.promotions += 1
+        # One non-blocking upload per map. Per-element writes to a device
+        # tensor (`map[e] = slot`) stage through pageable host memory and
+        # block the host until the owner stream drains, i.e. until the
+        # previous reader has finished -- which would hide the very ordering
+        # the release event is meant to provide.
+        self._upload_map(self._map, self._map_host)
         if cuda:
             assert self._copy_stream is not None and self._ready_event is not None
             with torch.cuda.stream(self._copy_stream):
@@ -290,9 +294,10 @@ class RowCacheWeightProvider:
                 self._fill_slot(e, slot)
         self._in_flight = copies
         # Rows not requested in this forward are hidden (-1) for this call.
-        forward_map = torch.full_like(self._map, -1)
+        forward_host = [-1] * self._num_experts
         for e in unique_ids:
-            forward_map[e] = self._map_host[e]
+            forward_host[e] = self._map_host[e]
+        forward_map = self._upload_map(None, forward_host)
         return ExpertWeightResult(
             w1=self._buf["w13"],
             w2=self._buf["w2"],
@@ -302,6 +307,23 @@ class RowCacheWeightProvider:
         )
 
     # --- internals ----------------------------------------------------------
+
+    def _upload_map(
+        self, target: torch.Tensor | None, values: list[int]
+    ) -> torch.Tensor:
+        """Copy `values` into `target` (or a new tensor) without a host sync.
+
+        The staging tensor is pinned when the map lives on CUDA; the caching
+        host allocator keeps it alive until the enqueued copy has consumed it.
+        """
+        host = torch.tensor(values, dtype=torch.int32)
+        cuda = self._map.device.type == "cuda"
+        if cuda:
+            host = host.pin_memory()
+        if target is None:
+            return host.to(self._map.device, non_blocking=cuda)
+        target.copy_(host, non_blocking=cuda)
+        return target
 
     def _check_owner_stream(self) -> None:
         if self.device.type != "cuda":
