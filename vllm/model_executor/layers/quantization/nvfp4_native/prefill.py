@@ -93,6 +93,58 @@ def allocate_workspace(
     return workspace
 
 
+def prefill_scratch_layout(
+    hidden: int, intermediate: int, max_tokens: int, top_k: int, num_experts: int
+) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+    """Name, shape and dtype of every prefill scratch buffer, in carve order."""
+    from .bank import decode_scratch_layout
+
+    route_capacity = max_tokens * top_k
+    max_sorted = route_capacity + num_experts * (32 - 1)
+    max_sorted = ((max_sorted + 32 - 1) // 32) * 32
+    max_blocks = (max_sorted + 16 - 1) // 16
+    layout = decode_scratch_layout(hidden, intermediate, max_tokens, top_k)
+    layout[2] = ("activated", (route_capacity, intermediate), torch.bfloat16)
+    return layout + [
+        ("logical_routes", (max_tokens, top_k), torch.int32),
+        ("sorted_token_ids", (max_sorted,), torch.int32),
+        ("logical_expert_ids", (max_blocks,), torch.int32),
+        ("physical_expert_ids", (max_blocks,), torch.int32),
+        ("num_tokens_post_padded", (1,), torch.int32),
+    ]
+
+
+def carve_workspace(
+    bank: Bank,
+    buffer: torch.Tensor,
+    max_tokens: int,
+    top_k: int,
+    error: torch.Tensor,
+    *,
+    num_experts: int = 512,
+) -> Workspace:
+    """A prefill Workspace whose buffers are views of ``buffer`` (uint8)."""
+    from .bank import carve_scratch
+
+    rows, hidden, intermediate = validate_bank(bank)
+    if min(max_tokens, top_k, num_experts) <= 0:
+        raise ValueError("workspace capacities must be positive")
+    views = carve_scratch(
+        buffer,
+        prefill_scratch_layout(hidden, intermediate, max_tokens, top_k, num_experts),
+    )
+    return Workspace(
+        num_experts=num_experts,
+        num_rows=rows,
+        hidden=hidden,
+        intermediate=intermediate,
+        max_tokens=max_tokens,
+        top_k=top_k,
+        error=error,
+        **views,
+    )
+
+
 def _validate_inputs(
     x: torch.Tensor,
     weights: torch.Tensor,

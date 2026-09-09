@@ -37,8 +37,8 @@ def make_experts(gemv_rows=1, max_num_tokens=8):
     )
     experts._bank = None
     experts._step_map = None
-    experts._decode_workspace = None
-    experts._prefill_workspace = None
+    experts._error = None
+    experts._rows = experts._hidden = experts._intermediate = 0
     return experts
 
 
@@ -52,8 +52,13 @@ class NativeExpertsTests(unittest.TestCase):
         self.ids = torch.tensor([[0, 2, 0, -1]] * 3, dtype=torch.int32)
         self.x = torch.full((3, 32), 0.0625, dtype=torch.bfloat16)
 
-    def run_apply(self, experts, rows):
+    def run_apply(self, experts, rows, scratch=None):
         out = torch.empty((rows, 32), dtype=torch.bfloat16)
+        if scratch is None:
+            _w1, (elems,), _o = experts.workspace_shapes(
+                rows, 16, 32, 4, 3, 3, None, MoEActivation.SILU
+            )
+            scratch = torch.empty((elems,), dtype=torch.bfloat16)
         experts.apply(
             out,
             self.x[:rows],
@@ -67,7 +72,7 @@ class NativeExpertsTests(unittest.TestCase):
             None,
             None,
             torch.empty(0),
-            torch.empty(0),
+            scratch,
             None,
             False,
         )
@@ -88,13 +93,29 @@ class NativeExpertsTests(unittest.TestCase):
             NativeNvFp4Experts._supports_parallel_config(SimpleNamespace(use_ep=True))
         )
 
-    def test_process_weights_builds_identity_map_and_workspaces(self):
+    def test_process_weights_keeps_only_bank_map_and_error(self):
         experts = make_experts()
         experts.process_weights_after_loading(self.layer)
         self.assertEqual(experts._step_map.tolist(), [0, 1, 2])
         self.assertEqual(set(experts._bank), set(BANK_TENSORS))
-        self.assertIsNotNone(experts._decode_workspace)
-        self.assertIsNotNone(experts._prefill_workspace)
+        self.assertEqual(experts._error.tolist(), [0])
+        self.assertEqual(
+            (experts._rows, experts._hidden, experts._intermediate), (3, 32, 16)
+        )
+
+    def test_workspace_shapes_cover_the_larger_of_decode_and_prefill_scratch(self):
+        experts = make_experts()
+        experts.process_weights_after_loading(self.layer)
+        w1, (elems,), out = experts.workspace_shapes(
+            3, 16, 32, 4, 3, 3, None, MoEActivation.SILU
+        )
+        self.assertEqual((w1, out), ((3, 32), (3, 32)))
+        prefill_bytes = native.scratch_nbytes(
+            native_prefill.prefill_scratch_layout(32, 16, 3, 4, 3)
+        )
+        self.assertEqual(elems, (prefill_bytes + 1) // 2)
+        with self.assertRaises(ValueError):
+            self.run_apply(experts, 3, scratch=torch.empty((8,), dtype=torch.bfloat16))
 
     def test_decode_rows_match_the_gemv_adapter(self):
         experts = make_experts(gemv_rows=1)
@@ -134,20 +155,6 @@ class NativeExpertsTests(unittest.TestCase):
         out = self.run_apply(experts, 1)
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.isfinite(out.float()).all())
-
-    def test_workspaces_are_shared_across_layers_with_the_same_shape(self):
-        a, b = make_experts(), make_experts()
-        a.process_weights_after_loading(self.layer)
-        b.process_weights_after_loading(self.layer)
-        self.assertIs(a._prefill_workspace, b._prefill_workspace)
-        self.assertIs(a._decode_workspace, b._decode_workspace)
-        c = make_experts(max_num_tokens=16)
-        c.process_weights_after_loading(self.layer)
-        self.assertIsNot(a._prefill_workspace, c._prefill_workspace)
-        # CPU has no streams: key stream id is 0 and sharing is by shape only.
-        from vllm.model_executor.layers.quantization.nvfp4_native import experts
-
-        self.assertEqual(experts._workspace_key(self.bank, 8, 4)[1], 0)
 
     def test_unsupported_configurations_are_rejected_explicitly(self):
         ok = SimpleNamespace(

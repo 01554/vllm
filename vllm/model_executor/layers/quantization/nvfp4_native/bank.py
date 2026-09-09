@@ -131,6 +131,87 @@ def allocate_workspace(
     return workspace
 
 
+def _align(n: int) -> int:
+    return (n + 255) // 256 * 256
+
+
+def decode_scratch_layout(
+    hidden: int, intermediate: int, max_tokens: int, top_k: int
+) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+    """Name, shape and dtype of every decode scratch buffer, in carve order."""
+    return [
+        ("routes", (max_tokens, top_k), torch.int32),
+        ("gate_up", (max_tokens, top_k, 2 * intermediate), torch.bfloat16),
+        ("activated", (max_tokens * top_k, intermediate), torch.bfloat16),
+        ("down", (max_tokens, top_k, hidden), torch.bfloat16),
+        ("output", (max_tokens, hidden), torch.bfloat16),
+    ]
+
+
+def scratch_nbytes(layout) -> int:
+    total = 0
+    for _name, shape, dtype in layout:
+        n = 1
+        for d in shape:
+            n *= d
+        total += _align(n * torch.empty((), dtype=dtype).element_size())
+    return total
+
+
+def carve_scratch(buffer: torch.Tensor, layout) -> dict[str, torch.Tensor]:
+    """Views of a flat uint8 buffer, one per layout entry, 256-byte aligned."""
+    if buffer.dtype != torch.uint8 or buffer.dim() != 1:
+        raise TypeError("scratch buffer must be a flat uint8 tensor")
+    need = scratch_nbytes(layout)
+    if buffer.numel() < need:
+        raise ValueError(f"scratch buffer too small: {buffer.numel()} < {need}")
+    views: dict[str, torch.Tensor] = {}
+    offset = 0
+    for name, shape, dtype in layout:
+        n = 1
+        for d in shape:
+            n *= d
+        nbytes = n * torch.empty((), dtype=dtype).element_size()
+        views[name] = buffer[offset : offset + nbytes].view(dtype).reshape(shape)
+        offset += _align(nbytes)
+    return views
+
+
+def carve_workspace(
+    bank: Bank,
+    buffer: torch.Tensor,
+    max_tokens: int,
+    top_k: int,
+    error: torch.Tensor,
+    *,
+    num_experts: int = 512,
+) -> Workspace:
+    """A decode Workspace whose large buffers are views of ``buffer``.
+
+    ``error`` is the caller's persistent sticky-error flag (int32[1]).
+    """
+    rows, hidden, intermediate = validate_bank(bank)
+    if min(max_tokens, top_k, num_experts) <= 0:
+        raise ValueError("workspace capacities must be positive")
+    views = carve_scratch(
+        buffer, decode_scratch_layout(hidden, intermediate, max_tokens, top_k)
+    )
+    return Workspace(
+        num_experts,
+        rows,
+        hidden,
+        intermediate,
+        max_tokens,
+        top_k,
+        views["routes"],
+        views["gate_up"],
+        views["activated"],
+        views["down"],
+        views["output"],
+        error,
+    )
+
+
 def _cpu_projection(a, bank, prefix, routes, weights, *, routed_input=False):
     packed = bank[f"{prefix}_weight"].to(torch.int64)
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)

@@ -7,7 +7,10 @@ Decode rows (``M <= gemv_rows``) run the Triton GEMV adapter, larger
 batches run the grouped prefill kernel.  Activations stay BF16 (no input
 scales), router weights are applied once after the down projection and
 routes are reduced inside the kernels, so the modular kernel's finalize
-step is a no-op.
+step is a no-op.  All large scratch comes from the modular kernel's
+workspace (the worker's WorkspaceManager, separated per execution lane);
+the experts keep only the bank views, an identity row map and a sticky
+error flag.
 """
 
 from __future__ import annotations
@@ -38,63 +41,6 @@ from .loader import activation_name
 # Rows at or below this count take the decode GEMV; above it, grouped prefill.
 DEFAULT_GEMV_ROWS = 1
 
-# Scratch is shared by every layer with the same bank shape and capacities
-# *on the same device and CUDA stream*: work on one stream is ordered, so two
-# layers (or two models) that share a stream can never run their kernels
-# concurrently, and a different stream gets its own scratch.  Per-layer
-# copies would cost hundreds of MiB each at prefill batch sizes (~390 MiB
-# per layer at 4096 tokens x top-10 on a 2560/640 model, ~18 GiB over 48
-# layers).  Graph capture records the stream's scratch addresses; replay of
-# that graph runs on the same stream, so the exclusivity argument holds.
-_DECODE_WORKSPACES: dict[tuple, native_bank.Workspace] = {}
-_PREFILL_WORKSPACES: dict[tuple, native_prefill.Workspace] = {}
-
-
-def _stream_id(device: torch.device) -> int:
-    if device.type != "cuda":
-        return 0
-    return torch.cuda.current_stream(device).cuda_stream
-
-
-def _workspace_key(bank: native_bank.Bank, max_tokens: int, top_k: int) -> tuple:
-    rows, hidden, intermediate = native_bank.validate_bank(bank)
-    device = bank["w13_weight"].device
-    return (
-        str(device),
-        _stream_id(device),
-        rows,
-        hidden,
-        intermediate,
-        max_tokens,
-        top_k,
-    )
-
-
-def shared_decode_workspace(
-    bank: native_bank.Bank, max_tokens: int, top_k: int
-) -> native_bank.Workspace:
-    key = _workspace_key(bank, max_tokens, top_k)
-    workspace = _DECODE_WORKSPACES.get(key)
-    if workspace is None:
-        workspace = native_bank.allocate_workspace(
-            bank, max_tokens, top_k, num_experts=key[2]
-        )
-        _DECODE_WORKSPACES[key] = workspace
-    return workspace
-
-
-def shared_prefill_workspace(
-    bank: native_bank.Bank, max_tokens: int, top_k: int
-) -> native_prefill.Workspace:
-    key = _workspace_key(bank, max_tokens, top_k)
-    workspace = _PREFILL_WORKSPACES.get(key)
-    if workspace is None:
-        workspace = native_prefill.allocate_workspace(
-            bank, max_tokens, top_k, num_experts=key[2]
-        )
-        _PREFILL_WORKSPACES[key] = workspace
-    return workspace
-
 
 class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
     """Raw-layout NVFP4 experts (no repack) for ModelOpt checkpoints."""
@@ -114,8 +60,10 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         self.gemv_rows = gemv_rows
         self._bank: native_bank.Bank | None = None
         self._step_map: torch.Tensor | None = None
-        self._decode_workspace: native_bank.Workspace | None = None
-        self._prefill_workspace: native_prefill.Workspace | None = None
+        self._error: torch.Tensor | None = None
+        self._rows = 0
+        self._hidden = 0
+        self._intermediate = 0
 
     # --- capability statics -------------------------------------------------
 
@@ -197,18 +145,30 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
                     f"native NVFP4 experts: {name} is not supported (plain SiLU only)"
                 )
         bank = {name: getattr(layer, name).data for name in BANK_TENSORS}
-        rows, _hidden, _intermediate = native_bank.validate_bank(bank)
-        top_k = self.moe_config.experts_per_token
+        rows, hidden, intermediate = native_bank.validate_bank(bank)
+        device = bank["w13_weight"].device
         self._bank = bank
-        self._step_map = torch.arange(
-            rows, dtype=torch.int32, device=bank["w13_weight"].device
+        self._rows, self._hidden, self._intermediate = rows, hidden, intermediate
+        self._step_map = torch.arange(rows, dtype=torch.int32, device=device)
+        self._error = torch.zeros(1, dtype=torch.int32, device=device)
+        if device.type == "cuda":
+            from . import kernels, prefill_kernels
+
+            kernels.warmup(device)
+            prefill_kernels.warmup(device)
+
+    def _scratch_nbytes(self, max_tokens: int, top_k: int) -> int:
+        decode = native_bank.scratch_nbytes(
+            native_bank.decode_scratch_layout(
+                self._hidden, self._intermediate, min(max_tokens, self.gemv_rows), top_k
+            )
         )
-        # Warm the scratch for the loading stream; apply() re-resolves on the
-        # forward stream, so a different stream gets its own scratch.
-        self._decode_workspace = shared_decode_workspace(bank, self.gemv_rows, top_k)
-        self._prefill_workspace = shared_prefill_workspace(
-            bank, self.moe_config.max_num_tokens, top_k
+        prefill = native_bank.scratch_nbytes(
+            native_prefill.prefill_scratch_layout(
+                self._hidden, self._intermediate, max_tokens, top_k, self._rows
+            )
         )
+        return max(decode, prefill)
 
     def workspace_shapes(
         self,
@@ -221,9 +181,14 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # The kernels own their scratch; the modular kernel only needs the
-        # output buffer, which it provisions from workspace1.
-        return ((M, K), (1,), (M, K))
+        # workspace1 only carries the output (M, K); workspace2 is the flat
+        # kernel scratch, declared in elements of the workspace dtype (the
+        # activation dtype, 2 bytes) and carved as bytes in apply().
+        if self._bank is None:
+            raise RuntimeError("NativeNvFp4Experts: weights were not processed")
+        nbytes = self._scratch_nbytes(M, topk)
+        elems = (nbytes + 1) // 2
+        return ((M, K), (elems,), (M, K))
 
     # --- forward ------------------------------------------------------------
 
@@ -258,26 +223,38 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         # The adapters require FP32 router weights.
         weights = topk_weights.to(torch.float32).contiguous()
         top_k = ids.shape[1]
-        if hidden_states.shape[0] <= self.gemv_rows:
+        rows = hidden_states.shape[0]
+        assert self._error is not None
+        scratch = workspace2.reshape(-1).view(torch.uint8)
+        if rows <= self.gemv_rows:
+            workspace = native_bank.carve_workspace(
+                self._bank,
+                scratch,
+                self.gemv_rows,
+                top_k,
+                self._error,
+                num_experts=self._rows,
+            )
             result = native_bank.gemv(
                 hidden_states,
                 weights,
                 ids,
                 self._bank,
                 self._step_map,
-                shared_decode_workspace(self._bank, self.gemv_rows, top_k),
+                workspace,
                 activation=act,
             )
         else:
+            workspace = native_prefill.carve_workspace(
+                self._bank, scratch, rows, top_k, self._error, num_experts=self._rows
+            )
             result = native_prefill.prefill(
                 hidden_states,
                 weights,
                 ids,
                 self._bank,
                 self._step_map,
-                shared_prefill_workspace(
-                    self._bank, self.moe_config.max_num_tokens, top_k
-                ),
+                workspace,
                 activation=act,
             )
         output.copy_(result)
