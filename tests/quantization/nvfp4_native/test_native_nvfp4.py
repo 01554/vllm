@@ -4,12 +4,7 @@
 
 import unittest
 
-import pytest
 import torch
-
-pytest.importorskip(
-    "vllm.distributed", reason="needs the full vLLM environment"
-)  # the package sits under vllm.model_executor, whose import pulls it in
 
 from tests.quantization.nvfp4_native.native_nvfp4_smoke import native, oracle
 
