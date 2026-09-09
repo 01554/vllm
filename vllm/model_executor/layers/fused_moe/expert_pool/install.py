@@ -100,13 +100,16 @@ def _sources(name: str, layer: torch.nn.Module) -> dict[str, torch.Tensor]:
                 f"{name}.{tensor_name}: the expert pool needs one row per expert, "
                 f"got shape {tuple(t.shape)}"
             )
-        if t.device.type != "cpu":
+        if t.device.type != "cpu" or not t.is_pinned() or not t.is_contiguous():
             # The per-expert global scales are small and are not allocated in
             # host memory by create_weights, so the loader leaves them on the
-            # device after conversion; take a pinned host copy as the source.
-            t = torch.empty_like(t, device="cpu", pin_memory=True).copy_(t)
-        elif not t.is_pinned() or not t.is_contiguous():
-            t = torch.empty_like(t, device="cpu", pin_memory=True).copy_(t)
+            # device after conversion; take a pinned, dense host copy as the
+            # source (explicit contiguous layout: empty_like would keep the
+            # input's strides).
+            t = torch.empty(
+                t.shape, dtype=t.dtype, device="cpu", pin_memory=True
+            ).copy_(t)
+        assert t.is_contiguous() and t.is_pinned()
         sources[tensor_name] = t
     return sources
 
