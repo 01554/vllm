@@ -55,6 +55,51 @@ def test_uncached_layer_stays_in_the_segment(monkeypatch):
     assert _run(monkeypatch, cached=False) == ["fn"]
 
 
+def test_legacy_placeholder_consumes_one_layer_per_op(monkeypatch):
+    """With the legacy "from_forward_context" name the lookup is stateful;
+    the wrapper must resolve it once per op, for cached and uncached layers
+    alike (the shared variant uses the same wrapper)."""
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    seen: list[str] = []
+
+    def fn(hidden_states, router_logits, shared_experts_input, input_ids, name, pad):
+        seen.append(moe_runner.get_layer_from_name(name).tag)  # plain fetch
+        return hidden_states
+
+    class Capture:
+        _capturing = True
+
+        def add_eager(self, thunk):
+            return thunk()
+
+    layers = {
+        "a": SimpleNamespace(
+            tag="a", routed_experts=SimpleNamespace(expert_weight_provider=object())
+        ),
+        "b": SimpleNamespace(
+            tag="b", routed_experts=SimpleNamespace(expert_weight_provider=None)
+        ),
+    }
+    ctx = SimpleNamespace(
+        all_moe_layers=["a", "b"], moe_layer_index=0, no_compile_layers=layers
+    )
+    with (
+        mock.patch.object(moe_runner, "_USE_LAYERNAME", False),
+        mock.patch.object(moe_runner, "get_forward_context", lambda: ctx),
+        mock.patch.object(moe_runner, "_resolve_layer_name", lambda n: n),
+        mock.patch.object(
+            bcg.BreakableCUDAGraphCapture, "current", classmethod(lambda cls: Capture())
+        ),
+        mock.patch.object(bcg, "is_forward_context_available", lambda: False),
+    ):
+        wrapped = moe_runner._eager_break_when_cached(fn)
+        x = torch.zeros(2, 4)
+        wrapped(x, x, None, None, "from_forward_context", 0)
+        wrapped(x, x, None, None, "from_forward_context", 0)
+    assert seen == ["a", "b"]
+    assert ctx.moe_layer_index == 2
+
+
 def test_identity_when_breakable_graphs_are_off(monkeypatch):
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
 
