@@ -31,6 +31,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import replace_parameter
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_row_provider import (
+        RowCacheWeightProvider,
+    )
     from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
         CachedWeightProvider,
     )
@@ -177,10 +180,13 @@ class RoutedExperts(PluggableLayer):
         # _maybe_init_expert_lru_cache(). The size is read here so that
         # create_weights() can allocate expert weights in CPU pinned memory
         # when offloading is requested.
-        self.expert_weight_provider: CachedWeightProvider | None = None
+        self.expert_weight_provider: (
+            CachedWeightProvider | RowCacheWeightProvider | None
+        ) = None
         offload_config = get_current_vllm_config().offload_config
         self._moe_expert_cache_size = offload_config.moe_expert_cache_size
         self._moe_expert_cache_split = offload_config.moe_expert_cache_split
+        self._moe_expert_cache_provider = offload_config.moe_expert_cache_provider
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
@@ -212,7 +218,12 @@ class RoutedExperts(PluggableLayer):
                 "or sequence parallelism."
             )
         vllm_config = get_current_vllm_config()
-        if not vllm_config.model_config.enforce_eager:
+        # No model_config: a layer built directly (unit tests); VllmConfig
+        # applies the same guard when it configures splitting_ops.
+        if (
+            vllm_config.model_config is not None
+            and not vllm_config.model_config.enforce_eager
+        ):
             splitting_ops = vllm_config.compilation_config.splitting_ops or []
             if "vllm::moe_forward" not in splitting_ops:
                 raise ValueError(
@@ -233,7 +244,9 @@ class RoutedExperts(PluggableLayer):
                 "expert remapping."
             )
 
-    def _maybe_init_expert_lru_cache(self, scale_suffix: str = "weight_scale") -> None:
+    def _maybe_init_expert_lru_cache(
+        self, scale_suffix: str = "weight_scale", *, scale_2_suffix: str | None = None
+    ) -> None:
         """Build the expert weight provider once weights have been loaded.
 
         Expert weights may reside on CPU (loaded directly into pinned memory
@@ -253,6 +266,11 @@ class RoutedExperts(PluggableLayer):
             scale_suffix: Parameter-name suffix for the per-expert weight
                 scales (``weight_scale``, or ``weight_scale_inv`` for
                 block-quantized checkpoints).
+            scale_2_suffix: Suffix of per-expert second-level (global) scales
+                that must follow the weights through the slots as well, e.g.
+                ``weight_scale_2`` for NVFP4. They are passed in the kernel's
+                final representation; the caller must not convert them again
+                after this call.
         """
         if self.expert_weight_provider is not None:
             # process_weights_after_loading can be re-run for RL-style weight
@@ -275,35 +293,69 @@ class RoutedExperts(PluggableLayer):
                 "terms (fused_experts() receives w1/w2 only, not bias). "
                 f"Layer: {self.layer_name}."
             )
+        from vllm.model_executor.layers.fused_moe.expert_row_provider import (
+            RowCacheWeightProvider,
+        )
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
             CachedWeightProvider,
         )
 
         # Only scales indexed by expert need remapping. Anything else (a global
         # or per-tensor scale) is slot-agnostic and is left on the layer.
-        w13_scale_name = f"w13_{scale_suffix}"
-        w2_scale_name = f"w2_{scale_suffix}"
-        w13_scale = getattr(self, w13_scale_name, None)
-        w2_scale = getattr(self, w2_scale_name, None)
-        per_expert_scales = (
-            w13_scale is not None
-            and w2_scale is not None
-            and w13_scale.size(0) == self.local_num_experts
-            and w2_scale.size(0) == self.local_num_experts
+        def per_expert_pair(
+            suffix: str,
+        ) -> tuple[str, str, torch.Tensor | None, torch.Tensor | None]:
+            w13_name, w2_name = f"w13_{suffix}", f"w2_{suffix}"
+            w13_t = getattr(self, w13_name, None)
+            w2_t = getattr(self, w2_name, None)
+            if (
+                w13_t is None
+                or w2_t is None
+                or w13_t.dim() == 0
+                or w2_t.dim() == 0
+                or w13_t.size(0) != self.local_num_experts
+                or w2_t.size(0) != self.local_num_experts
+            ):
+                return w13_name, w2_name, None, None
+            return w13_name, w2_name, w13_t, w2_t
+
+        w13_scale_name, w2_scale_name, w13_scale, w2_scale = per_expert_pair(
+            scale_suffix
         )
-        if not per_expert_scales:
-            w13_scale = None
-            w2_scale = None
+        w13_scale_2: torch.Tensor | None = None
+        w2_scale_2: torch.Tensor | None = None
+        if scale_2_suffix is not None:
+            w13_scale_2_name, w2_scale_2_name, w13_scale_2, w2_scale_2 = (
+                per_expert_pair(scale_2_suffix)
+            )
 
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
-        provider = CachedWeightProvider(
-            capacity=capacity,
-            w13_weight=cast(torch.Tensor, self.w13_weight).data,
-            w2_weight=cast(torch.Tensor, self.w2_weight).data,
-            w13_scale=w13_scale,
-            w2_scale=w2_scale,
-            split=self._moe_expert_cache_split,
-        )
+        w13_weight = cast(torch.Tensor, self.w13_weight).data
+        w2_weight = cast(torch.Tensor, self.w2_weight).data
+        provider: CachedWeightProvider | RowCacheWeightProvider
+        if self._moe_expert_cache_provider == "row":
+            provider = RowCacheWeightProvider(
+                capacity,
+                w13_weight,
+                w2_weight,
+                w13_scale,
+                w2_scale,
+                self._moe_expert_cache_split,
+                w13_scale_2=w13_scale_2,
+                w2_scale_2=w2_scale_2,
+                device=torch.accelerator.current_accelerator(),
+            )
+        else:
+            provider = CachedWeightProvider(
+                capacity=capacity,
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                split=self._moe_expert_cache_split,
+                w13_scale_2=w13_scale_2,
+                w2_scale_2=w2_scale_2,
+            )
         self.expert_weight_provider = provider
 
         # Repoint the scale parameters at the cache's slot-indexed buffers.
@@ -323,16 +375,26 @@ class RoutedExperts(PluggableLayer):
             )
             replace_parameter(self, w13_scale_name, provider.buf_w13_scale)
             replace_parameter(self, w2_scale_name, provider.buf_w2_scale)
+        if provider.buf_w13_scale_2 is not None:
+            assert provider.buf_w2_scale_2 is not None
+            assert self.quant_method.moe_quant_config is None, (
+                f"expert cache installed after {type(self.quant_method).__name__}"
+                " built its quant config; the kernel is holding expert-indexed"
+                " global scales that the cache cannot keep in sync"
+            )
+            replace_parameter(self, w13_scale_2_name, provider.buf_w13_scale_2)
+            replace_parameter(self, w2_scale_2_name, provider.buf_w2_scale_2)
 
-        # Release the full weight tensors (CachedWeightProvider holds its own
+        # Release the full weight tensors (the provider holds its own
         # reference to the CPU pinned backing store).
         replace_parameter(self, "w13_weight", torch.empty(0))
         replace_parameter(self, "w2_weight", torch.empty(0))
         logger.info(
-            "Expert LRU cache enabled for %s: %d/%d experts cached on GPU.",
+            "Expert LRU cache enabled for %s: %d/%d experts cached on GPU (%s).",
             self.layer_name,
             capacity,
             self.local_num_experts,
+            type(provider).__name__,
         )
 
     # TODO(bnell): Temporary hack. Get rid of this.

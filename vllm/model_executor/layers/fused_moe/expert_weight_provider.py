@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 
@@ -59,6 +59,20 @@ class ExpertWeightResult:
     expert_map: torch.Tensor
     w1_scale: torch.Tensor | None = None
     w2_scale: torch.Tensor | None = None
+
+
+class ExpertWeightProvider(Protocol):
+    """What run_with_expert_cache() and the consumers need from a provider."""
+
+    split: MoECacheSplit
+
+    def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]: ...
+
+    def plan_expert_groups(self, topk_ids: torch.Tensor) -> list[list[int]]: ...
+
+    def prepare(
+        self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
+    ) -> ExpertWeightResult: ...
 
 
 class CachedWeightProvider:
@@ -443,7 +457,7 @@ class CachedWeightProvider:
 
 
 def run_with_expert_cache(
-    provider: CachedWeightProvider,
+    provider: ExpertWeightProvider,
     topk_ids: torch.Tensor,
     run: Callable[[ExpertWeightResult, slice, bool], torch.Tensor],
 ) -> torch.Tensor:

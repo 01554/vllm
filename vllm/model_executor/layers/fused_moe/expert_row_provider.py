@@ -311,7 +311,11 @@ class RowCacheWeightProvider:
     def _upload_map(
         self, target: torch.Tensor | None, values: list[int]
     ) -> torch.Tensor:
-        """Copy `values` into `target` (or a new tensor) without a host sync.
+        """Copy `values` into `target` (or a new tensor) with one pinned upload.
+
+        Per-element scalar writes to a device tensor stage through pageable
+        memory and block the host until the stream drains; this path removes
+        that staging (other host waits, e.g. allocation, are not claimed away).
 
         The staging tensor is pinned when the map lives on CUDA; the caching
         host allocator keeps it alive until the enqueued copy has consumed it.
