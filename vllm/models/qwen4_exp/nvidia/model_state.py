@@ -160,6 +160,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
         for module in modules:
             module.initialize_mmap_staging(self.max_num_tokens, self.device)
         deferred = [m.deferred_rows for m in modules if m.deferred_rows is not None]
+        if deferred and len(deferred) != len(modules):
+            # Capture must agree with step eligibility across all mmap layers.
+            # Otherwise a capable layer would capture WAIT/H2D while the model
+            # uses synchronous preparation (which never signals its flag).
+            # Initialization precedes all prepare/capture calls, so no reader
+            # or pending producer owns these helpers yet.
+            for module in modules:
+                module.deferred_rows = None
+            logger.warning(
+                "PLE deferred unavailable on some mmap layers; "
+                "using synchronous preparation on every mmap layer"
+            )
+            deferred = []
         if deferred:
             pinned_bytes = sum(
                 tensor.numel() * tensor.element_size()

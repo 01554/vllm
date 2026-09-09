@@ -59,6 +59,26 @@ class DeferredStateTests(unittest.TestCase):
         state._deferred_ple_poisoned = False
         return state
 
+    def test_mixed_capability_disables_all_helpers_before_capture(self):
+        state = self.make_state()
+        state.device = torch.device("cpu")
+        state.max_num_tokens = 8
+        modules = state._mmap_ple_modules
+        modules[1].deferred_rows = None
+        for module in modules:
+            module.mmap_staging_nbytes = Mock(return_value=16)
+            module.initialize_mmap_staging = Mock()
+        with patch(
+            "vllm.models.qwen4_exp.nvidia.model_state.MemorySnapshot",
+            return_value=SimpleNamespace(free_memory=1024),
+        ):
+            state._initialize_mmap_staging(modules)
+        self.assertTrue(all(m.deferred_rows is None for m in modules))
+        for module in modules:
+            module.initialize_mmap_staging.assert_called_once_with(8, state.device)
+        state.set_deferred_ple_step(True)
+        self.assertFalse(state._deferred_ple_step)
+
     def test_complete_all_layers_and_next_step(self):
         state = self.make_state()
         state.set_deferred_ple_step(True)
