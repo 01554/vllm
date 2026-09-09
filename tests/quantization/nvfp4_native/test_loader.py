@@ -63,7 +63,7 @@ class NativeLoaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             nl.native_bank_shapes(layer.w13_weight, layer.w2_weight[:, :16])
 
-    def test_prepare_keeps_raw_banks_and_marks_the_method(self):
+    def test_prepare_keeps_raw_banks_and_leaves_the_method_alone(self):
         from vllm.model_executor.layers.quantization.nvfp4_native import (
             bank as native_nvfp4,
         )
@@ -86,9 +86,10 @@ class NativeLoaderTests(unittest.TestCase):
         self.assertEqual(layer.w2_weight_scale_2.shape, (3, 32))
         self.assertIsNone(layer.w13_input_scale)
         self.assertIsNone(layer.w2_input_scale)
-        self.assertIsNone(method.moe_kernel)
-        self.assertIsNone(layer.w13_input_scale)
-        self.assertIsNone(layer.w2_input_scale)
+        # The loader only prepares the layer; the method builds its kernel
+        # afterwards, so whatever it held stays as it was.
+        self.assertEqual(method.moe_kernel, "marlin")
+        self.assertEqual(method.moe_quant_config, 1)
         from vllm.model_executor.layers.quantization.nvfp4_native.bank import (
             BANK_TENSORS as TENSORS,
         )
