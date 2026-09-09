@@ -245,6 +245,41 @@ def test_owner_change_orders_copies_behind_the_previous_stream_reader():
     for name in want:
         assert torch.equal(got[name], want[name]), name
     assert torch.equal(read0.cpu(), ref)  # the reader saw expert 0, never the overwrite
+    # The shared resident map holds the final generation: the previous
+    # owner's upload cannot land after the new stream's.
+    assert p.expert_map.cpu().tolist() == p._map_host
+
+
+def test_invalidate_from_another_stream_keeps_the_resident_map_ordered():
+    """invalidate() on stream B while A's reader (and A's map upload) are
+    queued, then prepare() on B: the resident map must end in the final
+    generation and the reuse must wait for A's reader."""
+    src = make_source()
+    p = RowCacheWeightProvider(2, src["w13"], src["w2"], device="cuda")
+    first = torch.cuda.Stream(p.device)
+    with torch.cuda.stream(first):
+        r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    torch.accelerator.synchronize(p.device)
+    slot1 = int(r1.expert_map[1])
+    assert not torch.equal(ref_sum([src["w13"][1]]), ref_sum([src["w13"][3]]))
+    reader = GraphReader([p.buf_w13[slot1]], p.device)
+    reader_done = torch.cuda.Event()
+    with torch.cuda.stream(first):
+        read1 = reader.replay()
+        reader_done.record(first)
+    second = torch.cuda.Stream(p.device)
+    t0 = time.perf_counter()
+    with torch.cuda.stream(second):
+        p.invalidate(1)  # map write goes to the owner stream, behind the reader
+        r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
+    host_ms = (time.perf_counter() - t0) * 1e3
+    overlapped = not reader_done.query()
+    torch.accelerator.synchronize(p.device)
+    assert overlapped, inconclusive(host_ms, reader)
+    assert int(r2.expert_map[3]) == slot1
+    assert torch.equal(read1.cpu(), ref_sum([src["w13"][1]]))
+    assert torch.equal(p.buf_w13[slot1].cpu(), src["w13"][3])
+    assert p.expert_map.cpu().tolist() == p._map_host
 
 
 def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():

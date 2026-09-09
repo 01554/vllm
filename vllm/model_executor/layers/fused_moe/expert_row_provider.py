@@ -201,7 +201,10 @@ class RowCacheWeightProvider:
         if slot is not None:
             self._free.append(slot)
             self._map_host[expert_id] = -1
-            self._upload_map(self._map, self._map_host)
+            # Resident-map writes are serialized on the owner stream (where
+            # the last forward's reader and its map upload are queued), so
+            # the next prepare()'s release event orders this behind them.
+            self._upload_map(self._map, self._map_host, stream=self._owner_stream)
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -320,17 +323,22 @@ class RowCacheWeightProvider:
         # tensor (`map[e] = slot`) stage through pageable host memory and
         # block the host until the owner stream drains, i.e. until the
         # previous reader has finished -- which would hide the very ordering
-        # the release event is meant to provide.
-        self._upload_map(self._map, self._map_host)
+        # the release event is meant to provide. On CUDA the resident map is
+        # written on the copy stream after the release wait, so it is ordered
+        # behind the previous owner's map upload and reader even when the
+        # owner stream changes, and published to the consumer by the ready
+        # event together with the slot copies.
         if cuda:
             assert self._copy_stream is not None and self._ready_event is not None
             with torch.cuda.stream(self._copy_stream):
+                self._upload_map(self._map, self._map_host)
                 for e, slot in copies:
                     self._fill_slot(e, slot)
             # (3) consumer kernels on the owner stream wait for the copies
             self._ready_event.record(self._copy_stream)
             torch.cuda.current_stream(self.device).wait_event(self._ready_event)
         else:
+            self._upload_map(self._map, self._map_host)
             for e, slot in copies:
                 self._fill_slot(e, slot)
         self._in_flight = copies
@@ -350,7 +358,10 @@ class RowCacheWeightProvider:
     # --- internals ----------------------------------------------------------
 
     def _upload_map(
-        self, target: torch.Tensor | None, values: list[int]
+        self,
+        target: torch.Tensor | None,
+        values: list[int],
+        stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         """Copy `values` into `target` (or a new tensor) with one pinned upload.
 
@@ -362,12 +373,16 @@ class RowCacheWeightProvider:
         host allocator keeps it alive until the enqueued copy has consumed it.
         """
         host = torch.tensor(values, dtype=torch.int32)
-        cuda = self._map.device.type == "cuda"
-        if cuda:
+        pin = self._map.device.type == "cuda"
+        if pin:
             host = host.pin_memory()
         if target is None:
-            return host.to(self._map.device, non_blocking=cuda)
-        target.copy_(host, non_blocking=cuda)
+            return host.to(self._map.device, non_blocking=pin)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                target.copy_(host, non_blocking=pin)
+            return target
+        target.copy_(host, non_blocking=pin)
         return target
 
     def _take_owner_stream(self) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
