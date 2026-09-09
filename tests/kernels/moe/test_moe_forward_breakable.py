@@ -57,6 +57,8 @@ def _run(monkeypatch, cached: bool):
             bcg.BreakableCUDAGraphCapture, "current", classmethod(lambda cls: Capture())
         ),
         mock.patch.object(bcg, "is_forward_context_available", lambda: False),
+        # weak_ref_tensor is CUDA-only; tensor lifetime is a GPU acceptance item.
+        mock.patch.object(bcg, "weak_ref_tensor", lambda t: t),
     ):
         wrapped = moe_runner._eager_break_when_cached(fn)
         assert wrapped is not fn
@@ -106,6 +108,8 @@ def test_legacy_placeholder_consumes_one_layer_per_op(monkeypatch):
             bcg.BreakableCUDAGraphCapture, "current", classmethod(lambda cls: Capture())
         ),
         mock.patch.object(bcg, "is_forward_context_available", lambda: False),
+        # weak_ref_tensor is CUDA-only; tensor lifetime is a GPU acceptance item.
+        mock.patch.object(bcg, "weak_ref_tensor", lambda t: t),
     ):
         wrapped = moe_runner._eager_break_when_cached(fn)
         x = torch.zeros(2, 4)
