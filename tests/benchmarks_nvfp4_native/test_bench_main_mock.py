@@ -344,6 +344,35 @@ class BenchMainMockTests(unittest.TestCase):
                 self.assertEqual(orders[2], ["native", "native_kernel"])
                 self.assertEqual(len(t["samples_ms"]), 3)
 
+    def test_every_shape_is_prepared_before_its_first_eager_call(self):
+        class OrderRunner(FakeRunner):
+            def __init__(self, bank):
+                super().__init__(bank)
+                self.prepared: set[int] = set()
+                self.violations: list[int] = []
+
+            def prepare(self, m):
+                self.prepared.add(m)
+                return None
+
+            def __call__(self, x, ids, w):
+                if x.shape[0] not in self.prepared:
+                    self.violations.append(x.shape[0])
+                return super().__call__(x, ids, w)
+
+        holder: list[OrderRunner] = []
+
+        def factory(bank):
+            holder.append(OrderRunner(bank))
+            return holder[-1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(
+                tmp, runner_factory=factory, extra=("--patterns", "uniform,working_set")
+            )
+        self.assertEqual(holder[0].violations, [])
+        self.assertEqual(holder[0].prepared, {1, 3})
+
     def test_no_timing_only_writes_correctness(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows, correctness = self.run_main(tmp, extra=("--no-timing",))

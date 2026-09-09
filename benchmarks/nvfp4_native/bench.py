@@ -622,6 +622,10 @@ def main():
                 ref_backend = _oracle(bank, x, ids, w, True).float()
                 timeable: dict[str, tuple] = {}
                 for name, runner in runners.items():
+                    # Shapes are prepared before any eager call: a runner that
+                    # locks its WorkspaceManager after capture must have grown
+                    # the buffer for this M first.
+                    runner.prepare(m)
                     c = check_correctness(
                         runner, m, x, ids, w, ref_source, ref_backend, a.atol, a.rtol
                     )
