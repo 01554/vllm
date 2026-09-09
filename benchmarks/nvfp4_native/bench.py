@@ -12,7 +12,15 @@ values are batch-mean per-call latencies (median, p10, p90, variance).
 Usage (GPU host):
   python -m benchmarks.nvfp4_native.bench --shard <model-00001-of-00010.safetensors> \
       --prefix model.language_model.layers.0.mlp --num-experts 512 --out <dir> \
-      [--backends native,marlin] [--sizes 1,2,4,8,16,64,256,1024]
+      [--backends native,native_apply,marlin] [--sizes 1,2,4,8,16,64,256,1024]
+
+Backends: "native" calls the kernels with independently allocated
+workspaces (package-level pre-check); "native_apply" goes through
+NativeNvFp4Experts.apply with a caller-provided scratch (the experts
+path without the worker's WorkspaceManager); "marlin" is the reference
+backend. Correctness is reported against the source-semantics oracle
+(float32 globals) and, as a second column, against an oracle that uses the
+backend's float16 per-row globals; the pass verdict uses the source column.
 """
 
 from __future__ import annotations
@@ -112,6 +120,84 @@ class NativeRunner:
         return self.npf.prefill(x, w, ids, self.bank, self.step_map, ws)
 
 
+class ExpertsApplyRunner(NativeRunner):
+    """NativeNvFp4Experts.apply() with a caller-provided scratch buffer.
+
+    Mirrors the modular-kernel path (workspace_shapes -> carve in apply)
+    without the worker's WorkspaceManager; integration timing through the
+    full runner is the model-launch validation, not this bench.
+    """
+
+    name = "native_apply"
+
+    def __init__(self, bank, device, gemv_rows: int = 1):
+        super().__init__(bank, device, gemv_rows)
+        from types import SimpleNamespace
+
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from vllm.model_executor.layers.quantization.nvfp4_native.experts import (
+            NativeNvFp4Experts,
+        )
+
+        self._act = MoEActivation.SILU
+        self.experts = NativeNvFp4Experts.__new__(NativeNvFp4Experts)
+        self.experts.moe_config = SimpleNamespace(
+            experts_per_token=TOP_K, max_num_tokens=1024
+        )
+        self.experts.quant_config = SimpleNamespace(
+            gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None
+        )
+        self.experts.gemv_rows = gemv_rows
+        self.experts._bank = None
+        self.experts._step_map = None
+        self.experts._error = None
+        self.experts._rows = self.experts._hidden = self.experts._intermediate = 0
+        layer = SimpleNamespace(
+            **{k: SimpleNamespace(data=v) for k, v in self.bank.items()}
+        )
+        self.experts.process_weights_after_loading(layer)
+        self.error = self.experts._error
+        self._scratch = {}
+        self._out = {}
+
+    def prepare(self, m: int):
+        if m not in self._scratch:
+            hidden = self.bank["w13_weight"].shape[2] * 2
+            _w1, (elems,), _o = self.experts.workspace_shapes(
+                m, hidden // 2, hidden, TOP_K, self.rows, self.rows, None, self._act
+            )
+            self._scratch[m] = torch.empty(
+                (elems,), dtype=torch.bfloat16, device=self.device
+            )
+            self._out[m] = torch.empty(
+                (m, hidden), dtype=torch.bfloat16, device=self.device
+            )
+        return self._scratch[m]
+
+    def __call__(self, x, ids, w):
+        m = x.shape[0]
+        scratch = self.prepare(m)
+        out = self._out[m]
+        self.experts.apply(
+            out,
+            x,
+            self.bank["w13_weight"],
+            self.bank["w2_weight"],
+            w,
+            ids,
+            self._act,
+            self.rows,
+            None,
+            None,
+            None,
+            torch.empty(0, device=self.device),
+            scratch,
+            None,
+            False,
+        )
+        return out
+
+
 class MarlinRunner:
     """Marlin NVFP4 MoE on the same bank (repacked); present only if importable."""
 
@@ -124,29 +210,66 @@ class MarlinRunner:
         )
 
 
-def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
-    out = runner(x.to(runner.device), ids.to(runner.device), w.to(runner.device))
-    torch.accelerator.synchronize(runner.device)
-    ref = oracle_forward(
+def _oracle(bank, x, ids, w, f16_globals: bool):
+    g13, g2 = bank["w13_weight_scale_2"], bank["w2_weight_scale_2"]
+    if f16_globals:
+        # The backend's per-row float16 globals (the loader's transformation).
+        from vllm.model_executor.layers.quantization.nvfp4_native.loader import (
+            expand_w2_globals,
+            expand_w13_globals,
+        )
+
+        intermediate = bank["w13_weight"].shape[1] // 2
+        hidden = bank["w13_weight"].shape[2] * 2
+        g13 = expand_w13_globals(g13, intermediate)
+        g2 = expand_w2_globals(g2, hidden)
+    return oracle_forward(
         x,
         ids,
         w,
         bank["w13_weight"],
         bank["w13_weight_scale"],
-        bank["w13_weight_scale_2"],
+        g13,
         bank["w2_weight"],
         bank["w2_weight_scale"],
-        bank["w2_weight_scale_2"],
+        g2,
     )
-    got = out.detach().cpu().float()
-    diff = (got - ref.float()).abs()
-    tol = atol + rtol * ref.float().abs()
+
+
+def _compare(got: torch.Tensor, ref: torch.Tensor, atol: float, rtol: float) -> dict:
+    diff = (got - ref).abs()
+    tol = atol + rtol * ref.abs()
     return {
         "max_abs_diff": float(diff.max()),
-        "max_rel_diff": float((diff / (ref.float().abs() + 1e-6)).max()),
+        "max_rel_diff": float((diff / (ref.abs() + 1e-6)).max()),
+        "normalized_rms": float(
+            diff.pow(2).mean().sqrt() / (ref.pow(2).mean().sqrt() + 1e-12)
+        ),
         "violations": int((diff > tol).sum()),
         "elements": int(diff.numel()),
         "pass": bool((diff <= tol).all()),
+    }
+
+
+def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
+    if getattr(runner, "error", None) is not None:
+        runner.error.zero_()
+    out = runner(x.to(runner.device), ids.to(runner.device), w.to(runner.device))
+    torch.accelerator.synchronize(runner.device)
+    got = out.detach().cpu().float()
+    source = _compare(got, _oracle(bank, x, ids, w, False).float(), atol, rtol)
+    backend_globals = _compare(got, _oracle(bank, x, ids, w, True).float(), atol, rtol)
+    sticky = (
+        int(runner.error.item()) if getattr(runner, "error", None) is not None else None
+    )
+    return {
+        "vs_source_f32_globals": source,
+        "vs_backend_f16_globals": backend_globals,
+        "sticky_error": sticky,
+        "non_finite": int((~torch.isfinite(got)).sum()),
+        "pass": source["pass"]
+        and (sticky in (None, 0))
+        and bool(torch.isfinite(got).all()),
         "output_sha256": sha256_tensor(out),
     }
 
@@ -217,12 +340,12 @@ def main():
     ap.add_argument("--prefix", required=True)
     ap.add_argument("--num-experts", type=int, required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--backends", default="native")
+    ap.add_argument("--backends", default="native,native_apply")
     ap.add_argument("--sizes", default="1,2,4,8,16,64,256,1024")
     ap.add_argument("--gemv-rows", type=int, default=1)
     ap.add_argument("--seed", type=int, default=20260909)
-    ap.add_argument("--atol", type=float, default=0.03)
-    ap.add_argument("--rtol", type=float, default=0.0002)
+    ap.add_argument("--rtol", type=float, default=0.03)
+    ap.add_argument("--atol", type=float, default=0.0002)
     ap.add_argument("--no-timing", action="store_true", help="correctness stage only")
     a = ap.parse_args()
     out = Path(a.out)
@@ -241,6 +364,8 @@ def main():
     for name in a.backends.split(","):
         if name == "native":
             runners[name] = NativeRunner(bank, device, gemv_rows=a.gemv_rows)
+        elif name == "native_apply":
+            runners[name] = ExpertsApplyRunner(bank, device, gemv_rows=a.gemv_rows)
         elif name == "marlin":
             runners[name] = MarlinRunner(bank, device)
     correctness = {}
@@ -260,10 +385,16 @@ def main():
                 c["inputs_sha256"] = inputs_sha
                 c["path"] = runner.path(m) if hasattr(runner, "path") else name
                 correctness[f"{name}/M{m}"] = c
+                (out / "correctness.json").write_text(
+                    json.dumps(correctness, indent=1) + "\n"
+                )
                 if not c["pass"]:
+                    v = c["vs_source_f32_globals"]
                     print(
                         f"{name} M={m}: correctness FAIL "
-                        f"({c['violations']}/{c['elements']}); no timing"
+                        f"({v['violations']}/{v['elements']}, "
+                        f"sticky={c['sticky_error']}, "
+                        f"non_finite={c['non_finite']}); no timing"
                     )
                     sc.write(f"{name},{m},{c['path']},,,,,FAIL\n")
                     continue
