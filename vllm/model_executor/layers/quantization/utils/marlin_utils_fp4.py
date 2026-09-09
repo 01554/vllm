@@ -342,9 +342,20 @@ def prepare_nvfp4_moe_layer_for_marlin(
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
     is_act_and_mul: bool,
+    expert_chunk: int = 64,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
+    """Repack NVFP4 MoE weights and scales for Marlin.
+
+    Sources on the accelerator are converted in one pass over all experts.
+    Sources in CPU (pinned) memory -- the expert cache's load layout -- are
+    converted `expert_chunk` experts at a time on the accelerator and written
+    back into pinned host tensors; the accelerator holds one chunk's inputs
+    and outputs plus the repack scratch at a time, not the whole layer.
+    """
+    if expert_chunk <= 0:
+        raise ValueError(f"expert_chunk must be positive, got {expert_chunk}")
     logger.warning_once(
         "Your GPU does not have native support for FP4 computation but "
         "FP4 quantization is being used. Weight-only FP4 compression will "
@@ -372,22 +383,25 @@ def prepare_nvfp4_moe_layer_for_marlin(
         padded_N = round_up(N, 128)
 
     def pad_w13(x: torch.Tensor) -> torch.Tensor:
-        """Zero-pad each gate/up shard of a (E, num_shards * N, cols)
+        """Zero-pad each gate/up shard of a (e, num_shards * N, cols)
         tensor to padded_N rows."""
         if padded_N == N:
             return x
-        x = x.view(E, num_shards, N, x.size(-1))
+        e = x.size(0)
+        x = x.view(e, num_shards, N, x.size(-1))
         x = torch.nn.functional.pad(x, (0, 0, 0, padded_N - N))
-        return x.reshape(E, num_shards * padded_N, -1)
+        return x.reshape(e, num_shards * padded_N, -1)
 
     def pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
-        """Zero-pad the packed N (last) dim of a (E, K, N / packing)
+        """Zero-pad the packed N (last) dim of a (e, K, N / packing)
         tensor."""
         if padded_N == N:
             return x
         return torch.nn.functional.pad(x, (0, (padded_N - N) // packing))
 
-    device = w13.device
+    on_host = w13.device.type == "cpu"
+    device = torch.accelerator.current_accelerator() if on_host else w13.device
+    assert device is not None
     param_dtype = layer.params_dtype
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 
@@ -396,27 +410,34 @@ def prepare_nvfp4_moe_layer_for_marlin(
         device, 4, existing=getattr(layer, "workspace", None)
     )
 
-    # WEIGHT
-    # Repack weights to marlin format
+    # All experts share one global_scale, so the max scale_factor is taken
+    # over every expert first (value-only, so it can be computed on the
+    # source device) and then applied uniformly per chunk.
+    def scale_factor(scales: torch.Tensor, name: str) -> float:
+        scales = scales.to(param_dtype)
+        scales = pad_w13(scales) if "w13" in name else pad_w2(scales, GROUP_SIZE)
+        return _nvfp4_compute_scale_factor(scales, param_dtype)
+
+    factors = {
+        "w13": scale_factor(w13_scale, "w13"),
+        "w2": scale_factor(w2_scale, "w2"),
+    }
+
     def repack_weight(weight: torch.Tensor, name: str) -> torch.Tensor:
+        e = weight.size(0)
         if "w13" in name:
             size_n, size_k = N * num_shards, K
-            assert weight.shape == (E, size_n, size_k // 2)
+            assert weight.shape == (e, size_n, size_k // 2)
             weight = pad_w13(weight)
             size_n = padded_N * num_shards
         else:
             size_n, size_k = K, N
-            assert weight.shape == (E, size_n, size_k // 2)
+            assert weight.shape == (e, size_n, size_k // 2)
             weight = pad_w2(weight, packing=2)
             size_k = padded_N
 
         return _repack_marlin_experts(weight, size_n, size_k, is_a_8bit)
 
-    w13 = repack_weight(w13, "w13")
-    w2 = repack_weight(w2, "w2")
-
-    # WEIGHT SCALES
-    # Permute scales
     def permute_scales(
         scales: torch.Tensor, g_scales: torch.Tensor, name: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -430,11 +451,8 @@ def prepare_nvfp4_moe_layer_for_marlin(
             scales = pad_w2(scales, packing=GROUP_SIZE)
             size_n, size_k = K, padded_N
 
-        # All experts share one global_scale, so compute the max
-        # scale_factor across all experts first, then apply uniformly.
-        combined_scale_factor = _nvfp4_compute_scale_factor(scales, param_dtype)
-
-        for i in range(E):
+        combined_scale_factor = factors[name]
+        for i in range(scales.size(0)):
             scale = scales[i].T
             marlin_scales = marlin_permute_scales(
                 s=scale,
@@ -453,10 +471,36 @@ def prepare_nvfp4_moe_layer_for_marlin(
         g_scales = g_scales / combined_scale_factor
         return scales, g_scales
 
-    w13_scale, w13_scale_2 = permute_scales(w13_scale, w13_scale_2, "w13")
-    w2_scale, w2_scale_2 = permute_scales(w2_scale, w2_scale_2, "w2")
+    def convert_chunk(a: int, b: int) -> tuple[torch.Tensor, ...]:
+        def dev(t: torch.Tensor) -> torch.Tensor:
+            return t[a:b].to(device, non_blocking=True) if on_host else t[a:b]
 
-    return w13, w13_scale, w13_scale_2, w2, w2_scale, w2_scale_2
+        c_w13 = repack_weight(dev(w13), "w13")
+        c_w2 = repack_weight(dev(w2), "w2")
+        c_w13_scale, c_w13_scale_2 = permute_scales(
+            dev(w13_scale), dev(w13_scale_2), "w13"
+        )
+        c_w2_scale, c_w2_scale_2 = permute_scales(dev(w2_scale), dev(w2_scale_2), "w2")
+        return c_w13, c_w13_scale, c_w13_scale_2, c_w2, c_w2_scale, c_w2_scale_2
+
+    if not on_host:
+        return convert_chunk(0, E)
+
+    outs: list[torch.Tensor] | None = None
+    for a in range(0, E, expert_chunk):
+        b = min(a + expert_chunk, E)
+        chunk = convert_chunk(a, b)
+        if outs is None:
+            outs = [
+                torch.empty((E, *t.shape[1:]), dtype=t.dtype, device="cpu").pin_memory()
+                for t in chunk
+            ]
+        for out, t in zip(outs, chunk):
+            out[a:b].copy_(t)  # blocking D2H: the source outlives the copy
+        del chunk, t  # release the chunk before the next one is converted
+    assert outs is not None
+    torch.accelerator.synchronize(device)
+    return outs[0], outs[1], outs[2], outs[3], outs[4], outs[5]
 
 
 def prepare_moe_fp4_layer_for_marlin(
