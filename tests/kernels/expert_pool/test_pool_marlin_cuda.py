@@ -62,13 +62,17 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
     then a wide batch (bank + host-view partitions), then decode again on
     the same pool; every output must match the uncached layer."""
     device = torch.accelerator.current_accelerator()
-    refs, layers = [], []
+    # One config per layer and side: a layer registers in the static forward
+    # context of the config it was built under, which set_forward_context
+    # must see again at run time (the legacy lookup also resolves layers by
+    # call order within a config, so two layers never share one).
+    ref_cfgs, pool_cfgs, refs, layers = [], [], [], []
     for seed_offset in (0, 1):
         params = _quantized_weights(device, seed_offset=seed_offset)
-        refs.append(_make_layer(_vllm_config(0, "cached"), params))
-        layers.append(
-            _make_layer(_vllm_config(SLOTS, "pool"), params, host_source=True)
-        )
+        ref_cfgs.append(_vllm_config(0, "cached"))
+        pool_cfgs.append(_vllm_config(SLOTS, "pool"))
+        refs.append(_make_layer(ref_cfgs[-1], params))
+        layers.append(_make_layer(pool_cfgs[-1], params, host_source=True))
     model = torch.nn.ModuleDict({"a": layers[0], "b": layers[1]})
     pool = install_expert_pool(model, device, max_decode_tokens=1)
     assert pool is not None
@@ -79,12 +83,10 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
     check_global_tables(pool.tables)
     from vllm.forward_context import set_forward_context
 
-    cfg_ref, cfg_pool = _vllm_config(0, "cached"), _vllm_config(SLOTS, "pool")
-
     def run(i, x, logits, n):
-        with set_forward_context(None, cfg_ref, num_tokens=n):
+        with set_forward_context(None, ref_cfgs[i], num_tokens=n):
             want = refs[i](x, logits)
-        with set_forward_context(None, cfg_pool, num_tokens=n):
+        with set_forward_context(None, pool_cfgs[i], num_tokens=n):
             got = layers[i](x, logits)
         torch.accelerator.synchronize(device)
         torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
