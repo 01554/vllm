@@ -2,16 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Row-level expert weight cache with the CachedWeightProvider surface.
 
-Skeleton (first head): the same public surface as CachedWeightProvider
-(`prepare`, `plan_chunks`, `plan_expert_groups`, `invalidate`, `buf_*`,
-`capacity`, `split`, `hits`, `misses`) plus per-expert global scales for
-NVFP4 (`buf_w13_scale_2`, `buf_w2_scale_2`), an owner-stream contract, and
-counters. Internals in this head: pinned host source, device slot buffers,
-LRU placement, and row copies enqueued non-blocking on the owner compute
-stream (readiness is stream-ordered). Later heads move the copies to a
-provider-owned copy stream with events, keep victim protection for rows
-used in the current forward, and publish at forward boundaries, keeping
-this surface.
+The same public surface as CachedWeightProvider (`prepare`, `plan_chunks`,
+`plan_expert_groups`, `invalidate`, `buf_*`, `capacity`, `split`, `hits`,
+`misses`) plus per-expert global scales for NVFP4 (`buf_w13_scale_2`,
+`buf_w2_scale_2`), an owner-stream contract, and counters.
+
+Staged copies (this head), on CUDA:
+1. At `prepare()` the previous forward's completion is recorded as a
+   release event on the owner compute stream; the provider-owned copy
+   stream waits on it before touching any slot.
+2. Victims are chosen among rows not requested in this forward; every
+   missing expert's six tensors are copied from the pinned host source
+   into its slot on the copy stream.
+3. A ready event is recorded on the copy stream and the owner compute
+   stream waits on it, so the consumer's kernels are ordered after the
+   copies without a host synchronization.
+4. The forward map returned to the consumer is a separate object from
+   the resident map and refers to exactly this generation of slots.
+Pinned source rows and the slot assignments stay referenced by the
+provider until the ready event has been waited on. On CPU the same steps
+run synchronously. Re-entry from a different stream is rejected.
 """
 
 from __future__ import annotations
@@ -66,6 +76,13 @@ class RowCacheWeightProvider:
             )
         self.device = cache_device
         self._owner_stream: int | None = None
+        self._copy_stream: torch.cuda.Stream | None = None
+        self._release_event: torch.cuda.Event | None = None
+        self._ready_event: torch.cuda.Event | None = None
+        self._generation = 0
+        self._in_flight: list[
+            tuple[int, int]
+        ] = []  # (expert, slot) copied last prepare
 
         def host(t: torch.Tensor | None) -> torch.Tensor | None:
             # The provider owns its source: a clone, never an alias of the
@@ -141,10 +158,18 @@ class RowCacheWeightProvider:
             "resident": len(self._lru),
             "capacity": self.capacity,
             "prepare_calls": self._prepare_calls,
+            "generation": self._generation,
+            "last_copies": len(self._in_flight),
         }
 
     def invalidate(self, expert_id: int) -> None:
         self._check_owner_stream()
+        if self.device.type == "cuda" and self._copy_stream is not None:
+            # Slot release must be ordered after the copies that targeted it
+            # and after the previous reader on the owner stream.
+            assert self._ready_event is not None
+            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
+            self._copy_stream.synchronize()
         slot = self._lru.pop(expert_id, None)
         if slot is not None:
             self._free.append(slot)
@@ -213,6 +238,21 @@ class RowCacheWeightProvider:
             )
         self._check_owner_stream()
         self._prepare_calls += 1
+        self._generation += 1
+        cuda = self.device.type == "cuda"
+        if cuda:
+            owner = torch.cuda.current_stream(self.device)
+            if self._copy_stream is None:
+                self._copy_stream = torch.cuda.Stream(self.device)
+                self._release_event = torch.cuda.Event()
+                self._ready_event = torch.cuda.Event()
+            assert self._release_event is not None and self._ready_event is not None
+            # (1) previous reader on the owner stream must finish before any
+            # slot is rewritten: record on the owner stream, wait on the copy
+            # stream.
+            self._release_event.record(owner)
+            self._copy_stream.wait_event(self._release_event)
+        copies: list[tuple[int, int]] = []
         for e in unique_ids:
             if e in self._lru:
                 self._lru.move_to_end(e)
@@ -222,6 +262,7 @@ class RowCacheWeightProvider:
             if self._free:
                 slot = self._free.pop()
             else:
+                # (2) victims are never rows requested in this forward
                 victim, slot = next(
                     (k, v) for k, v in self._lru.items() if k not in needed
                 )
@@ -229,11 +270,23 @@ class RowCacheWeightProvider:
                 self._map_host[victim] = -1
                 self._map[victim] = -1
                 self.evictions += 1
-            self._fill_slot(e, slot)
+            copies.append((e, slot))
             self._lru[e] = slot
             self._map_host[e] = slot
             self._map[e] = slot
             self.promotions += 1
+        if cuda:
+            assert self._copy_stream is not None and self._ready_event is not None
+            with torch.cuda.stream(self._copy_stream):
+                for e, slot in copies:
+                    self._fill_slot(e, slot)
+            # (3) consumer kernels on the owner stream wait for the copies
+            self._ready_event.record(self._copy_stream)
+            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
+            self._in_flight = copies
+        else:
+            for e, slot in copies:
+                self._fill_slot(e, slot)
         # Rows not requested in this forward are hidden (-1) for this call.
         forward_map = torch.full_like(self._map, -1)
         for e in unique_ids:
