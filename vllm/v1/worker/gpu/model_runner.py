@@ -1762,52 +1762,88 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        deferred_ple_setter = getattr(self.model_state, "set_deferred_ple_step", None)
+        if deferred_ple_setter is not None:
+            deferred_ple_setter(
+                not dummy_run
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+                and input_batch.num_tokens == 1
+                and input_batch.num_tokens_after_padding == 1
+                and input_batch.num_reqs == 1
+            )
+
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
             "inputs_embeds": inputs_embeds,
             "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
-        }
-        if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
-            model_inputs["inputs_embeds"] = None
-
-            # Prepare the intermediate tensors.
-            assert intermediate_tensors is not None
-            assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
+            # NOTE: Values returned by `prepare_inputs`/
+            # `prepare_runtime_dummy_inputs` will override the default values
+            # above. Dummy/profile runs use the latter so state that must
+            # never read real request state (e.g. Qwen4Exp's mmap-staged PLE
+            # rows) only ever zeros instead.
+            **(
+                self.model_state.prepare_runtime_dummy_inputs(
+                    input_batch, self.req_states
+                )
                 if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
-            del intermediate_tensors
+                else self.model_state.prepare_inputs(input_batch, self.req_states)
+            ),
+        }
+        try:
+            if not self.is_first_pp_rank:
+                # Update for non-first PP ranks.
+                model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
 
-        # Update the EPLB meta.
-        ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
-        self.eplb.prepare_forward(
-            self.model_config, input_batch.num_tokens, ubatch_slices
-        )
+                # Prepare the intermediate tensors.
+                assert intermediate_tensors is not None
+                assert self.intermediate_tensors is not None
+                n = input_batch.num_tokens_after_padding
+                new_tensors = {
+                    k: v[:n]
+                    if dummy_run
+                    else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                    for k, v in self.intermediate_tensors.tensors.items()
+                }
+                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+                del intermediate_tensors
 
-        self.step_timing.record_batch(
-            input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
-        )
-        self.step_timing.forward_start()
+            # Update the EPLB meta.
+            ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+            self.eplb.prepare_forward(
+                self.model_config, input_batch.num_tokens, ubatch_slices
+            )
+
+            self.step_timing.record_batch(
+                input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+            )
+            self.step_timing.forward_start()
+        except BaseException:
+            abort_ple = getattr(self.model_state, "abort_deferred_ple", None)
+            if abort_ple is not None:
+                abort_ple()
+            raise
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            try:
+                assert self.cudagraph_manager is not None
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+                # Host fills must release graph WAITs before any observer,
+                # connector or output path can synchronize the compute stream.
+                complete_ple = getattr(self.model_state, "complete_deferred_ple", None)
+                if complete_ple is not None:
+                    complete_ple()
+            except BaseException:
+                abort_ple = getattr(self.model_state, "abort_deferred_ple", None)
+                if abort_ple is not None:
+                    abort_ple()
+                raise
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
