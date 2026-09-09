@@ -375,6 +375,7 @@ class RoutedExperts(PluggableLayer):
             )
             replace_parameter(self, w13_scale_name, provider.buf_w13_scale)
             replace_parameter(self, w2_scale_name, provider.buf_w2_scale)
+            self._mark_device_resident(w13_scale_name, w2_scale_name)
         if provider.buf_w13_scale_2 is not None:
             assert provider.buf_w2_scale_2 is not None
             assert self.quant_method.moe_quant_config is None, (
@@ -384,6 +385,7 @@ class RoutedExperts(PluggableLayer):
             )
             replace_parameter(self, w13_scale_2_name, provider.buf_w13_scale_2)
             replace_parameter(self, w2_scale_2_name, provider.buf_w2_scale_2)
+            self._mark_device_resident(w13_scale_2_name, w2_scale_2_name)
 
         # Release the full weight tensors (the provider holds its own
         # reference to the CPU pinned backing store).
@@ -412,6 +414,15 @@ class RoutedExperts(PluggableLayer):
             )
             / 2**20,
         )
+
+    def _mark_device_resident(self, *names: str) -> None:
+        # The loader's device_loading_context restores CPU-resident parameters
+        # by name after processing; slot buffers must stay where the kernel
+        # captured them.
+        from vllm.model_executor.model_loader.utils import DEVICE_RESIDENT_ATTR
+
+        for name in names:
+            setattr(getattr(self, name), DEVICE_RESIDENT_ATTR, True)
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
