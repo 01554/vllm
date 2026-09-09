@@ -246,6 +246,29 @@ class BenchMainMockTests(unittest.TestCase):
             self.assertFalse(any(t["valid"] for t in timing))
             self.assertIsNone(timing[0]["median_ms"])
 
+    def test_non_equivalent_backend_is_marked_in_summary_and_timing(self):
+        class NonEquivalentRunner(FakeRunner):
+            globals_report = {"source_equivalent": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = make_bank()
+            with mock.patch.object(
+                bench,
+                "NativeRunner",
+                lambda b, d, gemv_rows=1: NonEquivalentRunner(bank),
+            ):
+                rows, correctness = self.run_main(tmp)
+            self.assertEqual([r["source_equivalent"] for r in rows], ["NO", "NO"])
+            self.assertEqual([r["correct"] for r in rows], ["PASS", "PASS"])
+            self.assertTrue(
+                all(c["source_equivalent"] is False for c in correctness.values())
+            )
+            timing = [
+                json.loads(line)
+                for line in (Path(tmp) / "timing.jsonl").read_text().splitlines()
+            ]
+            self.assertTrue(all(t["source_equivalent"] is False for t in timing))
+
     def test_no_timing_only_writes_correctness(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows, correctness = self.run_main(tmp, extra=("--no-timing",))
