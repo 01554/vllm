@@ -80,6 +80,14 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
         for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
             p = getattr(layer.routed_experts, name)
             p.data = p.data.to(device)
+        # A non-contiguous (strided) host source must be densified into the
+        # pool's own pinned copy, values preserved, not stride-preserved.
+        p = layer.routed_experts.w2_weight_scale
+        wide = torch.zeros((p.shape[0], 2, *p.shape[1:]), dtype=p.dtype).pin_memory()
+        wide[:, 0].copy_(p.data)
+        strided_values = p.data.clone()
+        p.data = wide[:, 0]
+        assert not p.data.is_contiguous()
     model = torch.nn.ModuleDict({"a": layers[0], "b": layers[1]})
     pool = install_expert_pool(model, device, max_decode_tokens=1)
     assert pool is not None
@@ -90,6 +98,9 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
             t.device.type == "cpu" and t.is_pinned() and t.is_contiguous()
             for t in pl.sources.values()
         )
+    src = layers[-1].routed_experts.expert_pool_layer.sources["w2_weight_scale"]
+    assert src.shape == strided_values.shape and src.dtype == strided_values.dtype
+    assert torch.equal(src, strided_values)
     report = verify_bank_rows(pool, model.expert_pool_sources, sample=SLOTS)
     assert report == {"rows_checked": 2 * SLOTS, "rows_resident": 2 * SLOTS}
     assert pool.rows == 2 * SLOTS + TOP_K and pool.rows > E
