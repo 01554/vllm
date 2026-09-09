@@ -38,9 +38,10 @@ REPLAYS_PER_BATCH = 20
 
 
 def sha256_tensor(t: torch.Tensor) -> str:
-    return hashlib.sha256(
-        t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-    ).hexdigest()
+    # reshape(-1) first: 0-dim scalars (the F32 global/input scales) cannot
+    # be viewed as bytes directly.
+    flat = t.detach().cpu().contiguous().reshape(-1)
+    return hashlib.sha256(flat.view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
 def make_inputs(m: int, hidden: int, num_experts: int, seed: int):

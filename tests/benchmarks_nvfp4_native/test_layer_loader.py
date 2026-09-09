@@ -28,8 +28,11 @@ class LayerLoaderTests(unittest.TestCase):
                 ("up_proj", n, k),
                 ("down_proj", k, n),
             ):
+                # gate 0x20+i, up 0x40+i, down 0x60+i: concatenation order is
+                # visible in the bank.
+                base = {"gate_proj": 0x20, "up_proj": 0x40, "down_proj": 0x60}[proj]
                 tensors[tensor_name(PREFIX, i, proj, "weight")] = torch.full(
-                    (rows, cols // 2), 0x20 + i, dtype=torch.uint8
+                    (rows, cols // 2), base + i, dtype=torch.uint8
                 )
                 tensors[tensor_name(PREFIX, i, proj, "weight_scale")] = torch.ones(
                     (rows, cols // 16), dtype=torch.float8_e4m3fn
@@ -54,5 +57,18 @@ class LayerLoaderTests(unittest.TestCase):
         )
         # gate rows first, then up rows
         self.assertTrue(torch.all(bank["w13_weight"][1, :n] == 0x21))
+        self.assertTrue(torch.all(bank["w13_weight"][1, n:] == 0x41))
+        self.assertTrue(torch.all(bank["w2_weight"][2] == 0x62))
+        self.assertIn(
+            tensor_name(PREFIX, 0, "gate_proj", "weight_scale_2"), manifest["sources"]
+        )
         self.assertEqual(len(manifest["sources"]), e * 12)
         self.assertEqual(manifest["input_scales"]["down_proj"], [1.0] * e)
+
+
+class HashTests(unittest.TestCase):
+    def test_scalar_tensors_hash(self):
+        from benchmarks.nvfp4_native.layer_loader import sha256_of
+
+        self.assertEqual(len(sha256_of(torch.tensor(0.5))), 64)
+        self.assertNotEqual(sha256_of(torch.tensor(0.5)), sha256_of(torch.tensor(0.25)))
