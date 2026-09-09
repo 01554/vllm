@@ -27,14 +27,11 @@ from vllm.config import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    check_marlin_supported,
-)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    is_fp4_marlin_supported,
     prepare_nvfp4_moe_layer_for_marlin,
 )
 from vllm.platforms import current_platform
-from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import (
     init_workspace_manager,
@@ -43,10 +40,12 @@ from vllm.v1.worker.workspace import (
 
 pytestmark = [
     pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required"),
+    # The predicate the NVFP4 Marlin path itself uses (CUDA, capability >= 7.5);
+    # the generic check_marlin_supported group-size whitelist does not cover
+    # the FP4 group of 16 and would skip on supported GPUs.
     pytest.mark.skipif(
-        current_platform.is_cuda()
-        and not check_marlin_supported(scalar_types.float4_e2m1f, group_size=16),
-        reason="Marlin NVFP4 (float4_e2m1f, group 16) not supported on this GPU",
+        current_platform.is_cuda() and not is_fp4_marlin_supported(),
+        reason="FP4 Marlin not supported on this GPU",
     ),
 ]
 
