@@ -43,6 +43,15 @@ _STATS_LOG_INTERVAL = 1000
 
 
 class RowCacheWeightProvider:
+    """Row-level expert cache with staged copies on a provider-owned stream.
+
+    Consumer contract: calls are sequential host code; every consumer read
+    of the slots for one forward is enqueued on the stream that was current
+    at that forward's prepare() before the next prepare() or invalidate() is
+    called. The stream may change between calls (profile run, graph capture,
+    replay); concurrent consumers on several streams are not supported.
+    """
+
     def __init__(
         self,
         capacity: int,
@@ -180,7 +189,8 @@ class RowCacheWeightProvider:
         )
 
     def host_bytes(self) -> int:
-        """Pinned host bytes of the source (aliased when the input was pinned)."""
+        """Host bytes of the six source tensors (pinned on CUDA; aliased when
+        the input was already pinned; pageable on the CPU device)."""
         return sum(
             t.numel() * t.element_size() for t in self._cpu.values() if t is not None
         )
@@ -270,19 +280,6 @@ class RowCacheWeightProvider:
             )
         self._prepare_calls += 1
         self._generation += 1
-        if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
-            st = self.stats()
-            logger.info(
-                "Row expert cache: %d hits, %d misses, %d evictions, "
-                "%d/%d slots resident, slot %.1f MiB, host %.1f MiB",
-                st["hits"],
-                st["misses"],
-                st["evictions"],
-                len(self._lru),
-                self.capacity,
-                st["slot_bytes"] / 2**20,
-                st["host_bytes"] / 2**20,
-            )
         cuda = self.device.type == "cuda"
         if cuda:
             previous, owner = self._take_owner_stream()
@@ -342,6 +339,20 @@ class RowCacheWeightProvider:
             for e, slot in copies:
                 self._fill_slot(e, slot)
         self._in_flight = copies
+        if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
+            st = self.stats()  # counts include this call
+            logger.info(
+                "Row expert cache: %d hits, %d misses, %d evictions, "
+                "%d/%d slots resident, slot %.1f MiB, host %.1f MiB "
+                "(host = all six source tensors)",
+                st["hits"],
+                st["misses"],
+                st["evictions"],
+                len(self._lru),
+                self.capacity,
+                st["slot_bytes"] / 2**20,
+                st["host_bytes"] / 2**20,
+            )
         # Rows not requested in this forward are hidden (-1) for this call.
         forward_host = [-1] * self._num_experts
         for e in unique_ids:
