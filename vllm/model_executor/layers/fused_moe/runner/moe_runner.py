@@ -69,9 +69,12 @@ def register_layer_for_moe_forward_op(
     compilation_config.static_all_moe_layers.append(prefix)
 
 
-def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
-    forward_context: ForwardContext = get_forward_context()
+def resolve_concrete_layer_name(layer_name: str) -> str:
+    """Turn the legacy "from_forward_context" placeholder into the concrete
+    layer name, consuming one entry of the forward context's MoE layer
+    sequence. Stateful: call exactly once per MoE op invocation."""
     if not _USE_LAYERNAME and layer_name == "from_forward_context":
+        forward_context: ForwardContext = get_forward_context()
         all_moe_layers = forward_context.all_moe_layers
         assert all_moe_layers is not None
         moe_layer_index = forward_context.moe_layer_index
@@ -83,7 +86,12 @@ def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
             )
         layer_name = all_moe_layers[moe_layer_index]
         forward_context.moe_layer_index += 1
-    layer = forward_context.no_compile_layers[layer_name]
+    return layer_name
+
+
+def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[resolve_concrete_layer_name(layer_name)]
     assert isinstance(layer, MoERunnerInterface)
     return layer
 
@@ -220,7 +228,11 @@ def _eager_break_when_cached(fn):
     def wrapper(
         hidden_states, router_logits, shared_experts_input, input_ids, layer_name, *rest
     ):
-        layer = get_layer_from_name(_resolve_layer_name(layer_name))
+        # The legacy placeholder lookup is stateful (one forward-context
+        # entry per MoE op): resolve it exactly once here and hand the
+        # concrete name to the op, whose own lookup is then a plain fetch.
+        name = resolve_concrete_layer_name(_resolve_layer_name(layer_name))
+        layer = get_layer_from_name(name)
         target = (
             breaking if layer.routed_experts.expert_weight_provider is not None else fn
         )
@@ -229,7 +241,7 @@ def _eager_break_when_cached(fn):
             router_logits,
             shared_experts_input,
             input_ids,
-            layer_name,
+            name,
             *rest,
         )
 
