@@ -228,13 +228,9 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         scratch = workspace2.reshape(-1).view(torch.uint8)
         if rows <= self.gemv_rows:
             workspace = native_bank.carve_workspace(
-                self._bank,
-                scratch,
-                self.gemv_rows,
-                top_k,
-                self._error,
-                num_experts=self._rows,
+                self._bank, scratch, rows, top_k, self._error, num_experts=self._rows
             )
+
             result = native_bank.gemv(
                 hidden_states,
                 weights,

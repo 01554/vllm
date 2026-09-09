@@ -147,6 +147,21 @@ class NativeExpertsTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out, reference))
 
+    def test_decode_carve_uses_the_actual_row_count(self):
+        # gemv_rows=8 with M=1: the declared scratch is for 1 row and the
+        # carve must not exceed it.
+        experts = make_experts(gemv_rows=8)
+        experts.process_weights_after_loading(self.layer)
+        _w1, (elems,), _o = experts.workspace_shapes(
+            1, 16, 32, 4, 3, 3, None, MoEActivation.SILU
+        )
+        one_row = native.scratch_nbytes(native.decode_scratch_layout(32, 16, 1, 4))
+        self.assertGreaterEqual(elems * 2, one_row)
+        out = self.run_apply(
+            experts, 1, scratch=torch.empty((elems,), dtype=torch.bfloat16)
+        )
+        self.assertTrue(torch.isfinite(out.float()).all())
+
     def test_router_weights_are_passed_as_fp32(self):
         # The adapters reject non-FP32 router weights; apply converts.
         experts = make_experts(gemv_rows=1)
