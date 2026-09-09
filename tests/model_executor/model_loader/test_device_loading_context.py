@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""device_loading_context restores only the parameters it moved.
-
-A quant method may replace a parameter under the same name while its weights
-are being processed (the expert cache repoints scale parameters at device
-slot buffers); the replacement must stay on the device, while an unreplaced
-CPU-resident parameter is moved back to the CPU."""
+"""device_loading_context restores CPU-resident parameters by name after
+processing; only a replacement explicitly marked DEVICE_RESIDENT_ATTR (the
+expert cache's scale slot buffers) stays on the device. Ordinary same-name
+replacements and unreplaced parameters are moved back to the CPU as before.
+The UVA-offload branch is unchanged and not covered here (cache plus UVA
+offload is not a supported combination by this fix)."""
 
 import pytest
 import torch
