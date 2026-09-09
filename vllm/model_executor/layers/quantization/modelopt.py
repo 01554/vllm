@@ -855,6 +855,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         return True
 
     @property
+    def mk_can_overlap_shared_experts(self) -> bool:
+        # The expert pool runs its own consumer outside self.moe_kernel and
+        # does not overlap shared experts; the runner must run them itself.
+        if getattr(self, "_pool_mode", False):
+            return False
+        return super().mk_can_overlap_shared_experts
+
+    @property
     def supports_expert_lru_cache(self) -> bool:
         # The cache hands the kernel slot-indexed copies of all six expert
         # tensors, so every one of them must keep an expert-major layout in
@@ -1048,6 +1056,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # cache takes them as its source and repoints the per-expert scale
         # and global-scale parameters at its slot buffers. The quant config
         # built next captures those buffers, so this must come first.
+        self._pool_mode = (
+            layer._moe_expert_cache_size > 0
+            and layer._moe_expert_cache_provider == "pool"
+        )
         layer._maybe_init_expert_lru_cache(
             "weight_scale", scale_2_suffix="weight_scale_2"
         )
@@ -1125,10 +1137,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         pool_layer = layer.expert_pool_layer
         if pool_layer is not None:
-            if shared_experts is not None:
-                raise NotImplementedError(
-                    "expert pool does not overlap shared experts inside apply()"
-                )
+            # The runner always passes its SharedExperts wrapper; the wrapper
+            # picks the order itself. The pool never overlaps shared experts
+            # (mk_can_overlap_shared_experts is False), so the runner has
+            # already run them (NO_OVERLAP or the aux stream) and the
+            # argument is ignored here, as the synchronous modular path does.
+            assert not self.mk_can_overlap_shared_experts
             return pool_layer.apply(x, topk_weights, topk_ids)
         if layer.expert_pool_pending:
             raise RuntimeError(
