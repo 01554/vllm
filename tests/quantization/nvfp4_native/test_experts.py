@@ -202,6 +202,54 @@ class NativeExpertsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             experts.process_weights_after_loading(self.layer)
 
+    def test_modular_kernel_takes_native_scratch_from_the_workspace_manager(self):
+        """The real FusedMoEKernel path: workspace_shapes() -> WorkspaceManager
+        get_simultaneous() -> apply() carves the manager's buffer. Both the
+        decode (gemv) and prefill rows must match the direct apply on a
+        hand-allocated scratch, and the manager must hold at least the
+        declared scratch plus output bytes."""
+        import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+            MoEPrepareAndFinalizeNoDPEPModular,
+        )
+        from vllm.v1.worker import workspace as ws
+
+        experts = make_experts(gemv_rows=1)
+        experts.moe_config = SimpleNamespace(
+            experts_per_token=4, max_num_tokens=8, moe_parallel_config=None
+        )
+        experts.quant_config = SimpleNamespace(
+            gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None, a2_scale=None
+        )
+        experts.process_weights_after_loading(self.layer)
+        ws.reset_workspace_manager()
+        ws.init_workspace_manager(torch.device("cpu"))
+        try:
+            kernel = mk.FusedMoEKernel(MoEPrepareAndFinalizeNoDPEPModular(), experts)
+            for rows in (1, 3):  # gemv path, then prefill path
+                want = self.run_apply(experts, rows)
+                got = kernel.apply(
+                    self.x[:rows],
+                    self.bank["w13_weight"],
+                    self.bank["w2_weight"],
+                    self.ids[:rows],
+                    self.weights[:rows],
+                    activation=MoEActivation.SILU,
+                    global_num_experts=3,
+                )
+                self.assertEqual(got.shape, (rows, 32))
+                self.assertTrue(torch.equal(got, want), rows)
+            manager = ws.current_workspace_manager()
+            _w1, (elems,), _o = experts.workspace_shapes(
+                3, 32, 32, 4, 3, 3, None, MoEActivation.SILU
+            )
+            held = sum(
+                manager._workspace_size_bytes(w) for w in manager._current_workspaces
+            )
+            self.assertGreaterEqual(held, elems * 2 + 3 * 32 * 2)
+        finally:
+            ws.reset_workspace_manager()
+
     def test_rejects_unsupported_calls(self):
         experts = make_experts()
         with self.assertRaises(RuntimeError):
