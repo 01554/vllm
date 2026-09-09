@@ -236,6 +236,8 @@ class NativeExpertsTests(unittest.TestCase):
                     self.weights[:rows],
                     activation=MoEActivation.SILU,
                     global_num_experts=3,
+                    expert_map=None,
+                    apply_router_weight_on_input=False,
                 )
                 self.assertEqual(got.shape, (rows, 32))
                 self.assertTrue(torch.equal(got, want), rows)
