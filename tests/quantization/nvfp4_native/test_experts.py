@@ -144,6 +144,10 @@ class NativeExpertsTests(unittest.TestCase):
         c = make_experts(max_num_tokens=16)
         c.process_weights_after_loading(self.layer)
         self.assertIsNot(a._prefill_workspace, c._prefill_workspace)
+        # CPU has no streams: key stream id is 0 and sharing is by shape only.
+        from vllm.model_executor.layers.quantization.nvfp4_native import experts
+
+        self.assertEqual(experts._workspace_key(self.bank, 8, 4)[1], 0)
 
     def test_unsupported_configurations_are_rejected_explicitly(self):
         ok = SimpleNamespace(

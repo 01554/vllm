@@ -38,18 +38,36 @@ from .loader import activation_name
 # Rows at or below this count take the decode GEMV; above it, grouped prefill.
 DEFAULT_GEMV_ROWS = 1
 
-# Scratch is shared by every layer with the same bank shape and capacities:
-# layers run sequentially on one stream, and per-layer copies would cost
-# hundreds of MiB each at prefill batch sizes (e.g. ~390 MiB per layer at
-# 4096 tokens x top-10 on a 2560/640 model, ~18 GiB over 48 layers).
+# Scratch is shared by every layer with the same bank shape and capacities
+# *on the same device and CUDA stream*: work on one stream is ordered, so two
+# layers (or two models) that share a stream can never run their kernels
+# concurrently, and a different stream gets its own scratch.  Per-layer
+# copies would cost hundreds of MiB each at prefill batch sizes (~390 MiB
+# per layer at 4096 tokens x top-10 on a 2560/640 model, ~18 GiB over 48
+# layers).  Graph capture records the stream's scratch addresses; replay of
+# that graph runs on the same stream, so the exclusivity argument holds.
 _DECODE_WORKSPACES: dict[tuple, native_bank.Workspace] = {}
 _PREFILL_WORKSPACES: dict[tuple, native_prefill.Workspace] = {}
+
+
+def _stream_id(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 0
+    return torch.cuda.current_stream(device).cuda_stream
 
 
 def _workspace_key(bank: native_bank.Bank, max_tokens: int, top_k: int) -> tuple:
     rows, hidden, intermediate = native_bank.validate_bank(bank)
     device = bank["w13_weight"].device
-    return (str(device), rows, hidden, intermediate, max_tokens, top_k)
+    return (
+        str(device),
+        _stream_id(device),
+        rows,
+        hidden,
+        intermediate,
+        max_tokens,
+        top_k,
+    )
 
 
 def shared_decode_workspace(
@@ -59,7 +77,7 @@ def shared_decode_workspace(
     workspace = _DECODE_WORKSPACES.get(key)
     if workspace is None:
         workspace = native_bank.allocate_workspace(
-            bank, max_tokens, top_k, num_experts=key[1]
+            bank, max_tokens, top_k, num_experts=key[2]
         )
         _DECODE_WORKSPACES[key] = workspace
     return workspace
@@ -72,7 +90,7 @@ def shared_prefill_workspace(
     workspace = _PREFILL_WORKSPACES.get(key)
     if workspace is None:
         workspace = native_prefill.allocate_workspace(
-            bank, max_tokens, top_k, num_experts=key[1]
+            bank, max_tokens, top_k, num_experts=key[2]
         )
         _PREFILL_WORKSPACES[key] = workspace
     return workspace
@@ -185,6 +203,8 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         self._step_map = torch.arange(
             rows, dtype=torch.int32, device=bank["w13_weight"].device
         )
+        # Warm the scratch for the loading stream; apply() re-resolves on the
+        # forward stream, so a different stream gets its own scratch.
         self._decode_workspace = shared_decode_workspace(bank, self.gemv_rows, top_k)
         self._prefill_workspace = shared_prefill_workspace(
             bank, self.moe_config.max_num_tokens, top_k
@@ -237,26 +257,27 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         ids = topk_ids.to(torch.int32).contiguous()
         # The adapters require FP32 router weights.
         weights = topk_weights.to(torch.float32).contiguous()
+        top_k = ids.shape[1]
         if hidden_states.shape[0] <= self.gemv_rows:
-            assert self._decode_workspace is not None
             result = native_bank.gemv(
                 hidden_states,
                 weights,
                 ids,
                 self._bank,
                 self._step_map,
-                self._decode_workspace,
+                shared_decode_workspace(self._bank, self.gemv_rows, top_k),
                 activation=act,
             )
         else:
-            assert self._prefill_workspace is not None
             result = native_prefill.prefill(
                 hidden_states,
                 weights,
                 ids,
                 self._bank,
                 self._step_map,
-                self._prefill_workspace,
+                shared_prefill_workspace(
+                    self._bank, self.moe_config.max_num_tokens, top_k
+                ),
                 activation=act,
             )
         output.copy_(result)
