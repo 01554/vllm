@@ -83,8 +83,8 @@ def _quantize_row_major(w: torch.Tensor):
     return torch.stack(qs), torch.stack(ss), torch.stack(gs)
 
 
-def _quantized_weights(device, n: int = N):
-    set_random_seed(11)
+def _quantized_weights(device, n: int = N, seed_offset: int = 0):
+    set_random_seed(11 + seed_offset)
     w1 = torch.randn(E, 2 * n, K, dtype=torch.bfloat16, device=device)
     w2 = torch.randn(E, K, n, dtype=torch.bfloat16, device=device)
     # Distinct per-expert magnitudes so the global scales differ per expert.
