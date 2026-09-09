@@ -96,5 +96,7 @@ def test_event_order_on_prepare_and_invalidate():
         assert seq[:2] == ["release.record(owner)", "copy.wait(release)"], seq
         assert seq[2] == "enter(copy)" and "exit(copy)" in seq, seq
         assert seq[-2:] == ["ready.record(copy)", "owner.wait(ready)"], seq
-    assert third == ["owner.wait(ready)", "copy.synchronize"], third
+    assert third == ["copy.synchronize"], (
+        third
+    )  # copies only; reader ordering via the next release event
     assert p.stats()["last_copies"] == 1 and p.stats()["evictions"] == 1

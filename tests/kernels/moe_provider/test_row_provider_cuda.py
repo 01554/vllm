@@ -77,8 +77,9 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     owner = torch.cuda.current_stream(p.device)
     names = ("w13", "w2", "w13_scale", "w2_scale", "w13_scale_2", "w2_scale_2")
     bufs = [getattr(p, f"buf_{n}") for n in names]
-    # Pre-allocate outputs and warm the reader so the timed pass allocates
-    # nothing (allocator events would otherwise serialize the streams).
+    # Warm the reader first so the caching allocator can reuse blocks in the
+    # timed pass (it may still allocate; the overlap check below verifies the
+    # reader was genuinely unfinished when the copies were enqueued).
     acc = torch.zeros((), dtype=torch.float32, device=p.device)
 
     def slow_read(acc):
@@ -144,12 +145,26 @@ def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
     p = RowCacheWeightProvider(2, src["w13"], src["w2"], device="cuda")
     r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
     slot1 = int(r1.expert_map[1])
+    owner = torch.cuda.current_stream(p.device)
     acc = torch.zeros((), dtype=torch.float32, device=p.device)
-    for _ in range(256):
-        acc = acc + p.buf_w13[slot1].reshape(-1).float().sum()
-    p.invalidate(1)  # frees the slot while the reader may still be running
-    r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
+
+    def slow_read(acc):
+        for _ in range(256):
+            acc = acc + p.buf_w13[slot1].reshape(-1).float().sum()
+        return acc
+
+    slow_read(acc)  # warmup
     torch.accelerator.synchronize(p.device)
+    reader_done = torch.cuda.Event()
+    read1 = slow_read(acc)
+    reader_done.record(owner)
+    p.invalidate(1)  # frees the slot; may not wait for the reader
+    r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
+    overlapped = not reader_done.query()
+    torch.accelerator.synchronize(p.device)
+    assert overlapped, (
+        "reader finished before the reuse was enqueued; test is inconclusive"
+    )
     assert int(r2.expert_map[3]) == slot1
-    assert torch.equal(acc.cpu(), (src["w13"][1].reshape(-1).float().sum() * 256))
+    assert torch.equal(read1.cpu(), src["w13"][1].reshape(-1).float().sum() * 256)
     assert torch.equal(p.buf_w13[slot1].cpu(), src["w13"][3])
