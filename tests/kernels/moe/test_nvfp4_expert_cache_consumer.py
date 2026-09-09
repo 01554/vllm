@@ -72,10 +72,10 @@ def dist_env():
     return cfg
 
 
-def _quantized_weights(device):
+def _quantized_weights(device, n: int = N):
     set_random_seed(11)
-    w1 = torch.randn(E, 2 * N, K, dtype=torch.bfloat16, device=device)
-    w2 = torch.randn(E, K, N, dtype=torch.bfloat16, device=device)
+    w1 = torch.randn(E, 2 * n, K, dtype=torch.bfloat16, device=device)
+    w2 = torch.randn(E, K, n, dtype=torch.bfloat16, device=device)
     # Distinct per-expert magnitudes so the global scales differ per expert.
     mag = torch.tensor([0.5 + i for i in range(E)], device=device).view(E, 1, 1)
     w1 = (w1 * mag).to(torch.bfloat16)
@@ -124,6 +124,16 @@ def _make_layer(
             dp_size=1,
             prefix="from_forward_context",
         )
+        if cfg.offload_config.moe_expert_cache_size > 0:
+            # create_weights wiring: expert tensors start in pinned host memory.
+            for name in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ):
+                p = getattr(layer.routed_experts, name)
+                assert p.device.type == "cpu" and p.is_pinned(), name
         for name, value in params.items():
             data = value.clone()
             if host_source and name in (
@@ -150,23 +160,25 @@ def _routing(order: list[int], device) -> torch.Tensor:
     return logits
 
 
-def test_host_chunked_marlin_repack_matches_device_path(dist_env):
+@pytest.mark.parametrize("n", [N, 96])  # 96 needs Marlin tile padding
+def test_host_chunked_marlin_repack_matches_device_path(dist_env, n):
     """The chunked host path must produce the device path's bytes."""
     device = torch.accelerator.current_accelerator()
-    params = _quantized_weights(device)
+    params = _quantized_weights(device, n)
     g13 = params["w13_weight_scale_2"][:, 0].contiguous()
 
     def run(on_host: bool, chunk: int):
         layer = types.SimpleNamespace(
             num_experts=E,
             hidden_size=K,
-            intermediate_size_per_partition=N,
+            intermediate_size_per_partition=n,
             params_dtype=torch.bfloat16,
         )
         src = {k: v.clone() for k, v in params.items()}
         if on_host:
             for k in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
                 src[k] = src[k].cpu().pin_memory()
+                assert src[k].device.type == "cpu" and src[k].is_pinned()
         outs = prepare_nvfp4_moe_layer_for_marlin(
             layer,
             src["w13_weight"],
@@ -178,11 +190,12 @@ def test_host_chunked_marlin_repack_matches_device_path(dist_env):
             is_act_and_mul=True,
             expert_chunk=chunk,
         )
+        if on_host:
+            assert all(t.device.type == "cpu" and t.is_pinned() for t in outs)
         return [t.to(device) for t in outs]
 
     want = run(False, E)
     got = run(True, 3)  # 3 + 3 + 2 experts
-    assert all(t.device.type == "cpu" for t in got) is False  # moved back above
     for name, a, b in zip(
         ("w13", "w13_scale", "w13_scale_2", "w2", "w2_scale", "w2_scale_2"), want, got
     ):

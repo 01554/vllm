@@ -85,8 +85,10 @@ class RowCacheWeightProvider:
         ] = []  # (expert, slot) copied last prepare
 
         def host(t: torch.Tensor | None) -> torch.Tensor | None:
-            # The provider owns its source: a clone, never an alias of the
-            # caller's tensor (pinned when the cache is on CUDA).
+            # Source contract: on CUDA the source is pinned host memory; an
+            # input that is already pinned is aliased (same helper as
+            # CachedWeightProvider) and must stay immutable while the
+            # provider lives; anything else is copied.
             if t is None:
                 return None
             if cache_device.type == "cuda":

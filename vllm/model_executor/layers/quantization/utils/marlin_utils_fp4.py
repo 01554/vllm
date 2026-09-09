@@ -348,12 +348,14 @@ def prepare_nvfp4_moe_layer_for_marlin(
 ]:
     """Repack NVFP4 MoE weights and scales for Marlin.
 
-    Sources on the accelerator are converted in place of the old path (one
-    pass over all experts). Sources in CPU (pinned) memory -- the expert
-    cache's load layout -- are converted `expert_chunk` experts at a time on
-    the accelerator and written back into pinned host tensors, so the GPU
-    peak is one chunk rather than the whole layer.
+    Sources on the accelerator are converted in one pass over all experts.
+    Sources in CPU (pinned) memory -- the expert cache's load layout -- are
+    converted `expert_chunk` experts at a time on the accelerator and written
+    back into pinned host tensors; the accelerator holds one chunk's inputs
+    and outputs plus the repack scratch at a time, not the whole layer.
     """
+    if expert_chunk <= 0:
+        raise ValueError(f"expert_chunk must be positive, got {expert_chunk}")
     logger.warning_once(
         "Your GPU does not have native support for FP4 computation but "
         "FP4 quantization is being used. Weight-only FP4 compression will "
@@ -494,7 +496,8 @@ def prepare_nvfp4_moe_layer_for_marlin(
                 for t in chunk
             ]
         for out, t in zip(outs, chunk):
-            out[a:b].copy_(t)
+            out[a:b].copy_(t)  # blocking D2H: the source outlives the copy
+        del chunk, t  # release the chunk before the next one is converted
     assert outs is not None
     torch.accelerator.synchronize(device)
     return outs[0], outs[1], outs[2], outs[3], outs[4], outs[5]
