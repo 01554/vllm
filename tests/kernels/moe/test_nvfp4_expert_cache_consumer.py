@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.kernels.moe.modular_kernel_tools.parallel_utils import _set_vllm_config
-from tests.kernels.moe.utils import moe_quantize_weights
+from tests.kernels.moe.utils import _scaled_fp4_quant_emulated
 from vllm.config import (
     CompilationConfig,
     ParallelConfig,
@@ -71,6 +71,18 @@ def dist_env():
     return cfg
 
 
+def _quantize_row_major(w: torch.Tensor):
+    qs, ss, gs = [], [], []
+    for i in range(w.shape[0]):
+        amax = w[i].abs().max().to(torch.float32)
+        g = torch.tensor(448.0 * 6.0, device=w.device) / amax
+        q, s = _scaled_fp4_quant_emulated(w[i], g)
+        qs.append(q)
+        ss.append(s)
+        gs.append(g)
+    return torch.stack(qs), torch.stack(ss), torch.stack(gs)
+
+
 def _quantized_weights(device, n: int = N):
     set_random_seed(11)
     w1 = torch.randn(E, 2 * n, K, dtype=torch.bfloat16, device=device)
@@ -79,10 +91,11 @@ def _quantized_weights(device, n: int = N):
     mag = torch.tensor([0.5 + i for i in range(E)], device=device).view(E, 1, 1)
     w1 = (w1 * mag).to(torch.bfloat16)
     w2 = (w2 * mag.flip(0)).to(torch.bfloat16)
-    w1q, w1s, w1gs = moe_quantize_weights(w1, None, "nvfp4", False, None)
-    w2q, w2s, w2gs = moe_quantize_weights(w2, None, "nvfp4", False, None)
-    assert w1s is not None and w1gs is not None
-    assert w2s is not None and w2gs is not None
+    # Row-major [E, rows, K/16] block scales as a checkpoint stores them. The
+    # CUDA quant op would return the swizzled 128x4 layout padded to 128 rows,
+    # which is neither the checkpoint layout nor what Marlin's permute reads.
+    w1q, w1s, w1gs = _quantize_row_major(w1)
+    w2q, w2s, w2gs = _quantize_row_major(w2)
     params = {
         "w13_weight": w1q,
         "w2_weight": w2q,
@@ -93,6 +106,8 @@ def _quantized_weights(device, n: int = N):
         "w13_input_scale": torch.ones((E, 2), dtype=torch.float32, device=device),
         "w2_input_scale": torch.ones(E, dtype=torch.float32, device=device),
     }
+    assert params["w13_weight_scale"].shape == (E, 2 * n, K // 16)
+    assert params["w2_weight_scale"].shape == (E, K, n // 16)
     assert torch.unique(params["w13_weight_scale_2"][:, 0]).numel() == E
     assert torch.unique(params["w2_weight_scale_2"]).numel() == E
     return params
