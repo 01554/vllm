@@ -224,8 +224,15 @@ class RoutedExperts(PluggableLayer):
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
         ):
+            from vllm.compilation.breakable_cudagraph import (
+                is_breakable_cudagraph_enabled,
+            )
+
             splitting_ops = vllm_config.compilation_config.splitting_ops or []
-            if "vllm::moe_forward" not in splitting_ops:
+            if (
+                "vllm::moe_forward" not in splitting_ops
+                and not is_breakable_cudagraph_enabled()
+            ):
                 raise ValueError(
                     "moe_expert_cache_size without --enforce-eager requires "
                     "the MoE op to run outside CUDA graphs "

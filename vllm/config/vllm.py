@@ -1705,13 +1705,26 @@ class VllmConfig:
             and self.offload_config.moe_expert_cache_size > 0
             and not self.model_config.enforce_eager
         ):
+            from vllm.compilation.breakable_cudagraph import (
+                is_breakable_cudagraph_enabled,
+            )
+
             cc = self.compilation_config
-            if cc.mode != CompilationMode.VLLM_COMPILE:
+            # Two ways to keep the MoE op out of the graphs: torch.compile
+            # splitting (VLLM_COMPILE), or breakable CUDA graphs, where the
+            # MoE op is an eager break point for cached layers (moe_runner).
+            if (
+                not is_breakable_cudagraph_enabled()
+                and cc.mode != CompilationMode.VLLM_COMPILE
+            ):
                 raise ValueError(
                     "--moe-expert-cache-size without --enforce-eager requires "
-                    "compilation mode VLLM_COMPILE (piecewise CUDA graphs). "
-                    "Pass --enforce-eager or remove -O overrides."
+                    "compilation mode VLLM_COMPILE (piecewise CUDA graphs) or "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH=1. Pass --enforce-eager or "
+                    "remove -O overrides."
                 )
+            # Listed in both modes: the runner keys its capture-stable MoE
+            # output buffer on this membership.
             if cc.splitting_ops is None:
                 cc.splitting_ops = []
             for op in ("vllm::moe_forward", "vllm::moe_forward_shared"):
