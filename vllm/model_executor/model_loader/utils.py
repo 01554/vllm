@@ -173,13 +173,16 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
         return
 
-    cpu_params: set[str] = set()
+    # Parameters moved here, by object: a quant method may replace a parameter
+    # under the same name (e.g. the expert cache repoints scales at its device
+    # slot buffers); such new parameters must not be pulled back to the CPU.
+    cpu_params: dict[str, torch.nn.Parameter] = {}
     uva_offloaded_parameters: list[str] = []
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
-            cpu_params.add(name)
+            cpu_params[name] = p
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
             uva_offloaded_parameters.append(name)
@@ -195,7 +198,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         )
         # Restore the CPU-resident parameters, ignoring new parameters.
         for name, p in module.named_parameters():
-            if name in cpu_params:
+            moved = cpu_params.get(name)
+            if moved is not None and moved is p:
                 p.data = torch.empty_like(
                     p.data, device="cpu", pin_memory=use_pin_memory
                 ).copy_(p.data)
