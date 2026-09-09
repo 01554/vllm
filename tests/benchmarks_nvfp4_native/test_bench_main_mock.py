@@ -146,7 +146,7 @@ class FakeRunner:
 
 
 class BenchMainMockTests(unittest.TestCase):
-    def run_main(self, tmp, corrupt=False, extra=()):
+    def run_main(self, tmp, corrupt=False, extra=(), runner_factory=None):
         bank = make_bank()  # 3 experts, hidden 32, intermediate 16
 
         def fake_load(shard, prefix, num_experts, experts=None):
@@ -157,6 +157,8 @@ class BenchMainMockTests(unittest.TestCase):
             }
 
         def make_runner(name):
+            if runner_factory is not None:
+                return runner_factory(bank)
             return FakeRunner(bank, corrupt_replays=corrupt)
 
         argv = [
@@ -251,13 +253,9 @@ class BenchMainMockTests(unittest.TestCase):
             globals_report = {"source_equivalent": False}
 
         with tempfile.TemporaryDirectory() as tmp:
-            bank = make_bank()
-            with mock.patch.object(
-                bench,
-                "NativeRunner",
-                lambda b, d, gemv_rows=1: NonEquivalentRunner(bank),
-            ):
-                rows, correctness = self.run_main(tmp)
+            rows, correctness = self.run_main(
+                tmp, runner_factory=lambda bank: NonEquivalentRunner(bank)
+            )
             self.assertEqual([r["source_equivalent"] for r in rows], ["NO", "NO"])
             self.assertEqual([r["correct"] for r in rows], ["PASS", "PASS"])
             self.assertTrue(
