@@ -400,7 +400,29 @@ def _compare(got: torch.Tensor, ref: torch.Tensor, atol: float, rtol: float) -> 
         "violations": int((diff > tol).sum()),
         "elements": int(diff.numel()),
         "pass": bool((diff <= tol).all()),
+        # The worst elements, so a handful of violations can be characterised
+        # (near-cancellation vs systematic) without re-running.
+        "top_violations": _top_violations(got, ref, diff, tol),
     }
+
+
+def _top_violations(got, ref, diff, tol, limit: int = 8) -> list[dict]:
+    excess = (diff - tol).reshape(-1)
+    n = min(limit, int((excess > 0).sum()))
+    if n == 0:
+        return []
+    idx = torch.topk(excess, n).indices
+    g, r, d, t = (x.reshape(-1)[idx] for x in (got, ref, diff, tol))
+    return [
+        {
+            "flat_index": int(i),
+            "got": float(gv),
+            "ref": float(rv),
+            "abs_diff": float(dv),
+            "tol": float(tv),
+        }
+        for i, gv, rv, dv, tv in zip(idx.tolist(), g, r, d, t)
+    ]
 
 
 def check_correctness(runner, m, x, ids, w, ref_source, ref_backend, atol, rtol):
@@ -424,6 +446,7 @@ def check_correctness(runner, m, x, ids, w, ref_source, ref_backend, atol, rtol)
         and sticky in (None, 0)
         and bool(torch.isfinite(got).all()),
         "output_sha256": sha256_tensor(out),
+        "_got": got,
     }
 
 
@@ -560,6 +583,11 @@ def main():
     ap.add_argument("--atol", type=float, default=0.0002)
     ap.add_argument("--no-timing", action="store_true", help="correctness stage only")
     ap.add_argument(
+        "--save-outputs",
+        action="store_true",
+        help="save each backend's eager output per shape under outputs/",
+    )
+    ap.add_argument(
         "--device", default="cuda", help="cuda (default); cpu only for the mock test"
     )
     a = ap.parse_args()
@@ -629,6 +657,14 @@ def main():
                     c = check_correctness(
                         runner, m, x, ids, w, ref_source, ref_backend, a.atol, a.rtol
                     )
+                    if a.save_outputs:
+                        (out / "outputs").mkdir(exist_ok=True)
+                        torch.save(
+                            {"got": c.pop("_got"), "ref_source": ref_source},
+                            out / "outputs" / f"{name}_{pattern}_m{m}.pt",
+                        )
+                    else:
+                        c.pop("_got", None)
                     c["inputs_sha256"] = inputs_sha
                     c["pattern"] = pattern
                     c["path"] = runner.path(m) if hasattr(runner, "path") else name
