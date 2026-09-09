@@ -95,17 +95,18 @@ def _sources(name: str, layer: torch.nn.Module) -> dict[str, torch.Tensor]:
         if parameter is None:
             raise RuntimeError(f"{name}.{tensor_name}: missing for the expert pool")
         t = parameter.data
-        if (
-            t.device.type != "cpu"
-            or not t.is_pinned()
-            or not t.is_contiguous()
-            or t.ndim < 1
-            or t.shape[0] != layer.local_num_experts
-        ):
+        if t.ndim < 1 or t.shape[0] != layer.local_num_experts:
             raise RuntimeError(
-                f"{name}.{tensor_name}: the expert pool needs a pinned, "
-                "contiguous host source with one row per expert"
+                f"{name}.{tensor_name}: the expert pool needs one row per expert, "
+                f"got shape {tuple(t.shape)}"
             )
+        if t.device.type != "cpu":
+            # The per-expert global scales are small and are not allocated in
+            # host memory by create_weights, so the loader leaves them on the
+            # device after conversion; take a pinned host copy as the source.
+            t = torch.empty_like(t, device="cpu", pin_memory=True).copy_(t)
+        elif not t.is_pinned() or not t.is_contiguous():
+            t = torch.empty_like(t, device="cpu", pin_memory=True).copy_(t)
         sources[tensor_name] = t
     return sources
 
