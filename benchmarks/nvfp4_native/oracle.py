@@ -49,13 +49,13 @@ def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
     return values.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
 
 
-def dequantize_rows(
-    packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor
-) -> torch.Tensor:
-    """One expert's weight [N, K] in float32 from the raw ModelOpt layout.
+def dequantize_blocks(packed: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
+    """One expert's weight [N, K] in float32 with block scales applied only.
 
-    packed: uint8 [N, K/2]; block_scale: float8_e4m3fn [N, K/16];
-    global_scale: float32/float16 scalar or [N] (per output row).
+    packed: uint8 [N, K/2]; block_scale: float8_e4m3fn [N, K/16]. The global
+    scale is NOT folded in here: the rounding-aware path applies it after
+    the FP32 projection (see expert_forward), which is where the kernels
+    apply it.
     """
     values = unpack_e2m1(packed)
     n, k = values.shape
@@ -64,25 +64,57 @@ def dequantize_rows(
             f"block scale shape {tuple(block_scale.shape)} != {(n, k // 16)}"
         )
     scales = block_scale.to(torch.float32).repeat_interleave(16, dim=-1)
+    return values * scales
+
+
+def dequantize_rows(
+    packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    """Source-semantics reference: fully dequantized float32 weight [N, K].
+
+    Not used by the rounding-aware oracle path (global folded into the
+    weight changes FP32 accumulation rounding); kept for weight inspection.
+    """
     g = global_scale.to(torch.float32)
     if g.dim() == 1:
         g = g[:, None]
-    return values * scales * g
+    return dequantize_blocks(packed, block_scale) * g
 
 
 def expert_forward(
     x: torch.Tensor,
-    w13: torch.Tensor,
-    w2: torch.Tensor,
+    w13_blocks: torch.Tensor,
+    g13: torch.Tensor,
+    w2_blocks: torch.Tensor,
+    g2: torch.Tensor,
     route_weight: float,
 ) -> torch.Tensor:
-    """One route for one token: x [K] bf16 -> [K] bf16 (already router-weighted)."""
-    intermediate = w13.shape[0] // 2
-    gate_up = (x.to(torch.float32) @ w13.t()).to(torch.bfloat16).to(torch.float32)
+    """One route for one token: x [K] bf16 -> [K] bf16 (router-weighted).
+
+    Order: FP32 projection over block-scaled weights, then the global scale
+    (per output row: g13 [2N], g2 [K]), BF16 round of gate/up, FP32 SiLU and
+    multiply, BF16 round, FP32 down projection, global, router weight, BF16.
+    """
+    intermediate = w13_blocks.shape[0] // 2
+    gate_up = (x.to(torch.float32) @ w13_blocks.t()) * g13.to(torch.float32)
+    gate_up = gate_up.to(torch.bfloat16).to(torch.float32)
     gate, up = gate_up[:intermediate], gate_up[intermediate:]
     act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).to(torch.float32)
-    down = (act @ w2.t()) * route_weight
+    down = (act @ w2_blocks.t()) * g2.to(torch.float32) * route_weight
     return down.to(torch.bfloat16)
+
+
+def _row_globals(global_scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Per-output-row global scale [rows] from a scalar, a (gate, up) pair or [rows]."""
+    g = global_scale.to(torch.float32).reshape(-1)
+    if g.numel() == 1:
+        return g.repeat(rows)
+    if g.numel() == 2 and rows % 2 == 0:
+        half = rows // 2
+        return torch.cat((g[0].repeat(half), g[1].repeat(half)))
+    if g.numel() == rows:
+        return g
+    raise ValueError(f"cannot map global scale of size {g.numel()} onto {rows} rows")
 
 
 def moe_forward(
@@ -98,29 +130,24 @@ def moe_forward(
 ) -> torch.Tensor:
     """Dense reference for M tokens; ids of -1 are padding routes.
 
-    w13_scale_2 / w2_scale_2 are per-expert global scales, either scalar per
-    expert ([E] or [E, 1..2]) or per output row ([E, N]); the w13 pair
-    (gate, up) uses columns 0 and 1 when two values are given per expert.
+    Experts are processed one at a time (bounded memory: one dequantized
+    expert at a time plus [M, top_k, K] BF16 route outputs); the per-token
+    sum over routes is taken in route order in FP32 and rounded to BF16.
     """
     m, top_k = topk_ids.shape
-    out = torch.zeros((m, x.shape[1]), dtype=torch.float32)
-    cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    for t in range(m):
-        for r in range(top_k):
-            e = int(topk_ids[t, r])
-            if e < 0:
-                continue
-            if e not in cache:
-                g13 = w13_scale_2[e]
-                if g13.dim() == 1 and g13.numel() == 2:
-                    n_half = w13_packed.shape[1] // 2
-                    g13 = torch.cat((g13[0].repeat(n_half), g13[1].repeat(n_half)))
-                cache[e] = (
-                    dequantize_rows(w13_packed[e], w13_scale[e], g13),
-                    dequantize_rows(w2_packed[e], w2_scale[e], w2_scale_2[e]),
-                )
-            w13, w2 = cache[e]
-            out[t] += expert_forward(x[t], w13, w2, float(topk_weights[t, r])).to(
-                torch.float32
+    k = x.shape[1]
+    route_out = torch.zeros((m, top_k, k), dtype=torch.bfloat16)
+    ids = topk_ids.to(torch.int64)
+    for e in torch.unique(ids[ids >= 0]).tolist():
+        w13_blocks = dequantize_blocks(w13_packed[e], w13_scale[e])
+        g13 = _row_globals(w13_scale_2[e], w13_blocks.shape[0])
+        w2_blocks = dequantize_blocks(w2_packed[e], w2_scale[e])
+        g2 = _row_globals(w2_scale_2[e], w2_blocks.shape[0])
+        for t, r in torch.nonzero(ids == e).tolist():
+            route_out[t, r] = expert_forward(
+                x[t], w13_blocks, g13, w2_blocks, g2, float(topk_weights[t, r])
             )
+    out = torch.zeros((m, k), dtype=torch.float32)
+    for r in range(top_k):
+        out += route_out[:, r].to(torch.float32)
     return out.to(torch.bfloat16)

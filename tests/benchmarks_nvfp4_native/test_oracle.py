@@ -6,7 +6,13 @@ import unittest
 
 import torch
 
-from benchmarks.nvfp4_native.oracle import dequantize_rows, moe_forward, unpack_e2m1
+from benchmarks.nvfp4_native.oracle import (
+    dequantize_blocks,
+    dequantize_rows,
+    expert_forward,
+    moe_forward,
+    unpack_e2m1,
+)
 
 
 class OracleTests(unittest.TestCase):
@@ -39,3 +45,30 @@ class OracleTests(unittest.TestCase):
         self.assertTrue(
             torch.allclose(out.float(), torch.full((1, k), 512.0), rtol=0.02)
         )
+
+    def test_global_scale_is_applied_after_the_fp32_projection(self):
+        # Non-power-of-two, mixed-sign globals: folding them into the weight
+        # before the matmul changes FP32 accumulation; the oracle must not.
+        torch.manual_seed(0)
+        n, k = 32, 64
+        w13 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+        s13 = (torch.rand((n, k // 16)) * 3 + 0.1).to(torch.float8_e4m3fn)
+        w2 = torch.randint(0, 256, (k, n // 2 // 2), dtype=torch.uint8)
+        s2 = (torch.rand((k, (n // 2) // 16)) * 3 + 0.1).to(torch.float8_e4m3fn)
+        g13 = torch.tensor([-0.37, 1.93])
+        g2 = torch.tensor([0.71])
+        x = (torch.randn(k) * 0.3).to(torch.bfloat16)
+        w13_b = dequantize_blocks(w13, s13)
+        w2_b = dequantize_blocks(w2, s2)
+        g13_rows = torch.cat((g13[0].repeat(n // 2), g13[1].repeat(n // 2)))
+        g2_rows = g2.repeat(k)
+        got = expert_forward(x, w13_b, g13_rows, w2_b, g2_rows, 0.5)
+        # Hand-ordered expectation with the same sequence of roundings.
+        gu = ((x.float() @ w13_b.t()) * g13_rows).to(torch.bfloat16).float()
+        a = (
+            (torch.nn.functional.silu(gu[: n // 2]) * gu[n // 2 :])
+            .to(torch.bfloat16)
+            .float()
+        )
+        want = ((a @ w2_b.t()) * g2_rows * 0.5).to(torch.bfloat16)
+        self.assertTrue(torch.equal(got, want))
