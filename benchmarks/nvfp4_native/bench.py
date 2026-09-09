@@ -210,14 +210,107 @@ class ExpertsApplyRunner(NativeRunner):
 
 
 class MarlinRunner:
-    """Marlin NVFP4 MoE on the same bank (repacked); present only if importable."""
+    """Marlin NVFP4 MoE on the same raw bank after the Marlin repack.
+
+    Replicates the normal loader's handling of the w13 global scales
+    (column 0 is kept; gate != up is recorded, not fixed): see
+    `marlin_globals` in the manifest. Uses upstream's
+    prepare_moe_fp4_layer_for_marlin and fused_marlin_moe unchanged.
+    """
 
     name = "marlin"
 
     def __init__(self, bank, device):
-        raise NotImplementedError(
-            "Marlin path pending: needs the Marlin repack + fused_marlin_moe call "
-            "wired for this bank (tracked in the recipe note)."
+        from types import SimpleNamespace
+
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_moe_fp4_layer_for_marlin,
+        )
+        from vllm.scalar_type import scalar_types
+
+        self._fused_marlin_moe = fused_marlin_moe
+        self._quant_type_id = scalar_types.float4_e2m1f.id
+        self.device = device
+        rows, n2, kh = bank["w13_weight"].shape
+        intermediate, hidden = n2 // 2, kh * 2
+        self.rows = rows
+        g13 = bank["w13_weight_scale_2"].to(torch.float32).reshape(rows, -1)
+        if g13.shape[1] == 1:
+            g13 = g13.repeat(1, 2)
+        gate, up = g13[:, 0], g13[:, 1]
+        diff = (gate - up).abs()
+        nonzero = (gate != 0) & (up != 0)
+        self.globals_report = {
+            "experts_with_gate_ne_up": int((diff > 0).sum()),
+            "max_abs_diff": float(diff.max()),
+            "ratio_min": float((up[nonzero] / gate[nonzero]).min())
+            if nonzero.any()
+            else None,
+            "ratio_max": float((up[nonzero] / gate[nonzero]).max())
+            if nonzero.any()
+            else None,
+            "experts_with_a_zero": int((~nonzero).sum()),
+            "conversion": "w13 global = column 0 (gate), as the ModelOpt loader does",
+            "source_equivalent": bool(int((diff > 0).sum()) == 0),
+        }
+        layer = SimpleNamespace(
+            moe_config=SimpleNamespace(
+                num_local_experts=rows,
+                hidden_dim=hidden,
+                intermediate_size_per_partition=intermediate,
+            ),
+            params_dtype=torch.bfloat16,
+            w13_weight=torch.nn.Parameter(
+                bank["w13_weight"].to(device), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                bank["w2_weight"].to(device), requires_grad=False
+            ),
+            w13_weight_scale=torch.nn.Parameter(
+                bank["w13_weight_scale"].to(device), requires_grad=False
+            ),
+            w2_weight_scale=torch.nn.Parameter(
+                bank["w2_weight_scale"].to(device), requires_grad=False
+            ),
+            w13_weight_scale_2=torch.nn.Parameter(
+                gate.contiguous().to(device), requires_grad=False
+            ),
+            w2_weight_scale_2=torch.nn.Parameter(
+                bank["w2_weight_scale_2"].to(torch.float32).reshape(rows).to(device),
+                requires_grad=False,
+            ),
+        )
+        prepare_moe_fp4_layer_for_marlin(layer)
+        self.layer = layer
+        self.error = None
+
+    def path(self, m: int) -> str:
+        return "marlin"
+
+    def prepare(self, m: int):
+        return None
+
+    def __call__(self, x, ids, w):
+        layer = self.layer
+        return self._fused_marlin_moe(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            bias1=None,
+            bias2=None,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=w,
+            topk_ids=ids,
+            quant_type_id=self._quant_type_id,
+            global_num_experts=self.rows,
+            expert_map=None,
+            global_scale1=layer.w13_weight_scale_2,
+            global_scale2=layer.w2_weight_scale_2,
+            workspace=layer.workspace,
         )
 
 
@@ -419,6 +512,9 @@ def main():
             runners[name] = ExpertsApplyRunner(bank, device, gemv_rows=a.gemv_rows)
         elif name == "marlin":
             runners[name] = MarlinRunner(bank, device)
+    if "marlin" in runners:
+        manifest["marlin_globals"] = runners["marlin"].globals_report
+        write_manifest(manifest, out / "manifest.json")
     correctness = {}
     with open(out / "timing.jsonl", "w") as tl, open(out / "summary.csv", "w") as sc:
         sc.write("backend,M,path,median_ms,p10_ms,p90_ms,variance_ms2,correct\n")
