@@ -10,6 +10,33 @@ import torch
 
 from vllm.compilation import breakable_cudagraph as bcg
 from vllm.model_executor.layers.fused_moe.runner import moe_runner
+from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
+    MoERunnerInterface,
+)
+
+
+class _FakeRunner(MoERunnerInterface):
+    """Passes get_layer_from_name's isinstance check; nothing else is used."""
+
+    def __init__(self, tag: str, cached: bool):
+        self.tag = tag
+        self.routed_experts = SimpleNamespace(
+            expert_weight_provider=object() if cached else None
+        )
+
+    def forward(self, *a, **k):  # pragma: no cover - interface stub
+        raise NotImplementedError
+
+    @property
+    def shared_experts(self):  # pragma: no cover - interface stub
+        return None
+
+    @property
+    def _quant_method(self):  # pragma: no cover - interface stub
+        raise NotImplementedError
+
+    def _replace_quant_method(self, quant_method):  # pragma: no cover
+        raise NotImplementedError
 
 
 def _run(monkeypatch, cached: bool):
@@ -68,18 +95,14 @@ def test_legacy_placeholder_consumes_one_layer_per_op(monkeypatch):
 
     class Capture:
         _capturing = True
+        thunks: list = []
 
         def add_eager(self, thunk):
+            Capture.thunks.append(thunk)  # kept, as the real capture does
             return thunk()
 
-    layers = {
-        "a": SimpleNamespace(
-            tag="a", routed_experts=SimpleNamespace(expert_weight_provider=object())
-        ),
-        "b": SimpleNamespace(
-            tag="b", routed_experts=SimpleNamespace(expert_weight_provider=None)
-        ),
-    }
+    Capture.thunks = []
+    layers = {"a": _FakeRunner("a", cached=True), "b": _FakeRunner("b", cached=False)}
     ctx = SimpleNamespace(
         all_moe_layers=["a", "b"], moe_layer_index=0, no_compile_layers=layers
     )
@@ -96,7 +119,13 @@ def test_legacy_placeholder_consumes_one_layer_per_op(monkeypatch):
         x = torch.zeros(2, 4)
         wrapped(x, x, None, None, "from_forward_context", 0)
         wrapped(x, x, None, None, "from_forward_context", 0)
-    assert seen == ["a", "b"]
+        assert seen == ["a", "b"]
+        assert ctx.moe_layer_index == 2
+        # Replay of the recorded (cached) thunk fetches the fixed concrete
+        # name again and does not touch the forward-context index.
+        assert len(Capture.thunks) == 1
+        Capture.thunks[0]()
+    assert seen == ["a", "b", "a"]
     assert ctx.moe_layer_index == 2
 
 
