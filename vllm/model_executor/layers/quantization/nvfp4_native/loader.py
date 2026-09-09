@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Loader side of the native NVFP4 backend (FreeToken GEMV, `native_nvfp4`).
+"""Loader side of the native NVFP4 backend (raw-layout kernels in `bank`).
 
 The Marlin path repacks every expert bank during `process_weights_after_loading`
 and folds the two w13 global scales into one. The native adapter reads the
@@ -8,9 +8,9 @@ checkpoint layout instead: packed uint8 [E, N, K/2], E4M3 block scales
 [E, N, K/16], and one global scale per output row [E, N] (float16). This
 module runs before the Marlin conversion and leaves the raw packed weights
 and block scales untouched, expanding only the global scales (w13: gate rows
-take column 0 and up rows column 1; w2: one value per row). The layout is
-exclusive per process: either every layer is native or every layer is
-Marlin, decided by `VLLM_LAB_EXPERT_TIER_MOE_KERNEL`.
+take column 0 and up rows column 1; w2: one value per row). The backend is
+chosen per model with `moe_backend="native"` (explicit only), so every
+ModelOpt NVFP4 MoE layer of a process takes the same path.
 """
 
 from __future__ import annotations
