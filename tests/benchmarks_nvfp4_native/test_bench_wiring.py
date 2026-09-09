@@ -20,7 +20,7 @@ class BenchWiringTests(unittest.TestCase):
             if p != "self"
         ]
         self.assertEqual(len(params), 15)
-        # The runner passes exactly these, in this order (see bench.py).
+        # The kernel path (KernelRunner) reaches apply() with exactly these.
         self.assertEqual(
             params,
             [

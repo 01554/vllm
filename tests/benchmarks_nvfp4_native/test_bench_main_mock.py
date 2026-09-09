@@ -146,7 +146,9 @@ class FakeRunner:
 
 
 class BenchMainMockTests(unittest.TestCase):
-    def run_main(self, tmp, corrupt=False, extra=(), runner_factory=None):
+    def run_main(
+        self, tmp, corrupt=False, extra=(), runner_factory=None, backends="native"
+    ):
         bank = make_bank()  # 3 experts, hidden 32, intermediate 16
 
         def fake_load(shard, prefix, num_experts, experts=None):
@@ -172,11 +174,16 @@ class BenchMainMockTests(unittest.TestCase):
             "--out",
             tmp,
             "--backends",
-            "native",
+            backends,
             "--sizes",
             "1,3",
             "--device",
             "cpu",
+            *(
+                ()
+                if any(e.startswith("--patterns") for e in extra)
+                else ("--patterns", "uniform")
+            ),
             *extra,
         ]
         with (
@@ -185,6 +192,11 @@ class BenchMainMockTests(unittest.TestCase):
                 bench,
                 "NativeRunner",
                 lambda bank, device, gemv_rows=1: make_runner("native"),
+            ),
+            mock.patch.object(
+                bench,
+                "KernelRunner",
+                lambda bank, device, gemv_rows=1: make_runner("native_kernel"),
             ),
             mock.patch.object(bench, "TOP_K", 4),
             mock.patch.object(bench, "WARMUP", 2),
@@ -207,11 +219,12 @@ class BenchMainMockTests(unittest.TestCase):
         return rows, correctness
 
     @staticmethod
-    def make_inputs(m, hidden, num_experts, seed):
+    def make_inputs(m, hidden, num_experts, seed, pattern="uniform", **_kw):
         g = torch.Generator().manual_seed(seed)
         x = (torch.randn((m, hidden), generator=g) * 0.5).to(torch.bfloat16)
+        pool = torch.arange(num_experts) if pattern == "uniform" else torch.arange(3)
         ids = torch.stack(
-            [torch.randperm(num_experts, generator=g)[:3] for _ in range(m)]
+            [pool[torch.randperm(len(pool), generator=g)[:3]] for _ in range(m)]
         )
         ids = torch.cat((ids, torch.full((m, 1), -1)), dim=1).to(
             torch.int32
@@ -226,7 +239,12 @@ class BenchMainMockTests(unittest.TestCase):
             self.assertEqual([r["source_equivalent"] for r in rows], ["yes", "yes"])
             self.assertTrue(all(r["median_ms"] for r in rows))
             self.assertTrue(all(correctness[k]["pass"] for k in correctness))
-            for f in ("manifest.json", "timing.jsonl", "command.txt", "inputs/m1.pt"):
+            for f in (
+                "manifest.json",
+                "timing.jsonl",
+                "command.txt",
+                "inputs/uniform_m1.pt",
+            ):
                 self.assertTrue((Path(tmp) / f).exists(), f)
             timing = [
                 json.loads(line)
@@ -266,6 +284,65 @@ class BenchMainMockTests(unittest.TestCase):
                 for line in (Path(tmp) / "timing.jsonl").read_text().splitlines()
             ]
             self.assertTrue(all(t["source_equivalent"] is False for t in timing))
+
+    def test_two_patterns_are_reported_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, correctness = self.run_main(
+                tmp, extra=("--patterns", "uniform,working_set")
+            )
+            self.assertEqual(
+                [(r["pattern"], r["M"]) for r in rows],
+                [
+                    ("uniform", "1"),
+                    ("uniform", "3"),
+                    ("working_set", "1"),
+                    ("working_set", "3"),
+                ],
+            )
+            self.assertEqual(
+                sorted(correctness),
+                sorted(
+                    f"native/{p}/M{m}"
+                    for p in ("uniform", "working_set")
+                    for m in (1, 3)
+                ),
+            )
+            self.assertTrue((Path(tmp) / "inputs" / "working_set_m3.pt").exists())
+            timing = [
+                json.loads(line)
+                for line in (Path(tmp) / "timing.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                sorted({t["pattern"] for t in timing}), ["uniform", "working_set"]
+            )
+
+    def test_two_backends_are_timed_with_alternating_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, _ = self.run_main(tmp, backends="native,native_kernel")
+            self.assertEqual(
+                [(r["backend"], r["M"]) for r in rows],
+                [
+                    ("native", "1"),
+                    ("native_kernel", "1"),
+                    ("native", "3"),
+                    ("native_kernel", "3"),
+                ],
+            )
+            timing = [
+                json.loads(line)
+                for line in (Path(tmp) / "timing.jsonl").read_text().splitlines()
+            ]
+            for t in timing:
+                self.assertEqual(
+                    t["interleaved_with"],
+                    [b for b in ("native", "native_kernel") if b != t["backend"]],
+                )
+                orders = t["batch_order"]
+                self.assertEqual(len(orders), 3)  # BATCHES patched to 3
+                self.assertEqual(orders[0], ["native", "native_kernel"])
+                self.assertEqual(orders[1], ["native_kernel", "native"])
+                self.assertEqual(orders[2], ["native", "native_kernel"])
+                self.assertEqual(len(t["samples_ms"]), 3)
 
     def test_no_timing_only_writes_correctness(self):
         with tempfile.TemporaryDirectory() as tmp:
