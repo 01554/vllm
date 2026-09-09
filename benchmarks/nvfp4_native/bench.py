@@ -221,19 +221,30 @@ class MarlinRunner:
         )
 
 
+def backend_row_globals(
+    bank: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The backend loader's transformation of the global scales, replicated
+    in plain torch so the bench needs no vllm import: w13 gate rows take
+    column 0 and up rows column 1 (per-row float16), w2 one value per row."""
+    e, n2, _ = bank["w13_weight"].shape
+    hidden = bank["w2_weight"].shape[1]
+    g13 = bank["w13_weight_scale_2"].to(torch.float32).reshape(e, -1)
+    if g13.shape[1] == 1:
+        g13 = g13.repeat(1, 2)
+    half = n2 // 2
+    w13_rows = torch.cat(
+        (g13[:, :1].repeat(1, half), g13[:, 1:2].repeat(1, half)), dim=1
+    )
+    g2 = bank["w2_weight_scale_2"].to(torch.float32).reshape(e, -1)
+    w2_rows = g2[:, :1].repeat(1, hidden) if g2.shape[1] == 1 else g2
+    return w13_rows.to(torch.float16), w2_rows.to(torch.float16)
+
+
 def _oracle(bank, x, ids, w, f16_globals: bool):
     g13, g2 = bank["w13_weight_scale_2"], bank["w2_weight_scale_2"]
     if f16_globals:
-        # The backend's per-row float16 globals (the loader's transformation).
-        from vllm.model_executor.layers.quantization.nvfp4_native.loader import (
-            expand_w2_globals,
-            expand_w13_globals,
-        )
-
-        intermediate = bank["w13_weight"].shape[1] // 2
-        hidden = bank["w13_weight"].shape[2] * 2
-        g13 = expand_w13_globals(g13, intermediate)
-        g2 = expand_w2_globals(g2, hidden)
+        g13, g2 = backend_row_globals(bank)
     return oracle_forward(
         x,
         ids,
@@ -262,7 +273,7 @@ def _compare(got: torch.Tensor, ref: torch.Tensor, atol: float, rtol: float) -> 
     }
 
 
-def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
+def check_correctness(runner, m, x, ids, w, ref_source, ref_backend, atol, rtol):
     if hasattr(runner, "_m"):
         runner._m = m
     if getattr(runner, "error", None) is not None:
@@ -270,19 +281,17 @@ def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
     out = runner(x.to(runner.device), ids.to(runner.device), w.to(runner.device))
     torch.accelerator.synchronize(runner.device)
     got = out.detach().cpu().float()
-    source = _compare(got, _oracle(bank, x, ids, w, False).float(), atol, rtol)
-    backend_globals = _compare(got, _oracle(bank, x, ids, w, True).float(), atol, rtol)
-    sticky = (
-        int(runner.error.item()) if getattr(runner, "error", None) is not None else None
-    )
+    source = _compare(got, ref_source, atol, rtol)
+    backend_globals = _compare(got, ref_backend, atol, rtol)
+    err = getattr(runner, "error", None)
+    sticky = int(err.item()) if err is not None else None
     return {
-        "eager_output": got,
         "vs_source_f32_globals": source,
         "vs_backend_f16_globals": backend_globals,
         "sticky_error": sticky,
         "non_finite": int((~torch.isfinite(got)).sum()),
         "pass": source["pass"]
-        and (sticky in (None, 0))
+        and sticky in (None, 0)
         and bool(torch.isfinite(got).all()),
         "output_sha256": sha256_tensor(out),
     }
@@ -385,10 +394,13 @@ def main():
     ap.add_argument("--rtol", type=float, default=0.03)
     ap.add_argument("--atol", type=float, default=0.0002)
     ap.add_argument("--no-timing", action="store_true", help="correctness stage only")
+    ap.add_argument(
+        "--device", default="cuda", help="cuda (default); cpu only for the mock test"
+    )
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda")
+    device = torch.device(a.device)
     bank, manifest = load_layer_bank(a.shard, a.prefix, a.num_experts)
     manifest["environment"] = environment()
     manifest["args"] = vars(a)
@@ -418,8 +430,14 @@ def main():
                 "ids": sha256_tensor(ids),
                 "w": sha256_tensor(w),
             }
+            # Source-semantics oracle (pass/fail and the graph-replay reference)
+            # and the backend-globals oracle (second column), once per shape.
+            ref_source = _oracle(bank, x, ids, w, False).float()
+            ref_backend = _oracle(bank, x, ids, w, True).float()
             for name, runner in runners.items():
-                c = check_correctness(runner, bank, m, x, ids, w, a.atol, a.rtol)
+                c = check_correctness(
+                    runner, m, x, ids, w, ref_source, ref_backend, a.atol, a.rtol
+                )
                 c["inputs_sha256"] = inputs_sha
                 c["path"] = runner.path(m) if hasattr(runner, "path") else name
                 correctness[f"{name}/M{m}"] = c
@@ -439,7 +457,7 @@ def main():
                 if a.no_timing:
                     sc.write(f"{name},{m},{c['path']},,,,,PASS\n")
                     continue
-                t = time_graph(runner, m, x, ids, w)
+                t = time_graph(runner, m, x, ids, w, ref_source, a.atol, a.rtol)
                 rec = {
                     "backend": name,
                     "M": m,
@@ -448,8 +466,13 @@ def main():
                     **t,
                 }
                 tl.write(json.dumps(rec) + "\n")
+                if not t["valid"]:
+                    print(f"{name} M={m}: graph replay check FAIL; timing invalidated")
+                    sc.write(f"{name},{m},{c['path']},,,,,REPLAY_FAIL\n")
+                    continue
                 sc.write(
-                    f"{name},{m},{c['path']},{t['median_ms']:.4f},{t['p10_ms']:.4f},{t['p90_ms']:.4f},{t['variance_ms2']:.6f},PASS\n"
+                    f"{name},{m},{c['path']},{t['median_ms']:.4f},{t['p10_ms']:.4f},"
+                    f"{t['p90_ms']:.4f},{t['variance_ms2']:.6f},PASS\n"
                 )
                 print(f"{name} M={m} {c['path']}: median {t['median_ms']:.4f} ms")
     (out / "correctness.json").write_text(json.dumps(correctness, indent=1) + "\n")
