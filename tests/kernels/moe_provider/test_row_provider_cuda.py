@@ -75,28 +75,46 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
     slot0 = int(r1.expert_map[0])
     owner = torch.cuda.current_stream(p.device)
-    # A slow "previous reader" of expert 0's slot on the owner stream, and no
-    # host synchronization before the next prepare: the next copies must be
-    # ordered behind it by the release event alone.
-    big = p.buf_w13[slot0].float().repeat(4096, 1)
-    read0 = big
-    for _ in range(64):
-        read0 = read0 * 1.0 + 0.0
-    read0 = read0.sum() / 4096 + p.buf_w13_scale_2[slot0].sum()
-    ref0 = src["w13"][0].float().sum() + src["w13_scale_2"][0].sum()
-    r2 = p.prepare(
-        torch.tensor([[1, 2]], dtype=torch.int32)
-    )  # evicts 0 -> expert 2 in slot0
+    names = ("w13", "w2", "w13_scale", "w2_scale", "w13_scale_2", "w2_scale_2")
+    bufs = [getattr(p, f"buf_{n}") for n in names]
+    # Pre-allocate outputs and warm the reader so the timed pass allocates
+    # nothing (allocator events would otherwise serialize the streams).
+    acc = torch.zeros((), dtype=torch.float32, device=p.device)
+
+    def slow_read(acc):
+        for _ in range(256):
+            for b in bufs:
+                acc = acc + b[slot0].reshape(-1).view(torch.uint8).float().sum()
+        return acc
+
+    slow_read(acc)
+    torch.accelerator.synchronize(p.device)
+    reader_done = torch.cuda.Event()
+    read0 = slow_read(acc)  # reads all six slot tensors of expert 0
+    reader_done.record(owner)
+    # The next prepare is enqueued while the reader is still running (no
+    # host synchronization in between); the release event must order the
+    # copies behind it.
+    r2 = p.prepare(torch.tensor([[1, 2]], dtype=torch.int32))  # evicts 0 -> expert 2
+    overlapped = not reader_done.query()
     assert p._copy_stream is not None
     assert p._copy_stream.cuda_stream != owner.cuda_stream  # a separate copy stream
     torch.accelerator.synchronize(p.device)
+    assert overlapped, (
+        "reader finished before the copies were enqueued; test is inconclusive"
+    )
     assert int(r2.expert_map[0]) == -1 and int(r2.expert_map[2]) == slot0
     got = slot_bytes(p, slot0)
     want = src_bytes(src, 2)
     for name in want:
         assert torch.equal(got[name], want[name]), name
-    # the read issued before the eviction saw expert 0, not the overwrite
-    assert torch.allclose(read0.cpu(), ref0, rtol=1e-3)
+    ref = torch.zeros((), dtype=torch.float32)
+    for _ in range(256):
+        for n in names:
+            ref = (
+                ref + src[n][0].contiguous().reshape(-1).view(torch.uint8).float().sum()
+            )
+    assert torch.equal(read0.cpu(), ref)  # the reader saw expert 0, never the overwrite
     assert p.stats()["evictions"] == 1 and p.stats()["last_copies"] == 1
 
 
@@ -119,3 +137,19 @@ def test_all_routes_planned_exactly_once_and_other_stream_rejected():
     other = torch.cuda.Stream(p.device)
     with torch.cuda.stream(other), pytest.raises(RuntimeError):
         p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+
+
+def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
+    src = make_source()
+    p = RowCacheWeightProvider(2, src["w13"], src["w2"], device="cuda")
+    r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    slot1 = int(r1.expert_map[1])
+    acc = torch.zeros((), dtype=torch.float32, device=p.device)
+    for _ in range(256):
+        acc = acc + p.buf_w13[slot1].reshape(-1).float().sum()
+    p.invalidate(1)  # frees the slot while the reader may still be running
+    r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
+    torch.accelerator.synchronize(p.device)
+    assert int(r2.expert_map[3]) == slot1
+    assert torch.equal(acc.cpu(), (src["w13"][1].reshape(-1).float().sum() * 256))
+    assert torch.equal(p.buf_w13[slot1].cpu(), src["w13"][3])

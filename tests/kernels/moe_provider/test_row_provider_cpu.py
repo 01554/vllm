@@ -116,3 +116,16 @@ def test_source_is_owned_not_aliased():
     assert torch.equal(
         r.w1[slot], torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
     )
+
+
+def test_last_copies_is_reported_on_cpu_and_invalidate_then_prepare_refills():
+    p, (w13, _) = make_provider(capacity=2)
+    p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    assert p.stats()["last_copies"] == 2
+    p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    assert p.stats()["last_copies"] == 0
+    p.invalidate(1)
+    r = p.prepare(torch.tensor([[1, 3]], dtype=torch.int32))
+    assert p.stats()["last_copies"] == 2  # 1 refilled, 3 new
+    assert torch.equal(r.w1[int(r.expert_map[1])], w13[1])
+    assert torch.equal(r.w1[int(r.expert_map[3])], w13[3])

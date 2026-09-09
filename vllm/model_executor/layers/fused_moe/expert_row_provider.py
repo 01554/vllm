@@ -165,10 +165,12 @@ class RowCacheWeightProvider:
     def invalidate(self, expert_id: int) -> None:
         self._check_owner_stream()
         if self.device.type == "cuda" and self._copy_stream is not None:
-            # Slot release must be ordered after the copies that targeted it
-            # and after the previous reader on the owner stream.
+            # Wait for the copies that may still target this slot. This does
+            # NOT wait for the previous reader on the owner stream: a freed
+            # slot is only rewritten by a later prepare(), which records a new
+            # release event on the owner stream before any copy, so the
+            # previous reader is ordered ahead of the reuse by that contract.
             assert self._ready_event is not None
-            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
             self._copy_stream.synchronize()
         slot = self._lru.pop(expert_id, None)
         if slot is not None:
@@ -283,10 +285,10 @@ class RowCacheWeightProvider:
             # (3) consumer kernels on the owner stream wait for the copies
             self._ready_event.record(self._copy_stream)
             torch.cuda.current_stream(self.device).wait_event(self._ready_event)
-            self._in_flight = copies
         else:
             for e, slot in copies:
                 self._fill_slot(e, slot)
+        self._in_flight = copies
         # Rows not requested in this forward are hidden (-1) for this call.
         forward_map = torch.full_like(self._map, -1)
         for e in unique_ids:
