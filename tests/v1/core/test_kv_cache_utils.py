@@ -3900,6 +3900,155 @@ def test_draft_group_annotated_on_hybrid_general_path():
     assert "draft.attn.0" in flagged[0].layer_names
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_explicit_draft_owner_separates_identical_target_specs(hybrid):
+    """MTP reuses target attention formats but must not drop target blocks."""
+    specs = _hybrid_specs_with_draft(draft=False) if hybrid else {}
+    specs["target.attn.0"] = new_mla_spec(block_size=64)
+    specs["mtp.layers.48.attn"] = new_mla_spec(block_size=64)
+    specs = {
+        name: replace(spec, is_draft_layer=name.startswith("mtp."))
+        for name, spec in specs.items()
+    }
+    groups = get_kv_cache_groups(_spec_decode_grouping_config(method="mtp"), specs)
+
+    assert sorted(n for g in groups for n in g.layer_names) == sorted(specs)
+    for group in groups:
+        assert all(
+            specs[n].is_draft_layer == group.is_eagle_group for n in group.layer_names
+        )
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+            assert set(group.kv_cache_spec.kv_cache_specs) == set(group.layer_names)
+    assert [g.layer_names for g in groups if g.is_eagle_group] == [
+        ["mtp.layers.48.attn"]
+    ]
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        groups, {"target.attn.0": specs["target.attn.0"]}
+    )
+    assert not any(g.is_eagle_group for g in projected)
+
+
+def test_explicit_owner_does_not_change_non_speculative_grouping():
+    config = _spec_decode_grouping_config()
+    config.speculative_config = None
+    spec = new_mla_spec()
+    groups = get_kv_cache_groups(
+        config,
+        {
+            "target": replace(spec, is_draft_layer=False),
+            "draft": replace(spec, is_draft_layer=True),
+        },
+    )
+    assert len(groups) == 1
+    assert not groups[0].is_eagle_group
+
+
+def test_incomplete_explicit_kv_owner_is_rejected():
+    with pytest.raises(ValueError, match="ownership"):
+        get_kv_cache_groups(
+            _spec_decode_grouping_config(),
+            {
+                "target": new_mla_spec(),
+                "draft": replace(new_mla_spec(), is_draft_layer=True),
+            },
+        )
+
+
+def test_kv_owner_disagreement_across_workers_is_rejected():
+    spec = new_mla_spec()
+    with pytest.raises(AssertionError, match="ownership"):
+        get_kv_cache_configs(
+            _spec_decode_grouping_config(),
+            [
+                {"layer": replace(spec, is_draft_layer=False)},
+                {"layer": replace(spec, is_draft_layer=True)},
+            ],
+            [1024, 1024],
+        )
+
+
+def test_explicit_owner_splits_uniform_type_group_and_survives_regrouping():
+    specs = {
+        "target": replace(new_mla_spec(), head_size=128, is_draft_layer=False),
+        "draft": replace(new_mla_spec(), head_size=256, is_draft_layer=True),
+    }
+    config = _spec_decode_grouping_config(method="mtp")
+    groups = get_kv_cache_groups(config, specs)
+    assert [(g.layer_names, g.is_eagle_group) for g in groups] == [
+        (["target"], False),
+        (["draft"], True),
+    ]
+    for group in groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        assert set(group.kv_cache_spec.kv_cache_specs) == set(group.layer_names)
+    assert groups == get_kv_cache_groups(config, specs)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_explicit_owner_allocator_covers_all_layers_and_pp_projection(packed):
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+
+    specs = (
+        _glm5_like_kv_cache_spec()[0]
+        if packed
+        else _hybrid_specs_with_draft(draft=False)
+    )
+    template = "layers.3.attn" if packed else "target.attn.0"
+    specs["mtp.attn"] = specs[template]
+    if packed:
+        specs["mtp.indexer"] = specs["layers.3.indexer"]
+    specs = {
+        name: replace(spec, is_draft_layer=name.startswith("mtp."))
+        for name, spec in specs.items()
+    }
+    config = _spec_decode_grouping_config(method="mtp")
+    config.cache_config = SimpleNamespace(
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
+        num_gpu_blocks_override=None,
+        prefix_cache_retention_interval=1,
+    )
+    config.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    groups = get_kv_cache_groups(config, specs)
+    if packed:
+        # The one-attention-group shortcut must not omit target or draft views.
+        assert kv_cache_utils._glm5_next_tensor_layout(groups) is None
+    for local_specs in (
+        specs,
+        {n: s for n, s in specs.items() if not n.startswith("mtp.")},
+        {n: s for n, s in specs.items() if n.startswith("mtp.")},
+    ):
+        projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+            groups, local_specs
+        )
+        bytes_per_block = kv_cache_utils._pool_bytes_per_block(projected)
+        allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+            config, projected, bytes_per_block * 100 + 1
+        )
+        assert allocated.num_blocks == 100
+        tensors = _tensor_by_layer(allocated)
+        assert set(tensors) == set(local_specs)
+        for group in projected:
+            spans = []
+            for name in group.layer_names:
+                spec = (
+                    group.kv_cache_spec.kv_cache_specs[name]
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else group.kv_cache_spec
+                )
+                tensor = tensors[name]
+                offset = _layer_offset(tensor, name)
+                assert tensor.block_stride == bytes_per_block
+                end = offset + spec.page_size_bytes
+                assert end <= bytes_per_block
+                assert (
+                    offset + 99 * tensor.block_stride + spec.page_size_bytes
+                    <= tensor.size
+                )
+                spans.append((offset, end))
+            spans.sort()
+            assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+
+
 def test_mamba_groups_never_flagged_even_when_draft_shares_a_group():
     # Packed uniform-type groups can contain distinct target and draft layer
     # specs; the combined group still holds volatile draft KV and must be
