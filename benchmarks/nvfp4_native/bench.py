@@ -12,15 +12,19 @@ values are batch-mean per-call latencies (median, p10, p90, variance).
 Usage (GPU host):
   python -m benchmarks.nvfp4_native.bench --shard <model-00001-of-00010.safetensors> \
       --prefix model.language_model.layers.0.mlp --num-experts 512 --out <dir> \
-      [--backends native,native_apply,marlin] [--sizes 1,2,4,8,16,64,256,1024]
+      [--backends native,native_kernel,marlin] [--sizes 1,2,4,8,16,64,256,1024]
+      [--patterns uniform,working_set] [--working-set-size 32]
 
 Backends: "native" calls the kernels with independently allocated
-workspaces (package-level pre-check); "native_apply" goes through
-NativeNvFp4Experts.apply with a caller-provided scratch (the experts
-path without the worker's WorkspaceManager); "marlin" is the reference
-backend. Correctness is reported against the source-semantics oracle
-(float32 globals) and, as a second column, against an oracle that uses the
-backend's float16 per-row globals; the pass verdict uses the source column.
+workspaces (package-level pre-check); "native_kernel" runs
+NativeNvFp4Experts inside the real FusedMoEKernel with the worker's
+WorkspaceManager (the model path; the manager is locked before capture);
+"marlin" is the reference backend. Route patterns (uniform, fixed shared
+working set) are reported separately. Backends of one shape are captured
+together and timed with the order reversed every other batch. Correctness
+is reported against the source-semantics oracle (float32 globals) and, as
+a second column, against an oracle that uses the backend's float16 per-row
+globals; the pass verdict uses the source column.
 """
 
 from __future__ import annotations
@@ -434,7 +438,11 @@ class CapturedCall:
             rtol,
         )
         device = runner.device
-        xd, idd, wd = x.to(device), ids.to(device), w.to(device)
+        # The graph replays read these addresses; keep the tensors alive for
+        # the object's lifetime (the graph pool does not own external inputs,
+        # and several backends are captured per shape).
+        self.inputs = (x.to(device), ids.to(device), w.to(device))
+        xd, idd, wd = self.inputs
         runner.prepare(m)
         stream = torch.cuda.Stream(device)
         # Input copies were enqueued on the current stream; order them first.
