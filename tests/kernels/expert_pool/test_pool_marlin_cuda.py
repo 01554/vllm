@@ -87,7 +87,8 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
     # match them byte for byte.
     for pl in (layer.routed_experts.expert_pool_layer for layer in layers):
         assert all(
-            t.device.type == "cpu" and t.is_pinned() for t in pl.sources.values()
+            t.device.type == "cpu" and t.is_pinned() and t.is_contiguous()
+            for t in pl.sources.values()
         )
     report = verify_bank_rows(pool, model.expert_pool_sources, sample=SLOTS)
     assert report == {"rows_checked": 2 * SLOTS, "rows_resident": 2 * SLOTS}
