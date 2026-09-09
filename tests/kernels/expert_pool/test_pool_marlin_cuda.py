@@ -25,6 +25,7 @@ from tests.kernels.moe.test_nvfp4_expert_cache_consumer import (
 from vllm.model_executor.layers.fused_moe.expert_pool.install import (
     install_expert_pool,
 )
+from vllm.model_executor.layers.fused_moe.expert_pool.pool import verify_bank_rows
 from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
     check_global_tables,
     resident_per_layer,
@@ -73,9 +74,23 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
         pool_cfgs.append(_vllm_config(SLOTS, "pool"))
         refs.append(_make_layer(ref_cfgs[-1], params))
         layers.append(_make_layer(pool_cfgs[-1], params, host_source=True))
+    # As after the real loader: the small per-expert globals stay on the
+    # device (never allocated in host memory), the big tensors are pinned.
+    for layer in layers:
+        for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
+            p = getattr(layer.routed_experts, name)
+            p.data = p.data.to(device)
     model = torch.nn.ModuleDict({"a": layers[0], "b": layers[1]})
     pool = install_expert_pool(model, device, max_decode_tokens=1)
     assert pool is not None
+    # The pool owns pinned host copies of every source; the initial bank rows
+    # match them byte for byte.
+    for pl in (layer.routed_experts.expert_pool_layer for layer in layers):
+        assert all(
+            t.device.type == "cpu" and t.is_pinned() for t in pl.sources.values()
+        )
+    report = verify_bank_rows(pool, model.expert_pool_sources, sample=SLOTS)
+    assert report == {"rows_checked": 2 * SLOTS, "rows_resident": 2 * SLOTS}
     assert pool.rows == 2 * SLOTS + TOP_K and pool.rows > E
     assert resident_per_layer(pool.tables) == [SLOTS, SLOTS]
     pls = [layer.routed_experts.expert_pool_layer for layer in layers]
