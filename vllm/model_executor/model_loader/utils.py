@@ -166,6 +166,23 @@ def process_weights_after_loading(
         set_torchao_reload_attrs(model, model_config)
 
 
+def _move_cpu_params_to_device(
+    module: torch.nn.Module, target_device: torch.device
+) -> tuple[set[str], list[str]]:
+    """Move CPU-resident parameters to the device; return their names and
+    the names of UVA-offloaded parameters."""
+    cpu_params: set[str] = set()
+    uva_offloaded_parameters: list[str] = []
+    for name, p in module.named_parameters():
+        if p.device.type == "cpu":
+            cpu_params.add(name)
+            p.data = p.data.to(target_device)
+        if getattr(p, "_vllm_is_uva_offloaded", False):
+            uva_offloaded_parameters.append(name)
+        # Parameters already on target device are not touched
+    return cpu_params, uva_offloaded_parameters
+
+
 DEVICE_RESIDENT_ATTR = "_vllm_device_resident"
 """Set on a parameter that device_loading_context must not move back to the
 CPU after process_weights_after_loading (expert cache slot buffers)."""
@@ -178,19 +195,12 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
         return
 
-    cpu_params: set[str] = set()
-    uva_offloaded_parameters: list[str] = []
-
-    # Store which parameters are on CPU and move them to the GPU. Only names
-    # are kept: holding the Parameter objects would keep the moved weights
-    # alive after a quant method has replaced and released them.
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            cpu_params.add(name)
-            p.data = p.data.to(target_device)
-        if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
-        # Parameters already on target device are not touched
+    # Only names are kept, and the scan runs in a helper so no local of this
+    # generator frame references a Parameter across the yield: a weight the
+    # quant method replaces and releases must be freeable while processing.
+    cpu_params, uva_offloaded_parameters = _move_cpu_params_to_device(
+        module, target_device
+    )
 
     try:
         yield module
