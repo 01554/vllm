@@ -389,12 +389,28 @@ class RoutedExperts(PluggableLayer):
         # reference to the CPU pinned backing store).
         replace_parameter(self, "w13_weight", torch.empty(0))
         replace_parameter(self, "w2_weight", torch.empty(0))
+        bufs = [
+            provider.buf_w13,
+            provider.buf_w2,
+            provider.buf_w13_scale,
+            provider.buf_w2_scale,
+            provider.buf_w13_scale_2,
+            provider.buf_w2_scale_2,
+        ]
+        slot_bytes = sum(t.numel() * t.element_size() for t in bufs if t is not None)
         logger.info(
-            "Expert LRU cache enabled for %s: %d/%d experts cached on GPU (%s).",
+            "Expert LRU cache enabled for %s: %d/%d experts cached on GPU (%s), "
+            "slot buffers %.1f MiB, host source %.1f MiB (w13+w2 weights).",
             self.layer_name,
             capacity,
             self.local_num_experts,
             type(provider).__name__,
+            slot_bytes / 2**20,
+            (
+                w13_weight.numel() * w13_weight.element_size()
+                + w2_weight.numel() * w2_weight.element_size()
+            )
+            / 2**20,
         )
 
     # TODO(bnell): Temporary hack. Get rid of this.
