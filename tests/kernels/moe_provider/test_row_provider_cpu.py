@@ -95,3 +95,17 @@ def test_explicit_ids_are_validated_before_any_mutation():
             pass
     assert p.stats() == before
     assert sorted(int(e) for e in torch.nonzero(p.expert_map >= 0).flatten()) == [0, 1]
+
+
+def test_source_is_owned_not_aliased():
+    experts = 4
+    w13 = torch.arange(experts * 8, dtype=torch.float32).reshape(experts, 4, 2)
+    w2 = torch.zeros((experts, 2, 4))
+    p = RowCacheWeightProvider(2, w13, w2, device="cpu")
+    w13[1].fill_(-9.0)  # caller mutates its tensor after construction
+    r = p.prepare(torch.tensor([[1, 2]], dtype=torch.int32))
+    slot = int(r.expert_map[1])
+    assert float(r.w1[slot].max()) != -9.0
+    assert torch.equal(
+        r.w1[slot], torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
+    )

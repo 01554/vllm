@@ -7,9 +7,10 @@ Skeleton (first head): the same public surface as CachedWeightProvider
 `capacity`, `split`, `hits`, `misses`) plus per-expert global scales for
 NVFP4 (`buf_w13_scale_2`, `buf_w2_scale_2`), an owner-stream contract, and
 counters. Internals in this head: pinned host source, device slot buffers,
-LRU placement, synchronous copies. Later heads replace the copy path with
-staged copies on a provider-owned stream, victim protection for rows used
-in the current forward, and publication at forward boundaries, keeping
+LRU placement, and row copies enqueued non-blocking on the owner compute
+stream (readiness is stream-ordered). Later heads move the copies to a
+provider-owned copy stream with events, keep victim protection for rows
+used in the current forward, and publish at forward boundaries, keeping
 this surface.
 """
 
@@ -56,8 +57,10 @@ class RowCacheWeightProvider:
         elif w13_weight.device.type != "cpu":
             cache_device = w13_weight.device
         else:
-            # CPU-resident source weights: the cache lives on the current
-            # accelerator; tests pass device="cpu" explicitly.
+            # CPU-resident source weights and no device given: fall back to
+            # the current accelerator. Production passes the consumer's device
+            # (an accelerator being compiled in does not prove a usable
+            # driver); tests pass device="cpu".
             cache_device = torch.accelerator.current_accelerator() or torch.device(
                 "cpu"
             )
@@ -65,13 +68,13 @@ class RowCacheWeightProvider:
         self._owner_stream: int | None = None
 
         def host(t: torch.Tensor | None) -> torch.Tensor | None:
+            # The provider owns its source: a clone, never an alias of the
+            # caller's tensor (pinned when the cache is on CUDA).
             if t is None:
                 return None
-            return (
-                _pinned_cpu_copy(t)
-                if cache_device.type == "cuda"
-                else t.detach().cpu().contiguous()
-            )
+            if cache_device.type == "cuda":
+                return _pinned_cpu_copy(t)
+            return t.detach().cpu().clone().contiguous()
 
         self._cpu = {
             "w13": host(w13_weight),
@@ -141,6 +144,7 @@ class RowCacheWeightProvider:
         }
 
     def invalidate(self, expert_id: int) -> None:
+        self._check_owner_stream()
         slot = self._lru.pop(expert_id, None)
         if slot is not None:
             self._free.append(slot)
