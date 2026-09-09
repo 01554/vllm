@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -50,7 +50,16 @@ class AttentionCGSupportInfo:
         return self
 
 
-def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+def get_kv_cache_spec(
+    vllm_config: VllmConfig, draft_layer_names: set[str] | None = None
+) -> dict[str, KVCacheSpec]:
+    if draft_layer_names is None and (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.use_eagle()
+    ):
+        # Only the final PP rank loads the speculator. Other ranks still
+        # explicitly identify all of their registered layers as target-owned.
+        draft_layer_names = set()
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
@@ -62,6 +71,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
                 spec = attn_module.get_attn_backend().customize_spec(spec)
+            if draft_layer_names is not None:
+                spec = replace(spec, is_draft_layer=layer_name in draft_layer_names)
             kv_cache_spec[layer_name] = spec
     return kv_cache_spec
 

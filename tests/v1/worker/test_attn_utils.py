@@ -7,6 +7,9 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -24,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.attn_utils import (
     get_attn_cg_support,
+    get_kv_cache_spec,
     get_query_lens_mismatch_unsupported_backend,
 )
 from vllm.v1.worker.utils import (
@@ -31,6 +35,32 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
 )
+
+
+def test_kv_specs_keep_registered_draft_ownership_after_backend_customization(
+    monkeypatch,
+):
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    backend = SimpleNamespace(customize_spec=lambda s: replace(s, block_size=32))
+    layer = SimpleNamespace(
+        get_kv_cache_spec=lambda config: spec,
+        get_attn_backend=lambda: backend,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.attn_utils.get_layers_from_vllm_config",
+        lambda *args: {"target": layer, "draft": layer},
+    )
+    config = SimpleNamespace(speculative_config=None)
+    specs = get_kv_cache_spec(config, {"draft"})
+    assert specs["target"].is_draft_layer is False
+    assert specs["draft"].is_draft_layer is True
+    assert all(s.block_size == 32 for s in specs.values())
+    assert all(s.is_draft_layer is None for s in get_kv_cache_spec(config).values())
+    # A non-final PP worker has no local speculator but must not emit None.
+    config.speculative_config = SimpleNamespace(use_eagle=lambda: True)
+    assert all(s.is_draft_layer is False for s in get_kv_cache_spec(config).values())
 
 
 class _FakeMetadataBuilder:
