@@ -77,6 +77,38 @@ class GlobalPool:
         return read_control(self.tables)
 
 
+def verify_bank_rows(pool, sources, sample: int = 4) -> dict[str, int]:
+    """Compare up to `sample` resident rows per layer against the host
+    source, byte for byte (host readback; only at safe boundaries).
+
+    `sources[layer]` holds that layer's six host tensors. Returns the
+    counts checked/mismatched; raises on the first mismatch."""
+    import torch
+
+    tables = pool.tables
+    E = tables.num_experts
+    row_key = tables.row_key.tolist()
+    checked = 0
+    per_layer = [0] * tables.num_layers
+    for row, key in enumerate(row_key):
+        if key < 0:
+            continue
+        layer, expert = divmod(key, E)
+        if per_layer[layer] >= sample:
+            continue
+        per_layer[layer] += 1
+        for name in TENSORS:
+            got = pool.bank[name][row].detach().cpu().contiguous().view(torch.uint8)
+            want = sources[layer][name][expert].contiguous().view(torch.uint8)
+            if not torch.equal(got.reshape(-1), want.reshape(-1)):
+                raise AssertionError(
+                    f"bank row {row} ({name}) differs from layer {layer} "
+                    f"expert {expert}"
+                )
+        checked += 1
+    return {"rows_checked": checked, "rows_resident": sum(1 for k in row_key if k >= 0)}
+
+
 def copy_in(source, bank, buffers):
     """Copy the planned host rows of this layer into the bank rows."""
     copy_rows(

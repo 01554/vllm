@@ -272,3 +272,21 @@ class GlobalPoolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyBankRowsTests(unittest.TestCase):
+    def test_sampled_rows_match_and_a_corruption_is_caught(self):
+        device = torch.device("cpu")
+        sources = make_sources(2, 6)
+        pool = pool_mod.GlobalPool(device, sources[0], [2, 2], 2)
+        for layer, count in enumerate((2, 2)):
+            start = pool.offset(layer)
+            for name in gp.TENSORS:
+                pool.bank[name][start : start + count].copy_(
+                    sources[layer][name][:count]
+                )
+        report = pool_mod.verify_bank_rows(pool, sources, sample=1)
+        self.assertEqual(report, {"rows_checked": 2, "rows_resident": 4})
+        pool.bank["w2_weight"][0, 0] += 1
+        with self.assertRaises(AssertionError):
+            pool_mod.verify_bank_rows(pool, sources, sample=4)

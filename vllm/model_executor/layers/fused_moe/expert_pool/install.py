@@ -191,18 +191,21 @@ def install_expert_pool(
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
         layer.expert_pool_pending = False
-    # Placement policy: promotions on every forward, first miss promotes,
-    # no protection window, gate open (the lab run's values).
+    # Placement policy (the lab run's values): promotions on every forward,
+    # first miss promotes, no protection window. The gate stays closed
+    # through profiling and graph capture (dummy routing must not move the
+    # placement) and is opened by open_pool_gate() at the end of warm-up.
     set_control(
         pool.tables,
         promote_limit=0,
         promote_interval=1,
         promote_min_misses=1,
         protect_recent=0,
-        gate=1,
+        gate=0,
     )
     torch.accelerator.synchronize(device)
     model.expert_pool = pool
+    model.expert_pool_sources = sources
     logger.info(
         "Expert pool installed: %d layers, %d/%d rows per layer resident, "
         "%d staging rows (%d decode tokens x top_k %d; wider batches take the "
@@ -217,3 +220,39 @@ def install_expert_pool(
         type(layers[0][1].quant_method).__name__,
     )
     return pool
+
+
+def open_pool_gate(model: torch.nn.Module, sample_rows: int = 4) -> None:
+    """End of warm-up/capture: verify the tables and a sample of bank rows
+    against the host source, log the placement, then open the gate.
+
+    Host readback happens here only, never inside a forward. The gate is a
+    device scalar at a fixed address, so captured graphs see the change."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.pool import (
+        verify_bank_rows,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
+        check_global_tables,
+        resident_per_layer,
+        set_gate,
+    )
+
+    pool = getattr(model, "expert_pool", None)
+    if pool is None:
+        return
+    device = pool.tables.hot_phys.device
+    torch.accelerator.synchronize(device)
+    check_global_tables(pool.tables)
+    report = verify_bank_rows(pool, model.expert_pool_sources, sample_rows)
+    resident = resident_per_layer(pool.tables)
+    set_gate(pool.tables, True)
+    torch.accelerator.synchronize(device)
+    logger.info(
+        "Expert pool gate opened after warm-up: tables consistent, %d sampled "
+        "bank rows match the host source (%d resident), resident per layer "
+        "min/max %d/%d",
+        report["rows_checked"],
+        report["rows_resident"],
+        min(resident),
+        max(resident),
+    )
