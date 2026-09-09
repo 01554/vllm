@@ -8,6 +8,12 @@ previous forward's output (read from the old slot contents before the
 eviction) must match its reference so a premature overwrite is caught,
 every valid route is planned exactly once, and prepare() from another
 stream is rejected.
+
+The reader is a pre-captured CUDA graph (a finite GPU delay followed by a
+read of the real slot tensors) replayed on the owner stream, so it is still
+running when the next prepare()/invalidate() is enqueued from the host. The
+graph is only a test fixture; it is not evidence of graph support in the
+provider.
 """
 
 import pytest
@@ -60,6 +66,58 @@ def src_bytes(src, expert):
     }
 
 
+DELAY_N = 4096
+DELAY_MATMULS = 8
+REPLAYS = 20
+
+
+class GraphReader:
+    """Captured graph: GPU delay, then sum the bytes of the given slot tensors.
+
+    All buffers and the graph are prepared before the measured region; replay()
+    enqueues on the current (owner) stream and the accumulator holds the sum
+    seen by the last replay.
+    """
+
+    def __init__(self, tensors, device):
+        self.acc = torch.zeros((), dtype=torch.float32, device=device)
+        self.a = torch.full((DELAY_N, DELAY_N), 1e-3, device=device)
+        self.b = torch.empty_like(self.a)
+        self.tensors = tensors
+
+        def body():
+            for _ in range(DELAY_MATMULS // 2):
+                torch.matmul(self.a, self.a, out=self.b)
+                torch.matmul(self.b, self.b, out=self.a)
+            self.acc.zero_()
+            for t in self.tensors:
+                self.acc.add_(t.reshape(-1).view(torch.uint8).float().sum())
+
+        side = torch.cuda.Stream(device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                body()
+        torch.cuda.current_stream(device).wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=side):
+            body()
+        torch.accelerator.synchronize(device)
+        self.a.fill_(1e-3)
+
+    def replay(self, n=REPLAYS):
+        for _ in range(n):
+            self.graph.replay()
+        return self.acc
+
+
+def ref_sum(tensors):
+    ref = torch.zeros((), dtype=torch.float32)
+    for t in tensors:
+        ref = ref + t.contiguous().reshape(-1).view(torch.uint8).float().sum()
+    return ref
+
+
 def test_eviction_reuse_bytes_and_previous_reader_output():
     src = make_source()
     p = RowCacheWeightProvider(
@@ -76,22 +134,9 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     slot0 = int(r1.expert_map[0])
     owner = torch.cuda.current_stream(p.device)
     names = ("w13", "w2", "w13_scale", "w2_scale", "w13_scale_2", "w2_scale_2")
-    bufs = [getattr(p, f"buf_{n}") for n in names]
-    # Warm the reader first so the caching allocator can reuse blocks in the
-    # timed pass (it may still allocate; the overlap check below verifies the
-    # reader was genuinely unfinished when the copies were enqueued).
-    acc = torch.zeros((), dtype=torch.float32, device=p.device)
-
-    def slow_read(acc):
-        for _ in range(256):
-            for b in bufs:
-                acc = acc + b[slot0].reshape(-1).view(torch.uint8).float().sum()
-        return acc
-
-    slow_read(acc)
-    torch.accelerator.synchronize(p.device)
+    reader = GraphReader([getattr(p, f"buf_{n}")[slot0] for n in names], p.device)
     reader_done = torch.cuda.Event()
-    read0 = slow_read(acc)  # reads all six slot tensors of expert 0
+    read0 = reader.replay()  # reads all six slot tensors of expert 0
     reader_done.record(owner)
     # The next prepare is enqueued while the reader is still running (no
     # host synchronization in between); the release event must order the
@@ -109,12 +154,7 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     want = src_bytes(src, 2)
     for name in want:
         assert torch.equal(got[name], want[name]), name
-    ref = torch.zeros((), dtype=torch.float32)
-    for _ in range(256):
-        for n in names:
-            ref = (
-                ref + src[n][0].contiguous().reshape(-1).view(torch.uint8).float().sum()
-            )
+    ref = ref_sum([src[n][0] for n in names])
     assert torch.equal(read0.cpu(), ref)  # the reader saw expert 0, never the overwrite
     assert p.stats()["evictions"] == 1 and p.stats()["last_copies"] == 1
 
@@ -146,17 +186,9 @@ def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
     r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
     slot1 = int(r1.expert_map[1])
     owner = torch.cuda.current_stream(p.device)
-    acc = torch.zeros((), dtype=torch.float32, device=p.device)
-
-    def slow_read(acc):
-        for _ in range(256):
-            acc = acc + p.buf_w13[slot1].reshape(-1).float().sum()
-        return acc
-
-    slow_read(acc)  # warmup
-    torch.accelerator.synchronize(p.device)
+    reader = GraphReader([p.buf_w13[slot1]], p.device)
     reader_done = torch.cuda.Event()
-    read1 = slow_read(acc)
+    read1 = reader.replay()
     reader_done.record(owner)
     p.invalidate(1)  # frees the slot; may not wait for the reader
     r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
@@ -166,5 +198,5 @@ def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
         "reader finished before the reuse was enqueued; test is inconclusive"
     )
     assert int(r2.expert_map[3]) == slot1
-    assert torch.equal(read1.cpu(), src["w13"][1].reshape(-1).float().sum() * 256)
+    assert torch.equal(read1.cpu(), ref_sum([src["w13"][1]]))
     assert torch.equal(p.buf_w13[slot1].cpu(), src["w13"][3])
