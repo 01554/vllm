@@ -7,7 +7,8 @@ six tensors of the new expert byte-exactly (different global scales), the
 previous forward's output (read from the old slot contents before the
 eviction) must match its reference so a premature overwrite is caught,
 every valid route is planned exactly once, and prepare() from another
-stream is rejected.
+stream takes ownership while the previous stream's reader is still ordered
+ahead of the copies.
 
 The reader is a pre-captured CUDA graph (a finite GPU delay followed by a
 read of the real slot tensors) replayed on the owner stream, so it is still
@@ -175,7 +176,7 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     assert p.stats()["evictions"] == 1 and p.stats()["last_copies"] == 1
 
 
-def test_all_routes_planned_exactly_once_and_other_stream_rejected():
+def test_all_routes_planned_exactly_once_and_other_stream_takes_ownership():
     src = make_source()
     p = RowCacheWeightProvider(2, src["w13"], src["w2"], device="cuda")
     ids = torch.tensor([[0, 1], [1, 2], [3, -1], [4, 5]], dtype=torch.int32)
@@ -192,8 +193,58 @@ def test_all_routes_planned_exactly_once_and_other_stream_rejected():
         (t, int(e)) for t in range(ids.shape[0]) for e in ids[t].tolist() if e >= 0
     )
     other = torch.cuda.Stream(p.device)
-    with torch.cuda.stream(other), pytest.raises(RuntimeError):
-        p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    with torch.cuda.stream(other):
+        r = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    torch.accelerator.synchronize(p.device)
+    assert int(r.expert_map[0]) >= 0 and int(r.expert_map[1]) >= 0
+    assert p.stats()["owner_changes"] == 1
+    assert p._owner_stream is not None
+    assert p._owner_stream.cuda_stream == other.cuda_stream
+
+
+def test_owner_change_orders_copies_behind_the_previous_stream_reader():
+    """A reader still running on the previous owner stream (profile run,
+    capture stream, replay stream) must finish before a prepare() issued
+    from another stream rewrites its slot."""
+    src = make_source()
+    p = RowCacheWeightProvider(
+        2,
+        src["w13"],
+        src["w2"],
+        src["w13_scale"],
+        src["w2_scale"],
+        w13_scale_2=src["w13_scale_2"],
+        w2_scale_2=src["w2_scale_2"],
+        device="cuda",
+    )
+    first = torch.cuda.Stream(p.device)
+    with torch.cuda.stream(first):
+        r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    torch.accelerator.synchronize(p.device)
+    slot0 = int(r1.expert_map[0])
+    names = ("w13", "w2", "w13_scale", "w2_scale", "w13_scale_2", "w2_scale_2")
+    ref = ref_sum([src[n][0] for n in names])
+    assert not torch.equal(ref, ref_sum([src[n][2] for n in names]))
+    reader = GraphReader([getattr(p, f"buf_{n}")[slot0] for n in names], p.device)
+    reader_done = torch.cuda.Event()
+    with torch.cuda.stream(first):  # the reader runs on the previous owner
+        read0 = reader.replay()
+        reader_done.record(first)
+    second = torch.cuda.Stream(p.device)
+    with torch.cuda.stream(second):  # evicts 0 -> expert 2 from another stream
+        t0 = time.perf_counter()
+        r2 = p.prepare(torch.tensor([[1, 2]], dtype=torch.int32))
+        host_ms = (time.perf_counter() - t0) * 1e3
+    overlapped = not reader_done.query()
+    torch.accelerator.synchronize(p.device)
+    assert overlapped, inconclusive(host_ms, reader)
+    assert p.stats()["owner_changes"] == 1
+    assert int(r2.expert_map[2]) == slot0
+    got = slot_bytes(p, slot0)
+    want = src_bytes(src, 2)
+    for name in want:
+        assert torch.equal(got[name], want[name]), name
+    assert torch.equal(read0.cpu(), ref)  # the reader saw expert 0, never the overwrite
 
 
 def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
