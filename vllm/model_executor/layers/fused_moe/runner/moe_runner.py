@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -68,9 +69,12 @@ def register_layer_for_moe_forward_op(
     compilation_config.static_all_moe_layers.append(prefix)
 
 
-def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
-    forward_context: ForwardContext = get_forward_context()
+def resolve_concrete_layer_name(layer_name: str) -> str:
+    """Turn the legacy "from_forward_context" placeholder into the concrete
+    layer name, consuming one entry of the forward context's MoE layer
+    sequence. Stateful: call exactly once per MoE op invocation."""
     if not _USE_LAYERNAME and layer_name == "from_forward_context":
+        forward_context: ForwardContext = get_forward_context()
         all_moe_layers = forward_context.all_moe_layers
         assert all_moe_layers is not None
         moe_layer_index = forward_context.moe_layer_index
@@ -82,7 +86,12 @@ def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
             )
         layer_name = all_moe_layers[moe_layer_index]
         forward_context.moe_layer_index += 1
-    layer = forward_context.no_compile_layers[layer_name]
+    return layer_name
+
+
+def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[resolve_concrete_layer_name(layer_name)]
     assert isinstance(layer, MoERunnerInterface)
     return layer
 
@@ -198,11 +207,52 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _eager_break_when_cached(fn):
+    """Make the MoE op a breakable-CUDA-graph break point for cached layers.
+
+    With an expert cache, prepare() is host code that must run eagerly
+    between graph segments. Under torch.compile that is a splitting op;
+    under breakable CUDA graphs the op is intercepted here instead, only for
+    layers that hold a provider, so uncached MoE layers stay inside the
+    segments. The output lands in the runner's capture-stable buffer
+    (_maybe_stabilize_output), satisfying the break point's in-place output
+    contract. Identity when breakable graphs are disabled.
+    """
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    breaking = eager_break_during_capture(fn)
+    if breaking is fn:
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(
+        hidden_states, router_logits, shared_experts_input, input_ids, layer_name, *rest
+    ):
+        # The legacy placeholder lookup is stateful (one forward-context
+        # entry per MoE op): resolve it exactly once here and hand the
+        # concrete name to the op, whose own lookup is then a plain fetch.
+        name = resolve_concrete_layer_name(_resolve_layer_name(layer_name))
+        layer = get_layer_from_name(name)
+        target = (
+            breaking if layer.routed_experts.expert_weight_provider is not None else fn
+        )
+        return target(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            name,
+            *rest,
+        )
+
+    return wrapper
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
     op_name="moe_forward",
-    op_func=_moe_forward,
+    op_func=_eager_break_when_cached(_moe_forward),
     mutates_args=["hidden_states"],
     fake_impl=_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
@@ -211,7 +261,7 @@ direct_register_custom_op(
 
 direct_register_custom_op(
     op_name="moe_forward_shared",
-    op_func=_moe_forward_shared,
+    op_func=_eager_break_when_cached(_moe_forward_shared),
     fake_impl=_moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )

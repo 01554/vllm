@@ -166,17 +166,13 @@ def process_weights_after_loading(
         set_torchao_reload_attrs(model, model_config)
 
 
-@contextmanager
-def device_loading_context(module: torch.nn.Module, target_device: torch.device):
-    if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
-        yield module
-        return
-
+def _move_cpu_params_to_device(
+    module: torch.nn.Module, target_device: torch.device
+) -> tuple[set[str], list[str]]:
+    """Move CPU-resident parameters to the device; return their names and
+    the names of UVA-offloaded parameters."""
     cpu_params: set[str] = set()
     uva_offloaded_parameters: list[str] = []
-
-    # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
             cpu_params.add(name)
@@ -184,6 +180,27 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
             uva_offloaded_parameters.append(name)
         # Parameters already on target device are not touched
+    return cpu_params, uva_offloaded_parameters
+
+
+DEVICE_RESIDENT_ATTR = "_vllm_device_resident"
+"""Set on a parameter that device_loading_context must not move back to the
+CPU after process_weights_after_loading (expert cache slot buffers)."""
+
+
+@contextmanager
+def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    if target_device.type == "cpu":
+        # If target is CPU, no need to move anything
+        yield module
+        return
+
+    # Only names are kept, and the scan runs in a helper so no local of this
+    # generator frame references a Parameter across the yield: a weight the
+    # quant method replaces and releases must be freeable while processing.
+    cpu_params, uva_offloaded_parameters = _move_cpu_params_to_device(
+        module, target_device
+    )
 
     try:
         yield module
@@ -193,9 +210,13 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             is_pin_memory_available()
             and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
         )
-        # Restore the CPU-resident parameters, ignoring new parameters.
+        # Restore the CPU-resident parameters by name (a replacement under
+        # the same name is restored too, as before), except parameters a
+        # quant method has explicitly marked device-resident: the expert
+        # cache repoints per-expert scales at its device slot buffers and
+        # the kernel is built from those.
         for name, p in module.named_parameters():
-            if name in cpu_params:
+            if name in cpu_params and not getattr(p, DEVICE_RESIDENT_ATTR, False):
                 p.data = torch.empty_like(
                     p.data, device="cpu", pin_memory=use_pin_memory
                 ).copy_(p.data)

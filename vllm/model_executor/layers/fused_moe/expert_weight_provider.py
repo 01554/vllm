@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 
@@ -61,6 +61,20 @@ class ExpertWeightResult:
     w2_scale: torch.Tensor | None = None
 
 
+class ExpertWeightProvider(Protocol):
+    """What run_with_expert_cache() and the consumers need from a provider."""
+
+    split: MoECacheSplit
+
+    def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]: ...
+
+    def plan_expert_groups(self, topk_ids: torch.Tensor) -> list[list[int]]: ...
+
+    def prepare(
+        self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
+    ) -> ExpertWeightResult: ...
+
+
 class CachedWeightProvider:
     """GPU LRU cache backed by CPU pinned memory.
 
@@ -88,8 +102,22 @@ class CachedWeightProvider:
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
         split: MoECacheSplit = "token",
+        *,
+        w13_scale_2: torch.Tensor | None = None,
+        w2_scale_2: torch.Tensor | None = None,
     ) -> None:
         num_experts = w13_weight.size(0)
+        if (w13_scale_2 is None) != (w2_scale_2 is None):
+            raise ValueError(
+                "CachedWeightProvider: w13_scale_2 and w2_scale_2 must be given "
+                "together"
+            )
+        for name, t in (("w13_scale_2", w13_scale_2), ("w2_scale_2", w2_scale_2)):
+            if t is not None and (t.dim() == 0 or t.size(0) != num_experts):
+                raise ValueError(
+                    f"CachedWeightProvider: {name} must have {num_experts} rows "
+                    f"(one per expert), got shape {tuple(t.shape)}"
+                )
 
         self.capacity = capacity
         self.split: MoECacheSplit = split
@@ -141,6 +169,30 @@ class CachedWeightProvider:
             self._buf_w13_scale = None
             self._buf_w2_scale = None
 
+        # Per-expert second-level (global) scales, e.g. NVFP4. Slot buffers
+        # only; the kernel reads them from the layer parameters the slot
+        # buffers replace, so they are not part of ExpertWeightResult.
+        if w13_scale_2 is not None and w2_scale_2 is not None:
+            self._cpu_w13_scale_2: torch.Tensor | None = _pinned_cpu_copy(w13_scale_2)
+            self._cpu_w2_scale_2: torch.Tensor | None = _pinned_cpu_copy(w2_scale_2)
+            self._buf_w13_scale_2: torch.Tensor | None = torch.empty(
+                capacity,
+                *w13_scale_2.shape[1:],
+                dtype=w13_scale_2.dtype,
+                device=cuda_device,
+            )
+            self._buf_w2_scale_2: torch.Tensor | None = torch.empty(
+                capacity,
+                *w2_scale_2.shape[1:],
+                dtype=w2_scale_2.dtype,
+                device=cuda_device,
+            )
+        else:
+            self._cpu_w13_scale_2 = None
+            self._cpu_w2_scale_2 = None
+            self._buf_w13_scale_2 = None
+            self._buf_w2_scale_2 = None
+
         # LFRU state: {expert_id: [slot, freq, last_access_clock]}
         # Eviction score = freq / (clock - last_access + 1). Lower = evict first.
         self._lru: dict[int, list] = {}
@@ -176,6 +228,14 @@ class CachedWeightProvider:
     @property
     def buf_w2_scale(self) -> torch.Tensor | None:
         return self._buf_w2_scale
+
+    @property
+    def buf_w13_scale_2(self) -> torch.Tensor | None:
+        return self._buf_w13_scale_2
+
+    @property
+    def buf_w2_scale_2(self) -> torch.Tensor | None:
+        return self._buf_w2_scale_2
 
     def invalidate(self, expert_id: int) -> None:
         """Remove *expert_id* from the cache, returning its slot to the free
@@ -353,6 +413,16 @@ class CachedWeightProvider:
                     self._buf_w2_scale[slot].copy_(
                         self._cpu_w2_scale[expert_id], non_blocking=True
                     )
+                if self._buf_w13_scale_2 is not None:
+                    assert self._cpu_w13_scale_2 is not None
+                    assert self._cpu_w2_scale_2 is not None
+                    assert self._buf_w2_scale_2 is not None
+                    self._buf_w13_scale_2[slot].copy_(
+                        self._cpu_w13_scale_2[expert_id], non_blocking=True
+                    )
+                    self._buf_w2_scale_2[slot].copy_(
+                        self._cpu_w2_scale_2[expert_id], non_blocking=True
+                    )
 
                 self._clock += 1
                 self._lru[expert_id] = [slot, 1, self._clock]
@@ -387,7 +457,7 @@ class CachedWeightProvider:
 
 
 def run_with_expert_cache(
-    provider: CachedWeightProvider,
+    provider: ExpertWeightProvider,
     topk_ids: torch.Tensor,
     run: Callable[[ExpertWeightResult, slice, bool], torch.Tensor],
 ) -> torch.Tensor:

@@ -11,6 +11,7 @@ from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch"]
 MoECacheSplit = Literal["token", "expert"]
+MoECacheProvider = Literal["cached", "row"]
 
 
 @config
@@ -108,6 +109,12 @@ class OffloadConfig:
       each expert at most once per forward, but each part is rounded to the
       model dtype before being summed, so results differ from the uncached
       path at rounding level."""
+
+    moe_expert_cache_provider: MoECacheProvider = "cached"
+    """Which expert cache implementation serves moe_expert_cache_size.
+    - "cached": the upstream GPU LFRU cache backed by CPU pinned memory.
+    - "row": the row-level cache (staged copies on a copy stream, device
+      LRU with victim protection, publication at forward boundaries)."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
