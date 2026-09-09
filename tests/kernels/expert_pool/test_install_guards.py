@@ -6,6 +6,7 @@ allocating anything, and bounds the planner width."""
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.model_executor.layers.fused_moe.expert_pool import install as inst
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
@@ -57,3 +58,11 @@ def test_planner_width_is_bounded_by_the_decode_lane_cap():
         tokens = max(1, min(requested, cap_tokens))
         assert tokens == expected
         assert inst._next_power_of_two(top_k * tokens) <= 2 * inst.MAX_DECODE_LANES
+
+
+def test_top_k_beyond_the_lane_cap_is_rejected():
+    assert inst.install_expert_pool(torch.nn.Module(), torch.device("cpu")) is None
+    for bad in (0, inst.MAX_DECODE_LANES + 1):
+        with pytest.raises(ValueError, match="0 < top_k"):
+            inst._check_top_k(bad)
+    inst._check_top_k(inst.MAX_DECODE_LANES)

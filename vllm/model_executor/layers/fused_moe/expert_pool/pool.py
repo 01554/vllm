@@ -98,9 +98,11 @@ def verify_bank_rows(pool, sources, sample: int = 4) -> dict[str, int]:
             continue
         per_layer[layer] += 1
         for name in TENSORS:
-            got = pool.bank[name][row].detach().cpu().contiguous().view(torch.uint8)
-            want = sources[layer][name][expert].contiguous().view(torch.uint8)
-            if not torch.equal(got.reshape(-1), want.reshape(-1)):
+            # reshape before the byte view: a per-expert global scale row is
+            # a 0-dim tensor, which cannot be viewed as bytes directly.
+            got = pool.bank[name][row].detach().cpu().reshape(-1).view(torch.uint8)
+            want = sources[layer][name][expert].reshape(-1).view(torch.uint8)
+            if not torch.equal(got, want):
                 raise AssertionError(
                     f"bank row {row} ({name}) differs from layer {layer} "
                     f"expert {expert}"
