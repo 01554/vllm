@@ -28,6 +28,10 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+    ExpertWeightResult,
+    run_with_expert_cache,
+)
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
@@ -40,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -849,6 +854,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         return True
 
+    @property
+    def supports_expert_lru_cache(self) -> bool:
+        # The cache hands the kernel slot-indexed copies of all six expert
+        # tensors, so every one of them must keep an expert-major layout in
+        # its final representation and the kernel must read the global scales
+        # through the quant config the cache repoints. Marlin keeps
+        # weights, block scales and global scales expert-major and reads
+        # g1/g2_alphas from the config. The FlashInfer/CUTLASS paths fold
+        # activation scales into the globals and swizzle per backend, B12X
+        # and Humming repack across experts; none of them has been validated
+        # against slot remapping, so they stay rejected.
+        return self.nvfp4_backend == NvFp4MoeBackend.MARLIN
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -1013,6 +1031,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
+        # The parameters above are in the kernel's final representation; the
+        # cache takes them as its source and repoints the per-expert scale
+        # and global-scale parameters at its slot buffers. The quant config
+        # built next captures those buffers, so this must come first.
+        layer._maybe_init_expert_lru_cache(
+            "weight_scale", scale_2_suffix="weight_scale_2"
+        )
+
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
@@ -1054,6 +1080,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert self.is_monolithic
         assert self.moe_kernel is not None
+        assert layer.expert_weight_provider is None, (
+            "expert cache is not supported with a monolithic NVFP4 kernel"
+        )
         return self.moe_kernel.apply_monolithic(
             x,
             layer.w13_weight,
@@ -1080,6 +1109,35 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = layer.expert_weight_provider
+        if provider is not None:
+
+            def run(
+                result: ExpertWeightResult, rows: slice, include_shared: bool
+            ) -> torch.Tensor:
+                assert self.moe_kernel is not None
+                return self.moe_kernel.apply(
+                    x[rows],
+                    result.w1,
+                    result.w2,
+                    topk_weights[rows],
+                    topk_ids[rows],
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    expert_map=result.expert_map,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    # Shared experts belong to the forward, not to one call.
+                    shared_experts=shared_experts if include_shared else None,
+                    shared_experts_input=(
+                        shared_experts_input[rows]
+                        if include_shared and shared_experts_input is not None
+                        else None
+                    ),
+                )
+
+            return run_with_expert_cache(provider, topk_ids, run)
+
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,
