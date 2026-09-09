@@ -517,7 +517,9 @@ def main():
         write_manifest(manifest, out / "manifest.json")
     correctness = {}
     with open(out / "timing.jsonl", "w") as tl, open(out / "summary.csv", "w") as sc:
-        sc.write("backend,M,path,median_ms,p10_ms,p90_ms,variance_ms2,correct\n")
+        sc.write(
+            "backend,M,path,median_ms,p10_ms,p90_ms,variance_ms2,correct,source_equivalent\n"
+        )
         for m in sizes:
             x, ids, w = make_inputs(m, hidden, a.num_experts, a.seed + m)
             (out / "inputs").mkdir(exist_ok=True)
@@ -537,6 +539,15 @@ def main():
                 )
                 c["inputs_sha256"] = inputs_sha
                 c["path"] = runner.path(m) if hasattr(runner, "path") else name
+                # A backend whose weight conversion is not source-equivalent
+                # (Marlin with gate != up globals) is still checked, but its
+                # rows are marked so they are never read as a same-arithmetic
+                # comparison.
+                equivalent = getattr(runner, "globals_report", {}).get(
+                    "source_equivalent", True
+                )
+                c["source_equivalent"] = equivalent
+                eq = "yes" if equivalent else "NO"
                 correctness[f"{name}/M{m}"] = c
                 (out / "correctness.json").write_text(
                     json.dumps(correctness, indent=1) + "\n"
@@ -549,10 +560,10 @@ def main():
                         f"sticky={c['sticky_error']}, "
                         f"non_finite={c['non_finite']}); no timing"
                     )
-                    sc.write(f"{name},{m},{c['path']},,,,,FAIL\n")
+                    sc.write(f"{name},{m},{c['path']},,,,,FAIL,{eq}\n")
                     continue
                 if a.no_timing:
-                    sc.write(f"{name},{m},{c['path']},,,,,PASS\n")
+                    sc.write(f"{name},{m},{c['path']},,,,,PASS,{eq}\n")
                     continue
                 t = time_graph(runner, m, x, ids, w, ref_source, a.atol, a.rtol)
                 rec = {
@@ -560,16 +571,17 @@ def main():
                     "M": m,
                     "path": c["path"],
                     "time": time.time(),
+                    "source_equivalent": equivalent,
                     **t,
                 }
                 tl.write(json.dumps(rec) + "\n")
                 if not t["valid"]:
                     print(f"{name} M={m}: graph replay check FAIL; timing invalidated")
-                    sc.write(f"{name},{m},{c['path']},,,,,REPLAY_FAIL\n")
+                    sc.write(f"{name},{m},{c['path']},,,,,REPLAY_FAIL,{eq}\n")
                     continue
                 sc.write(
                     f"{name},{m},{c['path']},{t['median_ms']:.4f},{t['p10_ms']:.4f},"
-                    f"{t['p90_ms']:.4f},{t['variance_ms2']:.6f},PASS\n"
+                    f"{t['p90_ms']:.4f},{t['variance_ms2']:.6f},PASS,{eq}\n"
                 )
                 print(f"{name} M={m} {c['path']}: median {t['median_ms']:.4f} ms")
     (out / "correctness.json").write_text(json.dumps(correctness, indent=1) + "\n")

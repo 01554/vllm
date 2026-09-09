@@ -221,6 +221,7 @@ class BenchMainMockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rows, correctness = self.run_main(tmp)
             self.assertEqual([r["correct"] for r in rows], ["PASS", "PASS"])
+            self.assertEqual([r["source_equivalent"] for r in rows], ["yes", "yes"])
             self.assertTrue(all(r["median_ms"] for r in rows))
             self.assertTrue(all(correctness[k]["pass"] for k in correctness))
             for f in ("manifest.json", "timing.jsonl", "command.txt", "inputs/m1.pt"):
