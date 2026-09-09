@@ -186,11 +186,11 @@ class RowCacheWeightProvider:
     ) -> ExpertWeightResult:
         """Make `unique_ids` resident and return the map selecting them.
 
-        Owner-stream contract: the first call records the current stream;
-        a later call from a different stream is rejected (first PR).
+        Validation (capacity, range, duplicates) happens before any state
+        change, including the owner-stream record and the call counter.
+        Owner-stream contract: the first accepted call records the current
+        stream; a later call from a different stream is rejected.
         """
-        self._check_owner_stream()
-        self._prepare_calls += 1
         if unique_ids is None:
             unique_ids = sorted(
                 {int(e) for e in topk_ids.detach().cpu().reshape(-1).tolist() if e >= 0}
@@ -211,6 +211,8 @@ class RowCacheWeightProvider:
                 f"RowCacheWeightProvider: expert ids out of range: {bad[:4]} "
                 f"(num_experts={self._num_experts})"
             )
+        self._check_owner_stream()
+        self._prepare_calls += 1
         for e in unique_ids:
             if e in self._lru:
                 self._lru.move_to_end(e)

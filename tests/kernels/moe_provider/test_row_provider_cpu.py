@@ -93,8 +93,15 @@ def test_explicit_ids_are_validated_before_any_mutation():
             raise AssertionError(f"expected rejection for {bad}")
         except ValueError:
             pass
-    assert p.stats() == before
+    assert p.stats() == before  # counters untouched by rejected calls
     assert sorted(int(e) for e in torch.nonzero(p.expert_map >= 0).flatten()) == [0, 1]
+    # overflow is rejected before any state change too
+    try:
+        p.prepare(torch.empty((1, 3), dtype=torch.int32), [0, 1, 2])
+        raise AssertionError("expected overflow error")
+    except RuntimeError:
+        pass
+    assert p.stats() == before
 
 
 def test_source_is_owned_not_aliased():
