@@ -16,6 +16,8 @@ graph is only a test fixture; it is not evidence of graph support in the
 provider.
 """
 
+import time
+
 import pytest
 import torch
 
@@ -68,7 +70,7 @@ def src_bytes(src, expert):
 
 DELAY_N = 4096
 DELAY_MATMULS = 8
-REPLAYS = 20
+REPLAYS = 100
 
 
 class GraphReader:
@@ -104,9 +106,24 @@ class GraphReader:
         torch.accelerator.synchronize(device)
 
     def replay(self, n=REPLAYS):
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        self.start.record()
         for _ in range(n):
             self.graph.replay()
+        self.end.record()
         return self.acc
+
+    def gpu_ms(self):
+        return self.start.elapsed_time(self.end)
+
+
+def inconclusive(host_ms, reader):
+    return (
+        "reader finished before the copies were enqueued; test is inconclusive "
+        f"(prepare host {host_ms:.1f} ms, reader GPU {reader.gpu_ms():.1f} ms: "
+        "host >= reader means prepare blocked on the GPU)"
+    )
 
 
 def ref_sum(tensors):
@@ -140,15 +157,15 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     reader_done.record(owner)
     # The next prepare is enqueued while the reader is still running (no
     # host synchronization in between); the release event must order the
-    # copies behind it.
-    r2 = p.prepare(torch.tensor([[1, 2]], dtype=torch.int32))  # evicts 0 -> expert 2
+    # copies behind it. Evicts 0 -> expert 2.
+    t0 = time.perf_counter()
+    r2 = p.prepare(torch.tensor([[1, 2]], dtype=torch.int32))
+    host_ms = (time.perf_counter() - t0) * 1e3
     overlapped = not reader_done.query()
     assert p._copy_stream is not None
     assert p._copy_stream.cuda_stream != owner.cuda_stream  # a separate copy stream
     torch.accelerator.synchronize(p.device)
-    assert overlapped, (
-        "reader finished before the copies were enqueued; test is inconclusive"
-    )
+    assert overlapped, inconclusive(host_ms, reader)
     assert int(r2.expert_map[0]) == -1 and int(r2.expert_map[2]) == slot0
     got = slot_bytes(p, slot0)
     want = src_bytes(src, 2)
@@ -190,13 +207,13 @@ def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
     reader_done = torch.cuda.Event()
     read1 = reader.replay()
     reader_done.record(owner)
+    t0 = time.perf_counter()
     p.invalidate(1)  # frees the slot; may not wait for the reader
     r2 = p.prepare(torch.tensor([[3, 0]], dtype=torch.int32))  # 3 reuses slot1
+    host_ms = (time.perf_counter() - t0) * 1e3
     overlapped = not reader_done.query()
     torch.accelerator.synchronize(p.device)
-    assert overlapped, (
-        "reader finished before the reuse was enqueued; test is inconclusive"
-    )
+    assert overlapped, inconclusive(host_ms, reader)
     assert int(r2.expert_map[3]) == slot1
     assert torch.equal(read1.cpu(), ref_sum([src["w13"][1]]))
     assert torch.equal(p.buf_w13[slot1].cpu(), src["w13"][3])
