@@ -301,8 +301,9 @@ def time_graph(runner, m, x, ids, w, reference: torch.Tensor, atol: float, rtol:
     """Capture one MoE call in a CUDA graph and time its replay.
 
     The captured output tensor is kept and compared with `reference` (the
-    eager output that passed the oracle) after warmup and again after the
-    timed batches; a mismatch or a sticky error invalidates the timing.
+    source-semantics oracle result for this shape) after warmup and again
+    after the timed batches; a mismatch or a sticky error invalidates the
+    timing.
     """
     device = runner.device
     xd, idd, wd = x.to(device), ids.to(device), w.to(device)
