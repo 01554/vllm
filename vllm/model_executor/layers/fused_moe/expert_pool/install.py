@@ -29,8 +29,48 @@ from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
 logger = init_logger(__name__)
 
 
+# Decode lanes (tokens x top_k) the step program is compiled for. Wider
+# inputs take the bank + host-view partition path. Small on purpose: the
+# single-program planner loops over WIDTH lanes and scans the pool per miss.
+MAX_DECODE_LANES = 64
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << max(int(value) - 1, 0).bit_length()
+
+
+def check_pool_layers(layers: list[tuple[str, torch.nn.Module]]) -> None:
+    """Reject geometries the pool cannot serve, before anything is allocated:
+    every layer must share expert count, top-k, resident rows and backend,
+    and the backend must be NVFP4 Marlin (the only consumer bound here)."""
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4FusedMoE,
+    )
+
+    first_name, first = layers[0]
+    for name, layer in layers:
+        method = layer.quant_method
+        if not isinstance(method, ModelOptNvFp4FusedMoE):
+            raise ValueError(
+                f"{name}: expert pool supports ModelOptNvFp4FusedMoE only, got "
+                f"{type(method).__name__}"
+            )
+        if method.nvfp4_backend != NvFp4MoeBackend.MARLIN:
+            raise ValueError(
+                f"{name}: expert pool supports the Marlin NVFP4 backend only, "
+                f"got {method.nvfp4_backend.value}"
+            )
+        if layer.moe_config.moe_parallel_config.use_ep:
+            raise ValueError(f"{name}: expert pool is not compatible with EP")
+        for attr in ("local_num_experts", "_moe_expert_cache_size"):
+            if getattr(layer, attr) != getattr(first, attr):
+                raise ValueError(
+                    f"{name}.{attr}={getattr(layer, attr)} differs from "
+                    f"{first_name} ({getattr(first, attr)})"
+                )
+        if layer.moe_config.experts_per_token != first.moe_config.experts_per_token:
+            raise ValueError(f"{name}: top_k differs from {first_name}")
 
 
 def pool_layers(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
@@ -78,6 +118,7 @@ def install_expert_pool(
     layers = pool_layers(model)
     if not layers:
         return None
+    check_pool_layers(layers)
     first_name, first = layers[0]
     num_experts = first.local_num_experts
     top_k = first.moe_config.experts_per_token
@@ -86,7 +127,10 @@ def install_expert_pool(
         raise ValueError(
             f"expert pool needs at least top_k={top_k} rows per layer, got {slots}"
         )
-    staging = top_k * max(1, max_decode_tokens)
+    # Decode lanes served by the step program: at most MAX_DECODE_LANES and
+    # at least one token; batches beyond that use the partition path.
+    decode_tokens = max(1, min(max_decode_tokens, MAX_DECODE_LANES // top_k))
+    staging = top_k * decode_tokens
     width = _next_power_of_two(staging)
     sources = [_sources(name, layer) for name, layer in layers]
     for name, src in zip((n for n, _ in layers), sources):
@@ -147,26 +191,68 @@ def install_expert_pool(
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
         layer.expert_pool_pending = False
-    # Placement policy: promotions on every forward, first miss promotes,
-    # no protection window, gate open (the lab run's values).
+    # Placement policy (the lab run's values): promotions on every forward,
+    # first miss promotes, no protection window. The gate stays closed
+    # through profiling and graph capture (dummy routing must not move the
+    # placement) and is opened by open_pool_gate() at the end of warm-up.
     set_control(
         pool.tables,
         promote_limit=0,
         promote_interval=1,
         promote_min_misses=1,
         protect_recent=0,
-        gate=1,
+        gate=0,
     )
     torch.accelerator.synchronize(device)
     model.expert_pool = pool
+    model.expert_pool_sources = sources
     logger.info(
         "Expert pool installed: %d layers, %d/%d rows per layer resident, "
-        "%d staging rows, bank %.1f GiB (%s)",
+        "%d staging rows (%d decode tokens x top_k %d; wider batches take the "
+        "partition path), bank %.1f GiB (%s)",
         len(layers),
         slots,
         num_experts,
         staging,
+        decode_tokens,
+        top_k,
         (pool.pool_bytes + pool.staging_bytes) / 2**30,
         type(layers[0][1].quant_method).__name__,
     )
     return pool
+
+
+def open_pool_gate(model: torch.nn.Module, sample_rows: int = 4) -> None:
+    """End of warm-up/capture: verify the tables and a sample of bank rows
+    against the host source, log the placement, then open the gate.
+
+    Host readback happens here only, never inside a forward. The gate is a
+    device scalar at a fixed address, so captured graphs see the change."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.pool import (
+        verify_bank_rows,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
+        check_global_tables,
+        resident_per_layer,
+        set_gate,
+    )
+
+    pool = getattr(model, "expert_pool", None)
+    if pool is None:
+        return
+    device = pool.tables.hot_phys.device
+    torch.accelerator.synchronize(device)
+    check_global_tables(pool.tables)
+    report = verify_bank_rows(pool, model.expert_pool_sources, sample_rows)
+    resident = resident_per_layer(pool.tables)
+    set_gate(pool.tables, True)
+    torch.accelerator.synchronize(device)
+    logger.info(
+        "Expert pool gate opened after warm-up: tables consistent, %d sampled "
+        "bank rows match the host source (%d resident), resident per layer "
+        "min/max %d/%d",
+        report["rows_checked"],
+        report["rows_resident"],
+        min(resident),
+        max(resident),
+    )
