@@ -105,9 +105,9 @@ def test_event_order_on_prepare_and_invalidate():
         assert seq[:2] == ["release.record(owner)", "copy.wait(release)"], seq
         assert seq[2] == "enter(copy)" and "exit(copy)" in seq, seq
         assert seq[-2:] == ["ready.record(copy)", "owner.wait(ready)"], seq
-    assert third == ["copy.synchronize"], (
-        third
-    )  # copies only; reader ordering via the next release event
+    # copies only; the resident-map write goes to the owner stream (program
+    # order behind the last reader); reader ordering via the next release.
+    assert third == ["copy.synchronize", "enter(owner)", "exit(owner)"], third
     # Owner change: the release event goes to the previous owner's stream and
     # the new stream waits for the copies; then the roles swap back.
     assert fourth[1:3] == ["release.record(owner)", "copy.wait(release)"], fourth
