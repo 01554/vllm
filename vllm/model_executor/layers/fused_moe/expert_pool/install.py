@@ -39,6 +39,13 @@ def _next_power_of_two(value: int) -> int:
     return 1 << max(int(value) - 1, 0).bit_length()
 
 
+def _check_top_k(top_k: int) -> None:
+    if not 0 < top_k <= MAX_DECODE_LANES:
+        raise ValueError(
+            f"expert pool supports 0 < top_k <= {MAX_DECODE_LANES}, got {top_k}"
+        )
+
+
 def check_pool_layers(layers: list[tuple[str, torch.nn.Module]]) -> None:
     """Reject geometries the pool cannot serve, before anything is allocated:
     every layer must share expert count, top-k, resident rows and backend,
@@ -122,6 +129,7 @@ def install_expert_pool(
     first_name, first = layers[0]
     num_experts = first.local_num_experts
     top_k = first.moe_config.experts_per_token
+    _check_top_k(top_k)
     slots = min(first._moe_expert_cache_size, num_experts - 1)
     if slots < top_k:
         raise ValueError(
