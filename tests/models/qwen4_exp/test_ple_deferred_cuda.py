@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Real memop/copy capture smoke; checkpoint integration is a separate gate."""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+import torch
+
+from vllm.config import CUDAGraphMode
+from vllm.models.qwen4_exp.nvidia import ple_layer
+from vllm.models.qwen4_exp.nvidia.ple_wait import (
+    DeferredRows,
+    StreamMemopsUnavailable,
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_runtime_none_capture_replays_fresh_rows_and_resets_flag():
+    # Distinct raw BF16 rows catch stale data, zeros and ID mixups without
+    # relying on floating point comparisons or a model's generated text.
+    source = torch.arange(64, dtype=torch.bfloat16).reshape(8, 2, 4)
+
+    class Table:
+        def gather(self, ids):
+            return np.stack(
+                [source[int(ids[0, h]), h].view(torch.uint8).numpy() for h in range(2)]
+            )
+
+    destination = torch.empty((1, 2, 4), dtype=torch.bfloat16, device="cuda")
+    try:
+        helper = DeferredRows(destination, Table())
+    except StreamMemopsUnavailable as exc:
+        pytest.skip(str(exc))
+    helper.prepare_dummy()
+    graph = torch.cuda.CUDAGraph()
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        no_compile_layers={
+            "ple": SimpleNamespace(ple_embedding=SimpleNamespace(deferred_rows=helper))
+        },
+    )
+    with (
+        patch.object(ple_layer, "get_forward_context", return_value=context),
+        torch.cuda.graph(graph),
+    ):
+        ple_layer.qwen4_exp_ple_deferred_rows(destination, "ple")
+
+    for row_ids in ([1, 2], [5, 3], [0, 7]):
+        ids = torch.tensor([row_ids], dtype=torch.int64, device="cuda")
+        helper.prepare(ids)
+        graph.replay()
+        # Never synchronize a replay waiting for the host before releasing it.
+        try:
+            helper.complete()
+        except BaseException:
+            helper.abort()
+            raise
+        torch.accelerator.synchronize()
+        expected = torch.stack([source[row_ids[h], h] for h in range(2)])[None]
+        assert torch.equal(
+            destination.cpu().view(torch.uint8), expected.view(torch.uint8)
+        )
+        assert int(helper.flag[0]) == 0
+        assert not helper.pending

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
+import os
 from collections.abc import Iterable, Sequence
 from typing import cast
 
@@ -11,6 +12,7 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -40,7 +42,7 @@ from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.torch_utils import get_dtype_size
+from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -50,6 +52,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from ..common.ple import PLEVocabParallelEmbedding
 from . import ple_mmap
 from .ops.ple import ple_conv, ple_gate, ple_ngram_ids
+from .ple_wait import DeferredRows, StreamMemopsUnavailable
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -327,6 +330,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # staging (see initialize_mmap_staging). None until V2 model state
         # allocates it; stays None for the non-mmap embedding.
         self._mmap_staging: torch.Tensor | None = None
+        self.deferred_rows: DeferredRows | None = None
         if ple_mmap.enabled():
             vllm_config = get_current_vllm_config()
             ple_mmap.check_cudagraph_safety(vllm_config)
@@ -522,6 +526,32 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             device=device,
         )
 
+        if os.getenv("VLLM_PLE_MMAP_DEFERRED", "0") == "1":
+            table = self._require_mmap_embedding().table
+            if table is None:
+                raise RuntimeError("Deferred PLE requires an initialized mmap table")
+            try:
+                self.deferred_rows = DeferredRows(self._mmap_staging[:1], table)
+            except StreamMemopsUnavailable as exc:
+                import warnings
+
+                warnings.warn(
+                    f"Deferred PLE unavailable; using synchronous mmap rows: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+    def prepare_deferred_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        if self.deferred_rows is None:
+            raise RuntimeError("Deferred PLE was not initialized")
+        ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        self.deferred_rows.prepare(ids)
+
     def prepare_mmap_rows(
         self,
         input_ids: torch.Tensor,
@@ -563,6 +593,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"PLE mmap: {self.layer_name!r} staging was never initialized"
             )
         self._mmap_staging[:padded_tokens].zero_()
+        if padded_tokens == 1 and self.deferred_rows is not None:
+            self.deferred_rows.prepare_dummy()
 
     def forward(
         self,
@@ -582,7 +614,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # query_start_loc.size()[0] under the old whole-forward custom
             # op. A plain shape[0] read stays a SymInt when traced.
             num_tokens = input_ids.reshape(-1).shape[0]
-            return self._mmap_staging[:num_tokens].flatten(-2)
+            output = self._mmap_staging[:num_tokens]
+            if self.deferred_rows is not None:
+                torch.ops.vllm.qwen4_exp_ple_deferred_rows(output, self.layer_name)
+            return output.flatten(-2)
         if query_start_loc is None or ngram_context is None:
             raise RuntimeError("PLE inputs were not prepared")
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
@@ -1045,3 +1080,31 @@ __all__ = [
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
 ]
+
+
+def qwen4_exp_ple_deferred_rows(output: torch.Tensor, layer_name: str) -> None:
+    """Capture stream WAIT/H2D; host completes fills after graph dispatch."""
+    context = get_forward_context()
+    capture = (
+        context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and torch.cuda.is_current_stream_capturing()
+    )
+    # FULL capture invokes the model with runtime mode NONE. PIECEWISE and
+    # ordinary eager execution must keep the synchronous staging path.
+    if (
+        context.cudagraph_runtime_mode == CUDAGraphMode.FULL or capture
+    ) and output.shape[0] == 1:
+        layer = context.no_compile_layers[layer_name]
+        layer.ple_embedding.deferred_rows.consume(destination=output)
+
+
+def qwen4_exp_ple_deferred_rows_fake(output: torch.Tensor, layer_name: str) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_deferred_rows",
+    op_func=qwen4_exp_ple_deferred_rows,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_deferred_rows_fake,
+)
