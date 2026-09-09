@@ -3,7 +3,7 @@
 """Real memop/copy capture smoke; checkpoint integration is a separate gate."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -17,21 +17,48 @@ from vllm.models.qwen4_exp.nvidia.ple_wait import (
 )
 
 
+class _Table:
+    def __init__(self, source):
+        self.source = source
+
+    def gather(self, ids):
+        # Production mmap gather consumes a flattened ID array.
+        assert ids.ndim == 1
+        return np.stack(
+            [self.source[int(ids[h]), h].view(torch.uint8).numpy() for h in range(2)]
+        )
+
+
+def test_complete_passes_flat_ids_to_cuda_smoke_table():
+    source = torch.arange(64, dtype=torch.bfloat16).reshape(8, 2, 4)
+    helper = object.__new__(DeferredRows)
+    helper.table = _Table(source)
+    helper.ids = torch.tensor([[5, 3]], dtype=torch.int64)
+    helper.rows = torch.empty((1, 2, 4), dtype=torch.bfloat16)
+    helper._poisoned = False
+    helper._pending = True
+    helper._readback_event = Mock()
+    helper._ext = Mock()
+    helper.flag = torch.zeros(1, dtype=torch.int64)
+
+    helper.complete()
+
+    expected = torch.stack([source[5, 0], source[3, 1]])[None]
+    assert torch.equal(helper.rows.view(torch.uint8), expected.view(torch.uint8))
+    helper._readback_event.synchronize.assert_called_once_with()
+    helper._ext.signal_flag.assert_called_once_with(helper.flag.data_ptr())
+    assert not helper.pending
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_runtime_none_capture_replays_fresh_rows_and_resets_flag():
     # Distinct raw BF16 rows catch stale data, zeros and ID mixups without
     # relying on floating point comparisons or a model's generated text.
     source = torch.arange(64, dtype=torch.bfloat16).reshape(8, 2, 4)
 
-    class Table:
-        def gather(self, ids):
-            return np.stack(
-                [source[int(ids[0, h]), h].view(torch.uint8).numpy() for h in range(2)]
-            )
-
     destination = torch.empty((1, 2, 4), dtype=torch.bfloat16, device="cuda")
     try:
-        helper = DeferredRows(destination, Table())
+        helper = DeferredRows(destination, _Table(source))
     except StreamMemopsUnavailable as exc:
         pytest.skip(str(exc))
     helper.prepare_dummy()
