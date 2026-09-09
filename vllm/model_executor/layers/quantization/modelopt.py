@@ -40,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -969,6 +970,25 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+        if self.nvfp4_backend == NvFp4MoeBackend.NATIVE:
+            # Raw checkpoint layout stays; only the global scales are expanded
+            # per expert row and the input scales are dropped (BF16 inputs).
+            from vllm.model_executor.layers.quantization.nvfp4_native.loader import (
+                prepare_native_layer,
+            )
+
+            prepare_native_layer(self, layer)
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.experts_cls is not None
+            self.moe_kernel = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                backend=self.nvfp4_backend,
+                routing_tables=layer._expert_routing_tables(),
+            )
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+            return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
