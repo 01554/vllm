@@ -29,8 +29,48 @@ from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
 logger = init_logger(__name__)
 
 
+# Decode lanes (tokens x top_k) the step program is compiled for. Wider
+# inputs take the bank + host-view partition path. Small on purpose: the
+# single-program planner loops over WIDTH lanes and scans the pool per miss.
+MAX_DECODE_LANES = 64
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << max(int(value) - 1, 0).bit_length()
+
+
+def check_pool_layers(layers: list[tuple[str, torch.nn.Module]]) -> None:
+    """Reject geometries the pool cannot serve, before anything is allocated:
+    every layer must share expert count, top-k, resident rows and backend,
+    and the backend must be NVFP4 Marlin (the only consumer bound here)."""
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4FusedMoE,
+    )
+
+    first_name, first = layers[0]
+    for name, layer in layers:
+        method = layer.quant_method
+        if not isinstance(method, ModelOptNvFp4FusedMoE):
+            raise ValueError(
+                f"{name}: expert pool supports ModelOptNvFp4FusedMoE only, got "
+                f"{type(method).__name__}"
+            )
+        if method.nvfp4_backend != NvFp4MoeBackend.MARLIN:
+            raise ValueError(
+                f"{name}: expert pool supports the Marlin NVFP4 backend only, "
+                f"got {method.nvfp4_backend.value}"
+            )
+        if layer.moe_config.moe_parallel_config.use_ep:
+            raise ValueError(f"{name}: expert pool is not compatible with EP")
+        for attr in ("local_num_experts", "_moe_expert_cache_size"):
+            if getattr(layer, attr) != getattr(first, attr):
+                raise ValueError(
+                    f"{name}.{attr}={getattr(layer, attr)} differs from "
+                    f"{first_name} ({getattr(first, attr)})"
+                )
+        if layer.moe_config.experts_per_token != first.moe_config.experts_per_token:
+            raise ValueError(f"{name}: top_k differs from {first_name}")
 
 
 def pool_layers(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
@@ -78,6 +118,7 @@ def install_expert_pool(
     layers = pool_layers(model)
     if not layers:
         return None
+    check_pool_layers(layers)
     first_name, first = layers[0]
     num_experts = first.local_num_experts
     top_k = first.moe_config.experts_per_token
@@ -86,7 +127,10 @@ def install_expert_pool(
         raise ValueError(
             f"expert pool needs at least top_k={top_k} rows per layer, got {slots}"
         )
-    staging = top_k * max(1, max_decode_tokens)
+    # Decode lanes served by the step program: at most MAX_DECODE_LANES and
+    # at least one token; batches beyond that use the partition path.
+    decode_tokens = max(1, min(max_decode_tokens, MAX_DECODE_LANES // top_k))
+    staging = top_k * decode_tokens
     width = _next_power_of_two(staging)
     sources = [_sources(name, layer) for name, layer in layers]
     for name, src in zip((n for n, _ in layers), sources):
@@ -161,11 +205,14 @@ def install_expert_pool(
     model.expert_pool = pool
     logger.info(
         "Expert pool installed: %d layers, %d/%d rows per layer resident, "
-        "%d staging rows, bank %.1f GiB (%s)",
+        "%d staging rows (%d decode tokens x top_k %d; wider batches take the "
+        "partition path), bank %.1f GiB (%s)",
         len(layers),
         slots,
         num_experts,
         staging,
+        decode_tokens,
+        top_k,
         (pool.pool_bytes + pool.staging_bytes) / 2**30,
         type(layers[0][1].quant_method).__name__,
     )

@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.expert_pool.install import (
 from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
     check_global_tables,
     resident_per_layer,
+    set_gate,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     is_fp4_marlin_supported,
@@ -91,14 +92,34 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
         assert int(pool.tables.error[0]) == 0
 
     x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
+    tables = pool.tables
+    # Gate closed: a miss is staged into a shared staging row (physical row
+    # >= E) and the step map must point there; the output still matches.
+    set_gate(tables, False)
+    run(0, x, _decode([6, 7], device), 1)  # experts 6, 7 are not resident
+    step_map = pls[0].buffers.step_map.cpu().tolist()
+    assert step_map[6] >= E and step_map[7] >= E, step_map
+    assert resident_per_layer(tables) == [SLOTS, SLOTS]  # placement untouched
+    set_gate(tables, True)
     # Decode steps whose routes walk every expert of both layers: misses
     # promote (evicting the least recently used row of either layer) or
     # stage into the shared staging rows.
     for order in ([0, 1], [4, 5], [6, 7], [2, 3], [0, 6], [7, 1]):
         run(0, x, _decode(order, device), 1)
+    hot0_before = tables.layer_slice(tables.hot_phys, 0).cpu().clone()
+    row_key_before = tables.row_key.cpu().clone()
     for order in ([4, 5], [6, 7], [2, 6]):
         run(1, x, _decode(order, device), 1)
-    assert sum(resident_per_layer(pool.tables)) == 2 * SLOTS
+    # Cross-layer eviction: layer 1's misses took rows from layer 0.
+    hot0_after = tables.layer_slice(tables.hot_phys, 0).cpu()
+    assert not torch.equal(hot0_before, hot0_after)
+    row_key_after = tables.row_key.cpu()
+    changed = (row_key_before != row_key_after).nonzero().flatten().tolist()
+    assert changed and all(
+        int(row_key_before[r]) // E == 0 and int(row_key_after[r]) // E == 1
+        for r in changed
+    ), (row_key_before.tolist(), row_key_after.tolist())
+    assert sum(resident_per_layer(tables)) == 2 * SLOTS
     # Wide batch on layer 0: resident rows from the bank, the rest through
     # the host view; every route covered exactly once.
     xb = torch.randn(8, K, dtype=torch.bfloat16, device=device)
