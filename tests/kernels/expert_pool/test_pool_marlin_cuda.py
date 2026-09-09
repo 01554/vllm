@@ -129,4 +129,4 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
     for order in ([3, 4], [7, 0]):
         run(0, x, _decode(order, device), 1)
     run(1, x, _decode([0, 1], device), 1)
-    assert pls[0].decode_steps == 8 and pls[1].decode_steps == 4
+    assert pls[0].decode_steps == 9 and pls[1].decode_steps == 4  # 1 gate-closed

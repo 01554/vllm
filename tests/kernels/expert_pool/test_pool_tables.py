@@ -290,3 +290,19 @@ class VerifyBankRowsTests(unittest.TestCase):
         pool.bank["w2_weight"][0, 0] += 1
         with self.assertRaises(AssertionError):
             pool_mod.verify_bank_rows(pool, sources, sample=4)
+
+    def test_scalar_per_expert_globals_are_compared_as_bytes(self):
+        device = torch.device("cpu")
+        sources = make_sources(1, 4)
+        for src in sources:  # a [E] per-expert global, as Marlin's scale_2 is
+            src["w13_weight_scale_2"] = torch.arange(4, dtype=torch.float32) + 0.5
+            src["w2_weight_scale_2"] = torch.arange(4, dtype=torch.float32) + 1.5
+        pool = pool_mod.GlobalPool(device, sources[0], [2], 1)
+        for name in gp.TENSORS:
+            pool.bank[name][:2].copy_(sources[0][name][:2])
+        self.assertEqual(
+            pool_mod.verify_bank_rows(pool, sources, sample=2)["rows_checked"], 2
+        )
+        pool.bank["w2_weight_scale_2"][1] += 1
+        with self.assertRaises(AssertionError):
+            pool_mod.verify_bank_rows(pool, sources, sample=2)

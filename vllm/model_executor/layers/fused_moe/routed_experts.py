@@ -246,6 +246,25 @@ class RoutedExperts(PluggableLayer):
                     "This is configured automatically by VllmConfig; do not "
                     "override splitting_ops to exclude it."
                 )
+        if self._moe_expert_cache_provider == "pool":
+            # The pool binds one consumer (NVFP4 Marlin); reject others here,
+            # before any weight is allocated, not at the model-level install.
+            from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+                NvFp4MoeBackend,
+            )
+            from vllm.model_executor.layers.quantization.modelopt import (
+                ModelOptNvFp4FusedMoE,
+            )
+
+            if (
+                not isinstance(self.quant_method, ModelOptNvFp4FusedMoE)
+                or self.quant_method.nvfp4_backend != NvFp4MoeBackend.MARLIN
+            ):
+                raise ValueError(
+                    "moe_expert_cache_provider=pool supports the ModelOpt NVFP4 "
+                    "Marlin backend only, got "
+                    f"{type(self.quant_method).__name__}"
+                )
         # Checked before create_weights: an unsupported method would still get
         # its expert weights allocated in CPU pinned memory below and then run
         # its normal setup against them, which is not a supported combination.
