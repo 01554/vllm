@@ -15,28 +15,20 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 )
 
 
-class _FakeRunner(MoERunnerInterface):
-    """Passes get_layer_from_name's isinstance check; nothing else is used."""
-
-    def __init__(self, tag: str, cached: bool):
-        self.tag = tag
-        self.routed_experts = SimpleNamespace(
-            expert_weight_provider=object() if cached else None
-        )
-
-    def forward(self, *a, **k):  # pragma: no cover - interface stub
-        raise NotImplementedError
-
-    @property
-    def shared_experts(self):  # pragma: no cover - interface stub
-        return None
-
-    @property
-    def _quant_method(self):  # pragma: no cover - interface stub
-        raise NotImplementedError
-
-    def _replace_quant_method(self, quant_method):  # pragma: no cover
-        raise NotImplementedError
+def _fake_runner(tag: str, cached: bool) -> MoERunnerInterface:
+    """A MoERunnerInterface instance for get_layer_from_name's isinstance
+    check: every abstract member is stubbed (none is called here) and
+    __init__ is bypassed."""
+    stubs = {
+        name: (lambda *a, **k: None) for name in MoERunnerInterface.__abstractmethods__
+    }
+    cls: type = type("_FakeRunner", (MoERunnerInterface,), stubs)
+    runner: MoERunnerInterface = object.__new__(cls)
+    runner.tag = tag
+    runner.routed_experts = SimpleNamespace(
+        expert_weight_provider=object() if cached else None
+    )
+    return runner
 
 
 def _run(monkeypatch, cached: bool):
@@ -102,7 +94,7 @@ def test_legacy_placeholder_consumes_one_layer_per_op(monkeypatch):
             return thunk()
 
     Capture.thunks = []
-    layers = {"a": _FakeRunner("a", cached=True), "b": _FakeRunner("b", cached=False)}
+    layers = {"a": _fake_runner("a", cached=True), "b": _fake_runner("b", cached=False)}
     ctx = SimpleNamespace(
         all_moe_layers=["a", "b"], moe_layer_index=0, no_compile_layers=layers
     )
