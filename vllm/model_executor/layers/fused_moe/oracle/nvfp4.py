@@ -48,6 +48,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_B12X = "FLASHINFER_B12X"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
+    NATIVE = "NATIVE"
     HUMMING = "HUMMING"
     EMULATION = "EMULATION"
 
@@ -130,6 +131,12 @@ def backend_to_kernel_cls(
         )
 
         return [MarlinExperts]
+    elif backend == NvFp4MoeBackend.NATIVE:
+        from vllm.model_executor.layers.quantization.nvfp4_native.experts import (
+            NativeNvFp4Experts,
+        )
+
+        return [NativeNvFp4Experts]
     elif backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
             BatchedHummingGroupedExperts,
@@ -162,6 +169,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
+        "native": NvFp4MoeBackend.NATIVE,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,
     }
@@ -174,8 +182,10 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
 
 
 def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
-    return checkpoint_uses_a16 or (
-        backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16
+    return (
+        checkpoint_uses_a16
+        or backend == NvFp4MoeBackend.NATIVE
+        or (backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16)
     )
 
 
@@ -536,8 +546,10 @@ def make_nvfp4_moe_quant_config(
             gemm1_beta=getattr(layer, "swiglu_beta", None),
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif backend == NvFp4MoeBackend.MARLIN or (
-        backend == NvFp4MoeBackend.B12X and use_a16
+    elif (
+        backend == NvFp4MoeBackend.MARLIN
+        or backend == NvFp4MoeBackend.NATIVE
+        or (backend == NvFp4MoeBackend.B12X and use_a16)
     ):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
