@@ -886,9 +886,22 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         global_num_experts = extra_weight_attrs.get("global_num_experts")
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+
+        # With the expert cache enabled, the per-expert tensors are allocated
+        # in CPU pinned memory so loading never needs GPU capacity for them;
+        # the Marlin repack then runs in expert chunks and the cache mirrors
+        # only moe_expert_cache_size rows. device="cpu" is explicit because
+        # loading runs under an accelerator device context.
+        expert_tensors_on_cpu = getattr(layer, "_moe_expert_cache_size", 0) > 0
+
+        def _empty_expert_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+            if expert_tensors_on_cpu:
+                return torch.empty(*shape, dtype=dtype, device="cpu").pin_memory()
+            return torch.empty(*shape, dtype=dtype)
+
         # GEMM 1
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=_empty_expert_tensor(
                 num_experts,
                 w13_num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -903,7 +916,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=_empty_expert_tensor(
                 num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -917,7 +930,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=_empty_expert_tensor(
                 num_experts,
                 w13_num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -931,7 +944,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=_empty_expert_tensor(
                 num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension

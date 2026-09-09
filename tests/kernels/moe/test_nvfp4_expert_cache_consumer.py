@@ -11,6 +11,8 @@ be the live slot buffers rather than copies, and the output must match the
 uncached layer.
 """
 
+import types
+
 import pytest
 import torch
 
@@ -27,6 +29,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_marlin_supported,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    prepare_nvfp4_moe_layer_for_marlin,
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -94,7 +99,12 @@ def _quantized_weights(device):
     return params
 
 
-def _make_layer(cfg: VllmConfig, params: dict[str, torch.Tensor]):
+def _make_layer(
+    cfg: VllmConfig, params: dict[str, torch.Tensor], host_source: bool = False
+):
+    """Build the layer; with host_source the per-expert tensors are
+    registered as pinned CPU tensors, the layout the loader produces when the
+    cache is enabled."""
     with set_current_vllm_config(cfg):
         # Any construction error is a failure: the Marlin capability gate is
         # the module-level skip above, and the backend is pinned to "marlin".
@@ -115,8 +125,16 @@ def _make_layer(cfg: VllmConfig, params: dict[str, torch.Tensor]):
             prefix="from_forward_context",
         )
         for name, value in params.items():
+            data = value.clone()
+            if host_source and name in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ):
+                data = data.cpu().pin_memory()
             layer.routed_experts.register_parameter(
-                name, torch.nn.Parameter(value.clone(), requires_grad=False)
+                name, torch.nn.Parameter(data, requires_grad=False)
             )
         layer._quant_method.process_weights_after_loading(layer.routed_experts)
     return layer
@@ -132,17 +150,58 @@ def _routing(order: list[int], device) -> torch.Tensor:
     return logits
 
 
+def test_host_chunked_marlin_repack_matches_device_path(dist_env):
+    """The chunked host path must produce the device path's bytes."""
+    device = torch.accelerator.current_accelerator()
+    params = _quantized_weights(device)
+    g13 = params["w13_weight_scale_2"][:, 0].contiguous()
+
+    def run(on_host: bool, chunk: int):
+        layer = types.SimpleNamespace(
+            num_experts=E,
+            hidden_size=K,
+            intermediate_size_per_partition=N,
+            params_dtype=torch.bfloat16,
+        )
+        src = {k: v.clone() for k, v in params.items()}
+        if on_host:
+            for k in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+                src[k] = src[k].cpu().pin_memory()
+        outs = prepare_nvfp4_moe_layer_for_marlin(
+            layer,
+            src["w13_weight"],
+            src["w13_weight_scale"],
+            g13.cpu() if on_host else g13,
+            src["w2_weight"],
+            src["w2_weight_scale"],
+            src["w2_weight_scale_2"].cpu() if on_host else src["w2_weight_scale_2"],
+            is_act_and_mul=True,
+            expert_chunk=chunk,
+        )
+        return [t.to(device) for t in outs]
+
+    want = run(False, E)
+    got = run(True, 3)  # 3 + 3 + 2 experts
+    assert all(t.device.type == "cpu" for t in got) is False  # moved back above
+    for name, a, b in zip(
+        ("w13", "w13_scale", "w13_scale_2", "w2", "w2_scale", "w2_scale_2"), want, got
+    ):
+        assert a.shape == b.shape and a.dtype == b.dtype, name
+        assert torch.equal(a, b), name
+
+
 @pytest.mark.parametrize("provider", ["cached", "row"])
-def test_scale_2_follows_slots_through_marlin(dist_env, provider):
+@pytest.mark.parametrize("host_source", [False, True])
+def test_scale_2_follows_slots_through_marlin(dist_env, provider, host_source):
     device = torch.accelerator.current_accelerator()
     params = _quantized_weights(device)
     ref_cfg = _vllm_config(0, provider)
     ref = _make_layer(ref_cfg, params)
     cfg = _vllm_config(CAPACITY, provider)
-    layer = _make_layer(cfg, params)
+    layer = _make_layer(cfg, params, host_source=host_source)
     experts = layer.routed_experts
     prov = experts.expert_weight_provider
-    assert prov is not None and type(prov).__name__ != "NoneType"
+    assert prov is not None
     qm = experts.quant_method
     assert qm.moe_quant_config is not None and qm.moe_kernel is not None
     # The consumer's global-scale arguments are the live slot buffers.
