@@ -95,8 +95,15 @@ class NativeRunner:
         self.gemv_rows = gemv_rows
         self.device = device
         self.step_map = torch.arange(rows, dtype=torch.int32, device=device)
-        self.error = torch.zeros(1, dtype=torch.int32, device=device)
         self._ws = {}
+        self._m = None
+
+    @property
+    def error(self):
+        """Sticky error flag of the workspace used by the last/next call."""
+        if self._m is None:
+            return None
+        return self.prepare(self._m).error
 
     def path(self, m: int) -> str:
         return "gemv" if m <= self.gemv_rows else "grouped"
@@ -114,6 +121,7 @@ class NativeRunner:
         return self._ws[m]
 
     def __call__(self, x, ids, w):
+        self._m = x.shape[0]
         ws = self.prepare(x.shape[0])
         if x.shape[0] <= self.gemv_rows:
             return self.nb.gemv(x, w, ids, self.bank, self.step_map, ws)
@@ -156,9 +164,12 @@ class ExpertsApplyRunner(NativeRunner):
             **{k: SimpleNamespace(data=v) for k, v in self.bank.items()}
         )
         self.experts.process_weights_after_loading(layer)
-        self.error = self.experts._error
         self._scratch = {}
         self._out = {}
+
+    @property
+    def error(self):
+        return self.experts._error
 
     def prepare(self, m: int):
         if m not in self._scratch:
@@ -179,21 +190,21 @@ class ExpertsApplyRunner(NativeRunner):
         scratch = self.prepare(m)
         out = self._out[m]
         self.experts.apply(
-            out,
-            x,
-            self.bank["w13_weight"],
-            self.bank["w2_weight"],
-            w,
-            ids,
-            self._act,
-            self.rows,
-            None,
-            None,
-            None,
-            torch.empty(0, device=self.device),
-            scratch,
-            None,
-            False,
+            out,  # output
+            x,  # hidden_states
+            self.bank["w13_weight"],  # w1
+            self.bank["w2_weight"],  # w2
+            w,  # topk_weights
+            ids,  # topk_ids
+            self._act,  # activation
+            self.rows,  # global_num_experts
+            None,  # expert_map
+            None,  # a1q_scale
+            None,  # a2_scale
+            torch.empty(0, device=self.device),  # workspace13
+            scratch,  # workspace2
+            None,  # expert_tokens_meta
+            False,  # apply_router_weight_on_input
         )
         return out
 
@@ -252,6 +263,8 @@ def _compare(got: torch.Tensor, ref: torch.Tensor, atol: float, rtol: float) -> 
 
 
 def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
+    if hasattr(runner, "_m"):
+        runner._m = m
     if getattr(runner, "error", None) is not None:
         runner.error.zero_()
     out = runner(x.to(runner.device), ids.to(runner.device), w.to(runner.device))
@@ -263,6 +276,7 @@ def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
         int(runner.error.item()) if getattr(runner, "error", None) is not None else None
     )
     return {
+        "eager_output": got,
         "vs_source_f32_globals": source,
         "vs_backend_f16_globals": backend_globals,
         "sticky_error": sticky,
@@ -274,41 +288,65 @@ def check_correctness(runner, bank, m, x, ids, w, atol, rtol):
     }
 
 
-def time_graph(runner, m, x, ids, w):
+def time_graph(runner, m, x, ids, w, reference: torch.Tensor, atol: float, rtol: float):
+    """Capture one MoE call in a CUDA graph and time its replay.
+
+    The captured output tensor is kept and compared with `reference` (the
+    eager output that passed the oracle) after warmup and again after the
+    timed batches; a mismatch or a sticky error invalidates the timing.
+    """
     device = runner.device
     xd, idd, wd = x.to(device), ids.to(device), w.to(device)
     runner.prepare(m)
     stream = torch.cuda.Stream(device)
+    # Input copies were enqueued on the current stream; order them first.
+    stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
         for _ in range(3):
             runner(xd, idd, wd)
     torch.accelerator.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        runner(xd, idd, wd)
+        captured = runner(xd, idd, wd)
     torch.accelerator.synchronize(device)
+
+    def replay_matches() -> dict:
+        got = captured.detach().cpu().float()
+        cmp = _compare(got, reference.float(), atol, rtol)
+        err = getattr(runner, "error", None)
+        cmp["sticky_error"] = int(err.item()) if err is not None else None
+        cmp["non_finite"] = int((~torch.isfinite(got)).sum())
+        cmp["pass"] = (
+            cmp["pass"] and cmp["sticky_error"] in (None, 0) and cmp["non_finite"] == 0
+        )
+        return cmp
+
     for _ in range(WARMUP):
         graph.replay()
     torch.accelerator.synchronize(device)
+    after_warmup = replay_matches()
     samples = []
     for _ in range(BATCHES):
-        start, end = (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-        )
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(REPLAYS_PER_BATCH):
             graph.replay()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) / REPLAYS_PER_BATCH)  # ms per call
+    after_timing = replay_matches()
     samples_sorted = sorted(samples)
+    valid = after_warmup["pass"] and after_timing["pass"]
     return {
+        "valid": valid,
+        "replay_check_after_warmup": after_warmup,
+        "replay_check_after_timing": after_timing,
         "samples_ms": samples,
-        "median_ms": statistics.median(samples),
-        "p10_ms": samples_sorted[int(0.1 * (len(samples) - 1))],
-        "p90_ms": samples_sorted[int(0.9 * (len(samples) - 1))],
-        "variance_ms2": statistics.variance(samples),
+        "median_ms": statistics.median(samples) if valid else None,
+        "p10_ms": samples_sorted[int(0.1 * (len(samples) - 1))] if valid else None,
+        "p90_ms": samples_sorted[int(0.9 * (len(samples) - 1))] if valid else None,
+        "variance_ms2": statistics.variance(samples) if valid else None,
         "n_batches": BATCHES,
         "replays_per_batch": REPLAYS_PER_BATCH,
     }
