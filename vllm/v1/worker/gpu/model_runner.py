@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import json
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -551,7 +552,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if isinstance(self.speculator, DraftModelSpeculator)
             else None
         )
-        return get_kv_cache_spec(self.vllm_config, draft_layer_names)
+        specs = get_kv_cache_spec(self.vllm_config, draft_layer_names)
+        logger.warning(
+            "KV_OWNER_SMOKE specs %s",
+            json.dumps(
+                {
+                    "draft_registered": sorted(draft_layer_names or ()),
+                    "spec_owner": {n: s.is_draft_layer for n, s in specs.items()},
+                    "speculator": type(self.speculator).__name__,
+                },
+                sort_keys=True,
+            ),
+        )
+        return specs
 
     def initialize_kv_cache(
         self,
@@ -711,6 +724,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+        logger.warning(
+            "KV_OWNER_SMOKE allocated %s",
+            json.dumps(
+                {
+                    "is_profiling": is_profiling,
+                    "num_blocks": self.kv_cache_config.num_blocks,
+                    "groups": [
+                        {
+                            "names": g.layer_names,
+                            "draft": g.is_eagle_group,
+                            "spec_type": type(g.kv_cache_spec).__name__,
+                        }
+                        for g in self.kv_cache_config.kv_cache_groups
+                    ],
+                    "allocations": [
+                        {
+                            "names": t.layers,
+                            "size": t.size,
+                            "offset": t.offset,
+                            "layer_stride": t.layer_stride,
+                            "block_stride": t.block_stride,
+                        }
+                        for t in self.kv_cache_config.kv_cache_tensors
+                    ],
+                    "initialized_layer_names": sorted(kv_caches_dict),
+                },
+                sort_keys=True,
+            ),
+        )
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -981,9 +1023,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.lora_config, self
                         ),
                     )
+                    logger.warning(
+                        "KV_OWNER_SMOKE target_capture %s",
+                        json.dumps(
+                            {
+                                "captured_token_counts": sorted(
+                                    self.cudagraph_manager.captured_token_counts()
+                                )
+                            }
+                        ),
+                    )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
+                        logger.warning(
+                            "KV_OWNER_SMOKE draft_capture_returned %s",
+                            type(self.speculator).__name__,
+                        )
                     if self.adaptive_verification is not None:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
