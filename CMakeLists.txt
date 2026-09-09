@@ -325,6 +325,17 @@ endif()
 # cumem_allocator extension
 #
 
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  define_extension_target(
+    _ple_memops
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES "csrc/ple_memops.cpp"
+    LIBRARIES CUDA::cuda_driver
+    USE_SABI 3.8
+    WITH_SOABI)
+endif()
+
 set(VLLM_CUMEM_EXT_SRC
   "csrc/cumem_allocator.cpp")
 

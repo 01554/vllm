@@ -35,6 +35,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         self._mmap_ple_modules: tuple[Qwen4ExpNGramEmbedding, ...] = ()
+        self._deferred_ple_step = False
+        self._deferred_ple_poisoned = False
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -157,6 +159,32 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         for module in modules:
             module.initialize_mmap_staging(self.max_num_tokens, self.device)
+        deferred = [m.deferred_rows for m in modules if m.deferred_rows is not None]
+        if deferred and len(deferred) != len(modules):
+            # Capture must agree with step eligibility across all mmap layers.
+            # Otherwise a capable layer would capture WAIT/H2D while the model
+            # uses synchronous preparation (which never signals its flag).
+            # Initialization precedes all prepare/capture calls, so no reader
+            # or pending producer owns these helpers yet.
+            for module in modules:
+                module.deferred_rows = None
+            logger.warning(
+                "PLE deferred unavailable on some mmap layers; "
+                "using synchronous preparation on every mmap layer"
+            )
+            deferred = []
+        if deferred:
+            pinned_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for rows in deferred
+                for tensor in (rows.ids, rows.rows, rows.flag)
+            )
+            logger.info(
+                "PLE mmap deferred enabled: %d layers, pinned_bytes=%d; "
+                "FULL graph with one real token only, eager/prefill unchanged",
+                len(deferred),
+                pinned_bytes,
+            )
 
     def _dummy_query_start_loc_and_context(
         self, num_reqs: int, num_tokens: int
@@ -215,6 +243,46 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         return context
 
+    def set_deferred_ple_step(self, eligible: bool) -> None:
+        if self._deferred_ple_poisoned:
+            raise RuntimeError("Deferred PLE is poisoned after a failed fill")
+        self._deferred_ple_step = bool(
+            eligible
+            and self._mmap_ple_modules
+            and all(m.deferred_rows is not None for m in self._mmap_ple_modules)
+        )
+
+    def abort_deferred_ple(self) -> None:
+        if not self._deferred_ple_step:
+            return
+        # Release every layer: a failed early fill must not strand a later
+        # captured WAIT. The model is permanently unusable after this point.
+        self._deferred_ple_poisoned = True
+        self._deferred_ple_step = False
+        first_error: BaseException | None = None
+        for module in self._mmap_ple_modules:
+            if module.deferred_rows is not None:
+                try:
+                    module.deferred_rows.abort()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def complete_deferred_ple(self) -> None:
+        if not self._deferred_ple_step:
+            return
+        try:
+            for module in self._mmap_ple_modules:
+                assert module.deferred_rows is not None
+                module.deferred_rows.complete()
+        except BaseException:
+            self.abort_deferred_ple()
+            raise
+        finally:
+            self._deferred_ple_step = False
+
     def prepare_inputs(
         self,
         input_batch: InputBatch,
@@ -245,14 +313,26 @@ class Qwen4ExpModelState(MambaHybridModelState):
             actual_input_ids = input_batch.input_ids[:actual_tokens]
             actual_query_start_loc = query_start_loc[: num_reqs + 1]
             actual_ngram_context = ngram_context[:num_reqs]
-            for module in self._mmap_ple_modules:
-                module.prepare_mmap_rows(
-                    actual_input_ids,
-                    actual_query_start_loc,
-                    actual_ngram_context,
-                    actual_tokens,
-                    padded_tokens,
-                )
+            try:
+                for module in self._mmap_ple_modules:
+                    if self._deferred_ple_step:
+                        module.prepare_deferred_mmap_rows(
+                            actual_input_ids,
+                            actual_query_start_loc,
+                            actual_ngram_context,
+                        )
+                    else:
+                        module.prepare_mmap_rows(
+                            actual_input_ids,
+                            actual_query_start_loc,
+                            actual_ngram_context,
+                            actual_tokens,
+                            padded_tokens,
+                        )
+            except BaseException:
+                if self._deferred_ple_step:
+                    self.abort_deferred_ple()
+                raise
         return model_inputs
 
     def prepare_dummy_inputs(
