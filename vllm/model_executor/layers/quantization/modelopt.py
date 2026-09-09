@@ -1063,6 +1063,39 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        self._cache_diag(layer, "after_setup")
+
+    def _cache_diag(self, layer: RoutedExperts, stage: str) -> None:
+        # INTEGRATION DIAGNOSTIC ONLY (not part of the PR): where do the scale
+        # tensors live at setup and at the first cached apply.
+        prov = layer.expert_weight_provider
+        fe = self.moe_kernel.fused_experts if self.moe_kernel is not None else None
+
+        def loc(t):
+            return (
+                None
+                if t is None
+                else (str(t.device), t.data_ptr(), tuple(t.shape), str(t.dtype))
+            )
+
+        logger.warning(
+            "EXPERT_CACHE_DIAG %s layer=%s provider=%s w13_scale=%s w2_scale=%s "
+            "buf_w13_scale=%s buf_w2_scale=%s fe=%s fe.w1_scale=%s fe.w2_scale=%s "
+            "fe.g1=%s cfg.w1_scale=%s w13_weight=%s",
+            stage,
+            layer.layer_name,
+            type(prov).__name__,
+            loc(getattr(layer, "w13_weight_scale", None)),
+            loc(getattr(layer, "w2_weight_scale", None)),
+            loc(getattr(prov, "buf_w13_scale", None)),
+            loc(getattr(prov, "buf_w2_scale", None)),
+            type(fe).__name__,
+            loc(getattr(fe, "w1_scale", None)),
+            loc(getattr(fe, "w2_scale", None)),
+            loc(getattr(fe, "g1_alphas", None)),
+            loc(self.moe_quant_config.w1_scale if self.moe_quant_config else None),
+            loc(getattr(layer, "w13_weight", None)),
+        )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         return make_nvfp4_moe_quant_config(
@@ -1125,6 +1158,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         provider = layer.expert_weight_provider
         if provider is not None:
+            if not getattr(self, "_diag_first_apply_done", False):
+                self._diag_first_apply_done = True
+                self._cache_diag(layer, "first_apply")
 
             def run(
                 result: ExpertWeightResult, rows: slice, include_shared: bool
