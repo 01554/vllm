@@ -281,11 +281,18 @@ def run_case(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grouped", action="store_true")
+    parser.add_argument(
+        "--with-uva",
+        action="store_true",
+        help="extra diagnostic: grouped prefill gathering from a UVA host source "
+        "(outside the device-resident backend scope)",
+    )
     args = parser.parse_args()
     if args.grouped:
         # Both FT prefill tile configurations, partial tiles, and pool row > E.
         run_case(17, 32, 16, grouped=True)
         run_case(65, 128, 32, grouped=True, physical_rows=560)
+    if args.with_uva:
         run_case(17, 64, 32, grouped=True, uva=True)
     else:
         run_case(1, 32, 16, physical_rows=560)

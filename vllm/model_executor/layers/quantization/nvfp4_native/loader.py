@@ -18,20 +18,6 @@ from __future__ import annotations
 from typing import Any
 
 
-def native_requested():
-    """Whether the tier settings select the native backend (no CUDA touched).
-
-    False inside a draft-model load: draft layers keep their stock path.
-    """
-    from .draft_scope import is_draft_load_scope
-    from .runtime import Settings
-
-    if is_draft_load_scope():
-        return False
-    settings = Settings.from_env()
-    return settings is not None and settings.moe_kernel == "native"
-
-
 def activation_name(activation):
     """The activation as the adapter's string: RoutedExperts holds the
     MoEActivation enum (value "silu"), tests and configs may hold a str."""
@@ -100,11 +86,10 @@ def prepare_native_layer(method: Any, layer: Any, replace_parameter=None):
     """Replace the Marlin conversion for one MoE layer.
 
     Keeps `w13_weight`, `w2_weight`, and both block scales as loaded,
-    replaces both global scales with per-row float16 tensors, drops the
-    input scales (BF16 activations), and marks the method so the tier
-    initializer can tell the layout. No kernel object is built here: the
-    tier runtime calls the adapter directly. `replace_parameter` defaults
-    to vLLM's (reload-aware); tests pass a plain setter.
+    replaces both global scales with per-row float16 tensors and drops the
+    input scales (BF16 activations). No kernel object is built here.
+    `replace_parameter` defaults to vLLM's (reload-aware); tests pass a
+    plain setter.
     """
     import torch
 
@@ -136,7 +121,4 @@ def prepare_native_layer(method: Any, layer: Any, replace_parameter=None):
     )
     replace_parameter(layer, "w13_input_scale", None)
     replace_parameter(layer, "w2_input_scale", None)
-    method.moe_kernel = None
-    method.moe_quant_config = None
-    method._lab_native = True
     return experts, hidden, intermediate

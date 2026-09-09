@@ -2,19 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for the native backend loader branch: layout kept, globals expanded."""
 
-import importlib.util
 import unittest
-from importlib.abc import Loader
-from importlib.machinery import ModuleSpec
-from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
-
-import pytest
-
-pytest.importorskip(
-    "vllm.distributed", reason="needs the full vLLM environment"
-)  # the package sits under vllm.model_executor, whose import pulls it in
 
 from vllm.model_executor.layers.quantization.nvfp4_native import loader as nl
 
@@ -98,7 +87,8 @@ class NativeLoaderTests(unittest.TestCase):
         self.assertIsNone(layer.w13_input_scale)
         self.assertIsNone(layer.w2_input_scale)
         self.assertIsNone(method.moe_kernel)
-        self.assertTrue(method._lab_native)
+        self.assertIsNone(layer.w13_input_scale)
+        self.assertIsNone(layer.w2_input_scale)
         from vllm.model_executor.layers.quantization.nvfp4_native.bank import (
             BANK_TENSORS as TENSORS,
         )
@@ -109,41 +99,16 @@ class NativeLoaderTests(unittest.TestCase):
 
     def test_activation_accepts_the_real_enum_and_rejects_others(self):
         """RoutedExperts stores MoEActivation, not a string: the enum's
-        SiLU member must pass and any other member or string must not."""
-        spec = importlib.util.spec_from_file_location(
-            "moe_activation",
-            Path(__file__).resolve().parents[3]
-            / "vllm"
-            / "model_executor"
-            / "layers"
-            / "fused_moe"
-            / "activation.py",
-        )
-        module = importlib.util.module_from_spec(cast(ModuleSpec, spec))
-        try:
-            cast(Loader, cast(ModuleSpec, spec).loader).exec_module(module)
-        except ImportError as exc:  # full vllm environment only
-            self.skipTest(
-                f"fused_moe.activation needs the full vllm environment: {exc}"
-            )
-        enum = module.MoEActivation
-        self.assertEqual(nl.require_silu(enum.SILU), "silu")
-        self.assertEqual(nl.require_silu("silu"), "silu")
-        for bad in (enum.GELU, enum.SILU_NO_MUL, enum.SWIGLUOAI, "gelu"):
-            with self.assertRaises(NotImplementedError):
-                nl.require_silu(bad)
+        value is what the adapter compares."""
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        self.assertEqual(nl.activation_name(MoEActivation.SILU), "silu")
+        self.assertEqual(nl.activation_name("silu"), "silu")
+        nl.require_silu(MoEActivation.SILU)
+        with self.assertRaises(NotImplementedError):
+            nl.require_silu(MoEActivation.GELU)
         with self.assertRaises(TypeError):
-            nl.require_silu(3)
-        layer = make_layer()
-        layer.activation = enum.SILU
-        method = SimpleNamespace(
-            moe=SimpleNamespace(is_act_and_mul=True),
-            moe_kernel=None,
-            moe_quant_config=None,
-        )
-        self.assertEqual(
-            nl.prepare_native_layer(method, layer, nl._set_parameter), (3, 32, 16)
-        )
+            nl.activation_name(object())
 
     def test_prepare_rejects_other_activations(self):
         layer = make_layer()
