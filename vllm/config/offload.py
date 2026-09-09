@@ -11,7 +11,7 @@ from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch"]
 MoECacheSplit = Literal["token", "expert"]
-MoECacheProvider = Literal["cached", "row"]
+MoECacheProvider = Literal["cached", "row", "pool"]
 
 
 @config
@@ -114,7 +114,11 @@ class OffloadConfig:
     """Which expert cache implementation serves moe_expert_cache_size.
     - "cached": the upstream GPU LFRU cache backed by CPU pinned memory.
     - "row": the row-level cache (staged copies on a copy stream, device
-      LRU with victim protection, publication at forward boundaries)."""
+      LRU with victim protection, publication at forward boundaries).
+    - "pool": one VRAM bank shared by all MoE layers with a device-side
+      LRU planner; no host code in the forward, so the MoE op can stay
+      inside CUDA graphs. moe_expert_cache_size is the resident rows per
+      layer at startup; the pool moves rows between layers at run time."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
