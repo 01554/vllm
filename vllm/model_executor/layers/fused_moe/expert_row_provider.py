@@ -21,7 +21,8 @@ Staged copies (this head), on CUDA:
    the resident map and refers to exactly this generation of slots.
 Pinned source rows and the slot assignments stay referenced by the
 provider until the ready event has been waited on. On CPU the same steps
-run synchronously. Re-entry from a different stream is rejected.
+run synchronously. Calls may move between streams; the release event is
+recorded on the previous caller's stream.
 """
 
 from __future__ import annotations
@@ -79,7 +80,8 @@ class RowCacheWeightProvider:
                 "cpu"
             )
         self.device = cache_device
-        self._owner_stream: int | None = None
+        self._owner_stream: torch.cuda.Stream | None = None
+        self.owner_changes = 0
         self._copy_stream: torch.cuda.Stream | None = None
         self._release_event: torch.cuda.Event | None = None
         self._ready_event: torch.cuda.Event | None = None
@@ -166,6 +168,7 @@ class RowCacheWeightProvider:
             "prepare_calls": self._prepare_calls,
             "generation": self._generation,
             "last_copies": len(self._in_flight),
+            "owner_changes": self.owner_changes,
             "slot_bytes": self.slot_bytes(),
             "host_bytes": self.host_bytes(),
         }
@@ -183,7 +186,9 @@ class RowCacheWeightProvider:
         )
 
     def invalidate(self, expert_id: int) -> None:
-        self._check_owner_stream()
+        # Does not take ownership: the reader ordering for a later reuse comes
+        # from the next prepare(), which records its release event on the
+        # stream of the last forward.
         if self.device.type == "cuda" and self._copy_stream is not None:
             # Wait for the copies that may still target this slot. This does
             # NOT wait for the previous reader on the owner stream: a freed
@@ -235,8 +240,10 @@ class RowCacheWeightProvider:
 
         Validation (capacity, range, duplicates) happens before any state
         change, including the owner-stream record and the call counter.
-        Owner-stream contract: the first accepted call records the current
-        stream; a later call from a different stream is rejected.
+        Stream contract: the release event is recorded on the stream of the
+        previous accepted call (where that forward's kernels read the slots)
+        and the ready event is awaited by the current stream, so calls may
+        move between streams (profile run, graph capture, replay).
         """
         if unique_ids is None:
             unique_ids = sorted(
@@ -258,7 +265,6 @@ class RowCacheWeightProvider:
                 f"RowCacheWeightProvider: expert ids out of range: {bad[:4]} "
                 f"(num_experts={self._num_experts})"
             )
-        self._check_owner_stream()
         self._prepare_calls += 1
         self._generation += 1
         if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
@@ -276,16 +282,18 @@ class RowCacheWeightProvider:
             )
         cuda = self.device.type == "cuda"
         if cuda:
-            owner = torch.cuda.current_stream(self.device)
+            previous, owner = self._take_owner_stream()
             if self._copy_stream is None:
                 self._copy_stream = torch.cuda.Stream(self.device)
                 self._release_event = torch.cuda.Event()
                 self._ready_event = torch.cuda.Event()
             assert self._release_event is not None and self._ready_event is not None
-            # (1) previous reader on the owner stream must finish before any
-            # slot is rewritten: record on the owner stream, wait on the copy
-            # stream.
-            self._release_event.record(owner)
+            # (1) the previous reader ran on the stream that was current at
+            # the previous prepare(); it must finish before any slot is
+            # rewritten: record there, wait on the copy stream. The consumer
+            # of this call runs on the current stream, which may differ
+            # (profile run, breakable-graph capture, replay).
+            self._release_event.record(previous)
             self._copy_stream.wait_event(self._release_event)
         copies: list[tuple[int, int]] = []
         for e in unique_ids:
@@ -362,18 +370,18 @@ class RowCacheWeightProvider:
         target.copy_(host, non_blocking=cuda)
         return target
 
-    def _check_owner_stream(self) -> None:
-        if self.device.type != "cuda":
-            return
-        current = torch.cuda.current_stream(self.device).cuda_stream
-        if self._owner_stream is None:
-            self._owner_stream = current
-        elif current != self._owner_stream:
-            raise RuntimeError(
-                "RowCacheWeightProvider: prepare() from a different stream "
-                f"(owner {self._owner_stream:#x}, current {current:#x}) is not "
-                "supported in this version"
-            )
+    def _take_owner_stream(self) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+        """Return (previous owner, current stream) and make the current stream
+        the owner. The owner is the stream the last accepted prepare() ran on,
+        i.e. where that forward's kernels read the slots."""
+        current = torch.cuda.current_stream(self.device)
+        previous = self._owner_stream
+        if previous is None:
+            previous = current
+        elif previous.cuda_stream != current.cuda_stream:
+            self.owner_changes += 1
+        self._owner_stream = current
+        return previous, current
 
     def _fill_slot(self, expert: int, slot: int) -> None:
         for name, src in self._cpu.items():

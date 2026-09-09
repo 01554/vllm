@@ -92,6 +92,15 @@ def test_event_order_on_prepare_and_invalidate():
         LOG.clear()
         p.invalidate(2)
         third = list(LOG)
+        LOG.clear()
+        other = _Stream(name="other")
+        other.cuda_stream = 0x300
+        with _use_stream(other):
+            p.prepare(torch.tensor([[0, 3]], dtype=torch.int32))  # new stream
+        fourth = list(LOG)
+        LOG.clear()
+        p.prepare(torch.tensor([[3, 1]], dtype=torch.int32))  # back on owner
+        fifth = list(LOG)
     for seq in (first, second):
         assert seq[:2] == ["release.record(owner)", "copy.wait(release)"], seq
         assert seq[2] == "enter(copy)" and "exit(copy)" in seq, seq
@@ -99,4 +108,10 @@ def test_event_order_on_prepare_and_invalidate():
     assert third == ["copy.synchronize"], (
         third
     )  # copies only; reader ordering via the next release event
-    assert p.stats()["last_copies"] == 1 and p.stats()["evictions"] == 1
+    # Owner change: the release event goes to the previous owner's stream and
+    # the new stream waits for the copies; then the roles swap back.
+    assert fourth[1:3] == ["release.record(owner)", "copy.wait(release)"], fourth
+    assert fourth[-2:] == ["other.wait(ready)", "exit(other)"], fourth
+    assert fifth[:2] == ["release.record(other)", "copy.wait(release)"], fifth
+    assert fifth[-1] == "owner.wait(ready)", fifth
+    assert p.stats()["owner_changes"] == 2
