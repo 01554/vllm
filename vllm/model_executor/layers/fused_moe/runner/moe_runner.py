@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -198,11 +199,48 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _eager_break_when_cached(fn):
+    """Make the MoE op a breakable-CUDA-graph break point for cached layers.
+
+    With an expert cache, prepare() is host code that must run eagerly
+    between graph segments. Under torch.compile that is a splitting op;
+    under breakable CUDA graphs the op is intercepted here instead, only for
+    layers that hold a provider, so uncached MoE layers stay inside the
+    segments. The output lands in the runner's capture-stable buffer
+    (_maybe_stabilize_output), satisfying the break point's in-place output
+    contract. Identity when breakable graphs are disabled.
+    """
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    breaking = eager_break_during_capture(fn)
+    if breaking is fn:
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(
+        hidden_states, router_logits, shared_experts_input, input_ids, layer_name, *rest
+    ):
+        layer = get_layer_from_name(_resolve_layer_name(layer_name))
+        target = (
+            breaking if layer.routed_experts.expert_weight_provider is not None else fn
+        )
+        return target(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            layer_name,
+            *rest,
+        )
+
+    return wrapper
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
     op_name="moe_forward",
-    op_func=_moe_forward,
+    op_func=_eager_break_when_cached(_moe_forward),
     mutates_args=["hidden_states"],
     fake_impl=_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
@@ -211,7 +249,7 @@ direct_register_custom_op(
 
 direct_register_custom_op(
     op_name="moe_forward_shared",
-    op_func=_moe_forward_shared,
+    op_func=_eager_break_when_cached(_moe_forward_shared),
     fake_impl=_moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
