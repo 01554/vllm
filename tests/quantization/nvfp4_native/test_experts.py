@@ -181,18 +181,18 @@ class NativeExpertsTests(unittest.TestCase):
             swiglu_beta=None,
         )
         self.assertIsNone(NativeNvFp4Experts._unsupported_reason(ok))
-        for field, value in (
-            ("in_dtype", torch.float16),
-            ("is_lora_enabled", True),
-            ("has_bias", True),
-            ("swiglu_limit", 7.0),
-            ("swiglu_alpha", 1.702),
-            ("swiglu_beta", 1.0),
+        for field, value, word in (
+            ("in_dtype", torch.float16, "bfloat16"),
+            ("is_lora_enabled", True, "LoRA"),
+            ("has_bias", True, "bias"),
+            ("swiglu_limit", 7.0, "swiglu_limit"),
+            ("swiglu_alpha", 1.702, "swiglu_alpha"),
+            ("swiglu_beta", 1.0, "swiglu_beta"),
         ):
             bad = SimpleNamespace(**{**vars(ok), field: value})
             reason = NativeNvFp4Experts._unsupported_reason(bad)
             self.assertIsNotNone(reason, field)
-            self.assertIn(field.split("_")[0], reason.replace("activations", "in"))
+            self.assertIn(word, reason)
 
     def test_quant_config_activation_parameters_are_rejected(self):
         experts = make_experts()
