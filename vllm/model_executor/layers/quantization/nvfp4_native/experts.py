@@ -160,7 +160,8 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
             )
         act = activation_name(activation)
         ids = topk_ids.to(torch.int32).contiguous()
-        weights = topk_weights.to(hidden_states.dtype).contiguous()
+        # The adapters require FP32 router weights.
+        weights = topk_weights.to(torch.float32).contiguous()
         if hidden_states.shape[0] <= self.gemv_rows:
             assert self._decode_workspace is not None
             result = native_bank.gemv(

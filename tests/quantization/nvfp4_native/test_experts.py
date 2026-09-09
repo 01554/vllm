@@ -123,6 +123,15 @@ class NativeExpertsTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out, reference))
 
+    def test_router_weights_are_passed_as_fp32(self):
+        # The adapters reject non-FP32 router weights; apply converts.
+        experts = make_experts(gemv_rows=1)
+        experts.process_weights_after_loading(self.layer)
+        self.weights = self.weights.to(torch.bfloat16)
+        out = self.run_apply(experts, 1)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(out.float()).all())
+
     def test_rejects_unsupported_calls(self):
         experts = make_experts()
         with self.assertRaises(RuntimeError):
