@@ -25,14 +25,25 @@ from vllm.config import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    check_marlin_supported,
+)
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import (
     init_workspace_manager,
     is_workspace_manager_initialized,
 )
 
-pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required"),
+    pytest.mark.skipif(
+        current_platform.is_cuda()
+        and not check_marlin_supported(scalar_types.float4_e2m1f, group_size=16),
+        reason="Marlin NVFP4 (float4_e2m1f, group 16) not supported on this GPU",
+    ),
+]
 
 E, K, N, TOP_K, CAPACITY, M = 8, 256, 128, 2, 4, 8
 
@@ -85,25 +96,24 @@ def _quantized_weights(device):
 
 def _make_layer(cfg: VllmConfig, params: dict[str, torch.Tensor]):
     with set_current_vllm_config(cfg):
-        try:
-            layer = FusedMoEFactory(
-                num_experts=E,
-                top_k=TOP_K,
-                hidden_size=K,
-                intermediate_size=N,
-                params_dtype=torch.bfloat16,
-                renormalize=False,
-                quant_config=ModelOptNvFp4Config(
-                    is_checkpoint_nvfp4_serialized=True,
-                    kv_cache_quant_algo=None,
-                    exclude_modules=[],
-                ),
-                tp_size=1,
-                dp_size=1,
-                prefix="from_forward_context",
-            )
-        except ValueError as e:  # Marlin NVFP4 backend not usable here
-            pytest.skip(f"NVFP4 Marlin backend unavailable: {e}")
+        # Any construction error is a failure: the Marlin capability gate is
+        # the module-level skip above, and the backend is pinned to "marlin".
+        layer = FusedMoEFactory(
+            num_experts=E,
+            top_k=TOP_K,
+            hidden_size=K,
+            intermediate_size=N,
+            params_dtype=torch.bfloat16,
+            renormalize=False,
+            quant_config=ModelOptNvFp4Config(
+                is_checkpoint_nvfp4_serialized=True,
+                kv_cache_quant_algo=None,
+                exclude_modules=[],
+            ),
+            tp_size=1,
+            dp_size=1,
+            prefix="from_forward_context",
+        )
         for name, value in params.items():
             layer.routed_experts.register_parameter(
                 name, torch.nn.Parameter(value.clone(), requires_grad=False)
