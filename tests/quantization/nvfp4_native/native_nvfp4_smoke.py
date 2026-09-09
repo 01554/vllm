@@ -8,37 +8,10 @@ This checks arithmetic against an independent dense CPU oracle, not performance.
 """
 
 import argparse
-import importlib.util
-import sys
-from importlib.abc import Loader
-from importlib.machinery import ModuleSpec
-from pathlib import Path
-from typing import cast
 
 import torch
 
-# The kernels depend on torch only; load the package by file location so the
-# CPU tests do not import vllm.model_executor (distributed/CUDA stack).
-_PKG = (
-    Path(__file__).resolve().parents[3]
-    / "vllm"
-    / "model_executor"
-    / "layers"
-    / "quantization"
-    / "nvfp4_native"
-)
-if "nvfp4_native" not in sys.modules:
-    _spec = cast(
-        ModuleSpec,
-        importlib.util.spec_from_file_location(
-            "nvfp4_native", _PKG / "__init__.py", submodule_search_locations=[str(_PKG)]
-        ),
-    )
-    _pkg = importlib.util.module_from_spec(_spec)
-    sys.modules[_spec.name] = _pkg
-    cast(Loader, _spec.loader).exec_module(_pkg)
-
-from nvfp4_native import bank as native  # noqa: E402
+from vllm.model_executor.layers.quantization.nvfp4_native import bank as native
 
 
 def dense(bank, prefix):
@@ -131,7 +104,10 @@ def run_case(
     )
     operation, allocator = native.gemv, native.allocate_workspace
     if grouped:
-        from nvfp4_native.prefill import allocate_workspace, prefill
+        from vllm.model_executor.layers.quantization.nvfp4_native.prefill import (
+            allocate_workspace,
+            prefill,
+        )
 
         operation, allocator = prefill, allocate_workspace
     workspace = allocator(bank, tokens, 4, num_experts=4)

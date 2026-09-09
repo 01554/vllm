@@ -2,38 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native layout, rounding and routing contracts without a CUDA dependency."""
 
-import importlib.util
-import sys
 import unittest
-from importlib.abc import Loader
-from importlib.machinery import ModuleSpec
-from pathlib import Path
-from typing import cast
 
+import pytest
 import torch
 
-# The kernels depend on torch only; load the package by file location so the
-# CPU tests do not import vllm.model_executor (distributed/CUDA stack).
-_PKG = (
-    Path(__file__).resolve().parents[3]
-    / "vllm"
-    / "model_executor"
-    / "layers"
-    / "quantization"
-    / "nvfp4_native"
-)
-if "nvfp4_native" not in sys.modules:
-    _spec = cast(
-        ModuleSpec,
-        importlib.util.spec_from_file_location(
-            "nvfp4_native", _PKG / "__init__.py", submodule_search_locations=[str(_PKG)]
-        ),
-    )
-    _pkg = importlib.util.module_from_spec(_spec)
-    sys.modules[_spec.name] = _pkg
-    cast(Loader, _spec.loader).exec_module(_pkg)
+pytest.importorskip(
+    "vllm.distributed", reason="needs the full vLLM environment"
+)  # the package sits under vllm.model_executor, whose import pulls it in
 
-from native_nvfp4_smoke import native, oracle  # noqa: E402
+from tests.quantization.nvfp4_native.native_nvfp4_smoke import native, oracle
 
 
 def make_bank():
@@ -215,13 +193,15 @@ class NativePrefillTests(NativeNVFP4Tests):
     """
 
     def setUp(self):
-        from nvfp4_native.prefill import allocate_workspace
+        from vllm.model_executor.layers.quantization.nvfp4_native.prefill import (
+            allocate_workspace,
+        )
 
         super().setUp()
         self.workspace = allocate_workspace(self.bank, 3, 4, num_experts=3)
 
     def run_native(self):
-        from nvfp4_native.prefill import prefill
+        from vllm.model_executor.layers.quantization.nvfp4_native.prefill import prefill
 
         return prefill(
             self.x, self.weights, self.ids, self.bank, self.mapping, self.workspace

@@ -3,7 +3,6 @@
 """CPU tests for the native backend loader branch: layout kept, globals expanded."""
 
 import importlib.util
-import sys
 import unittest
 from importlib.abc import Loader
 from importlib.machinery import ModuleSpec
@@ -11,28 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
-# The kernels depend on torch only; load the package by file location so the
-# CPU tests do not import vllm.model_executor (distributed/CUDA stack).
-_PKG = (
-    Path(__file__).resolve().parents[3]
-    / "vllm"
-    / "model_executor"
-    / "layers"
-    / "quantization"
-    / "nvfp4_native"
-)
-if "nvfp4_native" not in sys.modules:
-    _spec = cast(
-        ModuleSpec,
-        importlib.util.spec_from_file_location(
-            "nvfp4_native", _PKG / "__init__.py", submodule_search_locations=[str(_PKG)]
-        ),
-    )
-    _pkg = importlib.util.module_from_spec(_spec)
-    sys.modules[_spec.name] = _pkg
-    cast(Loader, _spec.loader).exec_module(_pkg)
+import pytest
 
-from nvfp4_native import loader as nl  # noqa: E402
+pytest.importorskip(
+    "vllm.distributed", reason="needs the full vLLM environment"
+)  # the package sits under vllm.model_executor, whose import pulls it in
+
+from vllm.model_executor.layers.quantization.nvfp4_native import loader as nl
 
 try:
     import torch
@@ -91,7 +75,9 @@ class NativeLoaderTests(unittest.TestCase):
             nl.native_bank_shapes(layer.w13_weight, layer.w2_weight[:, :16])
 
     def test_prepare_keeps_raw_banks_and_marks_the_method(self):
-        from nvfp4_native import bank as native_nvfp4
+        from vllm.model_executor.layers.quantization.nvfp4_native import (
+            bank as native_nvfp4,
+        )
 
         layer = make_layer()
         packed_ptr = layer.w13_weight.data_ptr()
@@ -113,7 +99,9 @@ class NativeLoaderTests(unittest.TestCase):
         self.assertIsNone(layer.w2_input_scale)
         self.assertIsNone(method.moe_kernel)
         self.assertTrue(method._lab_native)
-        from nvfp4_native.bank import BANK_TENSORS as TENSORS
+        from vllm.model_executor.layers.quantization.nvfp4_native.bank import (
+            BANK_TENSORS as TENSORS,
+        )
 
         bank = {name: getattr(layer, name).data for name in TENSORS}
         # The prepared layer is a valid adapter bank as is.
@@ -124,7 +112,8 @@ class NativeLoaderTests(unittest.TestCase):
         SiLU member must pass and any other member or string must not."""
         spec = importlib.util.spec_from_file_location(
             "moe_activation",
-            _PKG.parents[3]
+            Path(__file__).resolve().parents[3]
+            / "vllm"
             / "model_executor"
             / "layers"
             / "fused_moe"
