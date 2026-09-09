@@ -17,7 +17,7 @@ def make_provider(capacity=2, experts=4):
     g13 = torch.arange(experts, dtype=torch.float32).reshape(experts, 1).repeat(1, 2)
     g2 = torch.arange(experts, dtype=torch.float32)
     return RowCacheWeightProvider(
-        capacity, w13, w2, s13, s2, w13_scale_2=g13, w2_scale_2=g2
+        capacity, w13, w2, s13, s2, w13_scale_2=g13, w2_scale_2=g2, device="cpu"
     ), (w13, w2)
 
 
@@ -71,3 +71,27 @@ def test_overflow_and_invalidate():
     p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
     p.invalidate(0)
     assert int(p.expert_map[0]) == -1 and p.stats()["resident"] == 1
+
+
+def test_single_token_over_capacity_is_rejected_even_after_a_flush():
+    p, _ = make_provider(capacity=2)
+    ids = torch.tensor([[0, -1, -1], [1, 2, 3]], dtype=torch.int32)
+    try:
+        p.plan_chunks(ids)
+        raise AssertionError("expected a capacity error for token 1")
+    except RuntimeError as exc:
+        assert "token 1" in str(exc)
+
+
+def test_explicit_ids_are_validated_before_any_mutation():
+    p, _ = make_provider(capacity=2)
+    p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
+    before = p.stats()
+    for bad in ([-1], [4], [1, 1]):
+        try:
+            p.prepare(torch.empty((1, 2), dtype=torch.int32), bad)
+            raise AssertionError(f"expected rejection for {bad}")
+        except ValueError:
+            pass
+    assert p.stats() == before
+    assert sorted(int(e) for e in torch.nonzero(p.expert_map >= 0).flatten()) == [0, 1]

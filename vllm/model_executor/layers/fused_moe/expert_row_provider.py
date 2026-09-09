@@ -38,6 +38,7 @@ class RowCacheWeightProvider:
         *,
         w13_scale_2: torch.Tensor | None = None,
         w2_scale_2: torch.Tensor | None = None,
+        device: torch.device | str | None = None,
     ):
         if capacity <= 0:
             raise ValueError("capacity must be positive")
@@ -49,14 +50,18 @@ class RowCacheWeightProvider:
         self.promotions = 0
         self.evictions = 0
         self._prepare_calls = 0
-        device = (
-            torch.accelerator.current_accelerator()
-            if w13_weight.device.type == "cpu"
-            else w13_weight.device
-        )
-        if device is None:
-            device = torch.device("cpu")
-        self.device = device
+        cache_device: torch.device
+        if device is not None:
+            cache_device = torch.device(device)
+        elif w13_weight.device.type != "cpu":
+            cache_device = w13_weight.device
+        else:
+            # CPU-resident source weights: the cache lives on the current
+            # accelerator; tests pass device="cpu" explicitly.
+            cache_device = torch.accelerator.current_accelerator() or torch.device(
+                "cpu"
+            )
+        self.device = cache_device
         self._owner_stream: int | None = None
 
         def host(t: torch.Tensor | None) -> torch.Tensor | None:
@@ -64,7 +69,7 @@ class RowCacheWeightProvider:
                 return None
             return (
                 _pinned_cpu_copy(t)
-                if device.type == "cuda"
+                if cache_device.type == "cuda"
                 else t.detach().cpu().contiguous()
             )
 
@@ -81,14 +86,14 @@ class RowCacheWeightProvider:
                 None
                 if src is None
                 else torch.empty(
-                    (capacity, *src.shape[1:]), dtype=src.dtype, device=device
+                    (capacity, *src.shape[1:]), dtype=src.dtype, device=cache_device
                 )
             )
             for name, src in self._cpu.items()
         }
         # global expert id -> slot, -1 when not resident
         self._map = torch.full(
-            (self._num_experts,), -1, dtype=torch.int32, device=device
+            (self._num_experts,), -1, dtype=torch.int32, device=cache_device
         )
         self._map_host = [-1] * self._num_experts
         self._lru: OrderedDict[int, int] = OrderedDict()  # expert -> slot, LRU order
@@ -151,12 +156,12 @@ class RowCacheWeightProvider:
         rows = ids.shape[0]
         for r in range(rows):
             row_ids = {int(e) for e in ids[r].tolist() if e >= 0}
+            if len(row_ids) > self.capacity:
+                raise RuntimeError(
+                    f"RowCacheWeightProvider: token {r} routes to "
+                    f"{len(row_ids)} experts but capacity is {self.capacity}"
+                )
             if len(seen | row_ids) > self.capacity:
-                if not seen:
-                    raise RuntimeError(
-                        f"RowCacheWeightProvider: a single token routes to "
-                        f"{len(row_ids)} experts but capacity is {self.capacity}"
-                    )
                 plan.append((slice(start, r), sorted(seen)))
                 start, seen = r, set()
             seen |= row_ids
@@ -192,6 +197,16 @@ class RowCacheWeightProvider:
                 f"requested but capacity is {self.capacity}"
             )
         needed = set(unique_ids)
+        if len(needed) != len(unique_ids):
+            raise ValueError(
+                "RowCacheWeightProvider: duplicate expert ids in unique_ids"
+            )
+        bad = [e for e in unique_ids if not (0 <= e < self._num_experts)]
+        if bad:
+            raise ValueError(
+                f"RowCacheWeightProvider: expert ids out of range: {bad[:4]} "
+                f"(num_experts={self._num_experts})"
+            )
         for e in unique_ids:
             if e in self._lru:
                 self._lru.move_to_end(e)
