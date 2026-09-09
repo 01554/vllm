@@ -261,11 +261,54 @@ def test_scale_lifecycle():
     torch.testing.assert_close(provider.buf_w2_scale[slot_7].cpu(), w2_s[7])
 
 
+def test_scale_2_lifecycle():
+    """Per-expert global scales follow the slot through fill, eviction, reuse."""
+    provider, _, _, _ = _make_provider(capacity=2, with_scales=True)
+    assert provider.buf_w13_scale_2 is None and provider.buf_w2_scale_2 is None
+    set_random_seed(42)
+    w13, w2 = _make_weights(8, torch.bfloat16)
+    w13_s, w2_s = _make_scales(8)
+    g13 = torch.rand(8, 2, dtype=torch.float32)  # gate/up globals per expert
+    g2 = torch.rand(8, 1, dtype=torch.float32)
+    provider = CachedWeightProvider(
+        2, w13, w2, w13_s, w2_s, w13_scale_2=g13, w2_scale_2=g2
+    )
+    assert provider.buf_w13_scale_2 is not None
+    assert provider.buf_w2_scale_2 is not None
+    assert provider.buf_w13_scale_2.shape == (2, 2)
+    assert provider.buf_w2_scale_2.shape == (2, 1)
+    result = provider.prepare(_topk([0, 1]))
+    for eid in (0, 1):
+        slot = int(result.expert_map[eid])
+        torch.testing.assert_close(provider.buf_w13_scale_2[slot].cpu(), g13[eid])
+        torch.testing.assert_close(provider.buf_w2_scale_2[slot].cpu(), g2[eid])
+        torch.testing.assert_close(result.w1_scale[slot].cpu(), w13_s[eid])
+    slot_0 = int(result.expert_map[0])
+    result = provider.prepare(_topk([1, 5]))  # evicts 0; 5 reuses its slot
+    assert int(result.expert_map[5]) == slot_0
+    torch.testing.assert_close(provider.buf_w13_scale_2[slot_0].cpu(), g13[5])
+    torch.testing.assert_close(provider.buf_w2_scale_2[slot_0].cpu(), g2[5])
+    assert result.w1_scale is provider.buf_w13_scale  # result surface unchanged
+    assert not hasattr(result, "w1_scale_2")
+
+
+def test_scale_2_validation():
+    w13, w2 = _make_weights(8, torch.bfloat16)
+    with pytest.raises(ValueError, match="together"):
+        CachedWeightProvider(2, w13, w2, w13_scale_2=torch.rand(8, 2))
+    with pytest.raises(ValueError, match="rows"):
+        CachedWeightProvider(
+            2, w13, w2, w13_scale_2=torch.rand(7, 2), w2_scale_2=torch.rand(8, 1)
+        )
+
+
 def test_no_scales_when_not_provided():
     """Without scale inputs, scale buffers remain None."""
     provider, *_ = _make_provider()
     assert provider.buf_w13_scale is None
     assert provider.buf_w2_scale is None
+    assert provider.buf_w13_scale_2 is None
+    assert provider.buf_w2_scale_2 is None
     result = provider.prepare(_topk([0]))
     assert result.w1_scale is None
     assert result.w2_scale is None
