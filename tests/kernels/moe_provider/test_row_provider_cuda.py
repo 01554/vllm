@@ -86,9 +86,8 @@ class GraphReader:
         self.tensors = tensors
 
         def body():
-            for _ in range(DELAY_MATMULS // 2):
+            for _ in range(DELAY_MATMULS):  # constant input, no feedback
                 torch.matmul(self.a, self.a, out=self.b)
-                torch.matmul(self.b, self.b, out=self.a)
             self.acc.zero_()
             for t in self.tensors:
                 self.acc.add_(t.reshape(-1).view(torch.uint8).float().sum())
@@ -103,7 +102,6 @@ class GraphReader:
         with torch.cuda.graph(self.graph, stream=side):
             body()
         torch.accelerator.synchronize(device)
-        self.a.fill_(1e-3)
 
     def replay(self, n=REPLAYS):
         for _ in range(n):
@@ -134,6 +132,8 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     slot0 = int(r1.expert_map[0])
     owner = torch.cuda.current_stream(p.device)
     names = ("w13", "w2", "w13_scale", "w2_scale", "w13_scale_2", "w2_scale_2")
+    ref = ref_sum([src[n][0] for n in names])
+    assert not torch.equal(ref, ref_sum([src[n][2] for n in names]))
     reader = GraphReader([getattr(p, f"buf_{n}")[slot0] for n in names], p.device)
     reader_done = torch.cuda.Event()
     read0 = reader.replay()  # reads all six slot tensors of expert 0
@@ -154,7 +154,6 @@ def test_eviction_reuse_bytes_and_previous_reader_output():
     want = src_bytes(src, 2)
     for name in want:
         assert torch.equal(got[name], want[name]), name
-    ref = ref_sum([src[n][0] for n in names])
     assert torch.equal(read0.cpu(), ref)  # the reader saw expert 0, never the overwrite
     assert p.stats()["evictions"] == 1 and p.stats()["last_copies"] == 1
 
@@ -186,6 +185,7 @@ def test_invalidate_then_prepare_orders_reuse_behind_the_previous_reader():
     r1 = p.prepare(torch.tensor([[0, 1]], dtype=torch.int32))
     slot1 = int(r1.expert_map[1])
     owner = torch.cuda.current_stream(p.device)
+    assert not torch.equal(ref_sum([src["w13"][1]]), ref_sum([src["w13"][3]]))
     reader = GraphReader([p.buf_w13[slot1]], p.device)
     reader_done = torch.cuda.Event()
     read1 = reader.replay()
