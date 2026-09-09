@@ -38,6 +38,45 @@ from .loader import activation_name
 # Rows at or below this count take the decode GEMV; above it, grouped prefill.
 DEFAULT_GEMV_ROWS = 1
 
+# Scratch is shared by every layer with the same bank shape and capacities:
+# layers run sequentially on one stream, and per-layer copies would cost
+# hundreds of MiB each at prefill batch sizes (e.g. ~390 MiB per layer at
+# 4096 tokens x top-10 on a 2560/640 model, ~18 GiB over 48 layers).
+_DECODE_WORKSPACES: dict[tuple, native_bank.Workspace] = {}
+_PREFILL_WORKSPACES: dict[tuple, native_prefill.Workspace] = {}
+
+
+def _workspace_key(bank: native_bank.Bank, max_tokens: int, top_k: int) -> tuple:
+    rows, hidden, intermediate = native_bank.validate_bank(bank)
+    device = bank["w13_weight"].device
+    return (str(device), rows, hidden, intermediate, max_tokens, top_k)
+
+
+def shared_decode_workspace(
+    bank: native_bank.Bank, max_tokens: int, top_k: int
+) -> native_bank.Workspace:
+    key = _workspace_key(bank, max_tokens, top_k)
+    workspace = _DECODE_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = native_bank.allocate_workspace(
+            bank, max_tokens, top_k, num_experts=key[1]
+        )
+        _DECODE_WORKSPACES[key] = workspace
+    return workspace
+
+
+def shared_prefill_workspace(
+    bank: native_bank.Bank, max_tokens: int, top_k: int
+) -> native_prefill.Workspace:
+    key = _workspace_key(bank, max_tokens, top_k)
+    workspace = _PREFILL_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = native_prefill.allocate_workspace(
+            bank, max_tokens, top_k, num_experts=key[1]
+        )
+        _PREFILL_WORKSPACES[key] = workspace
+    return workspace
+
 
 class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
     """Raw-layout NVFP4 experts (no repack) for ModelOpt checkpoints."""
@@ -108,11 +147,9 @@ class NativeNvFp4Experts(mk.FusedMoEExpertsModular):
         self._step_map = torch.arange(
             rows, dtype=torch.int32, device=bank["w13_weight"].device
         )
-        self._decode_workspace = native_bank.allocate_workspace(
-            bank, self.gemv_rows, top_k, num_experts=rows
-        )
-        self._prefill_workspace = native_prefill.allocate_workspace(
-            bank, self.moe_config.max_num_tokens, top_k, num_experts=rows
+        self._decode_workspace = shared_decode_workspace(bank, self.gemv_rows, top_k)
+        self._prefill_workspace = shared_prefill_workspace(
+            bank, self.moe_config.max_num_tokens, top_k
         )
 
     def workspace_shapes(

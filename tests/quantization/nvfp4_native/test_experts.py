@@ -132,6 +132,16 @@ class NativeExpertsTests(unittest.TestCase):
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.isfinite(out.float()).all())
 
+    def test_workspaces_are_shared_across_layers_with_the_same_shape(self):
+        a, b = make_experts(), make_experts()
+        a.process_weights_after_loading(self.layer)
+        b.process_weights_after_loading(self.layer)
+        self.assertIs(a._prefill_workspace, b._prefill_workspace)
+        self.assertIs(a._decode_workspace, b._decode_workspace)
+        c = make_experts(max_num_tokens=16)
+        c.process_weights_after_loading(self.layer)
+        self.assertIsNot(a._prefill_workspace, c._prefill_workspace)
+
     def test_rejects_unsupported_calls(self):
         experts = make_experts()
         with self.assertRaises(RuntimeError):
