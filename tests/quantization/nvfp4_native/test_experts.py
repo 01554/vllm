@@ -229,11 +229,11 @@ class NativeExpertsTests(unittest.TestCase):
             for rows in (1, 3):  # gemv path, then prefill path
                 want = self.run_apply(experts, rows)
                 got = kernel.apply(
-                    self.x[:rows],
-                    self.bank["w13_weight"],
-                    self.bank["w2_weight"],
-                    self.ids[:rows],
-                    self.weights[:rows],
+                    hidden_states=self.x[:rows],
+                    w1=self.bank["w13_weight"],
+                    w2=self.bank["w2_weight"],
+                    topk_weights=self.weights[:rows],
+                    topk_ids=self.ids[:rows],
                     activation=MoEActivation.SILU,
                     global_num_experts=3,
                     expert_map=None,
