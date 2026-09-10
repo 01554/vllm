@@ -268,12 +268,14 @@ def test_decode_graph_capture_and_replay_match_eager(dist_env):  # noqa: F811
         torch.cuda.graph(graph, stream=stream),
     ):
         out_static = pls[0].apply(x_static, w_static, ids_static)
-    # Mirror the two warm-up steps on the twin so placements agree.
+    # Mirror only the two warm-up steps on the twin: capture records the
+    # kernels without executing them, so the placements agree here.
     with set_forward_context(None, tcfgs[0], num_tokens=1):
         for _ in range(2):
             tpls[0].apply(x_static, w_static, ids_static)
-        tpls[0].apply(x_static, w_static, ids_static)  # the capture's own step
     torch.accelerator.synchronize(device)
+    for name in ("hot_phys", "row_key"):
+        assert torch.equal(getattr(pool.tables, name), getattr(twin.tables, name))
     for order in ([3, 4], [7, 0], [0, 0], [6, 1]):
         x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
         ids = torch.tensor([order], dtype=torch.int32, device=device)
@@ -285,12 +287,133 @@ def test_decode_graph_capture_and_replay_match_eager(dist_env):  # noqa: F811
         torch.accelerator.synchronize(device)
         torch.testing.assert_close(out_static, want, rtol=2e-2, atol=2e-2)
         assert bool(pool.tables.ok[0]) and bool(twin.tables.ok[0])
+        # The replayed step moved the placement exactly as the eager step.
+        for name in ("hot_phys", "row_key"):
+            assert torch.equal(getattr(pool.tables, name), getattr(twin.tables, name))
+        assert torch.equal(pls[0].buffers.step_map, tpls[0].buffers.step_map)
+        assert torch.equal(pls[0].buffers.safe_ids, tpls[0].buffers.safe_ids)
+
+
+def test_step_graph_keeps_the_error_sticky_across_replays(dist_env):  # noqa: F811
+    """The planner step alone (no consumer, so no assertion fires) captured
+    in a CUDA graph: a replay with an invalid id sets the sticky error, a
+    later clean replay keeps it, clear_error resets it, and the placement
+    matches a twin stepped with padding throughout."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
+        check_global_tables,
+        clear_error,
+        step,
+    )
+
+    device = torch.accelerator.current_accelerator()
+    pool, pls, _ = _three_layer_pool(device)
+    twin, tpls, _ = _three_layer_pool(device)
+    ids_static = torch.tensor([[1, 2]], dtype=torch.int32, device=device)
+    w_static = torch.full((1, TOP_K), 0.5, dtype=torch.float32, device=device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step(pool.tables, 0, ids_static, pls[0].buffers, w_static)
+    torch.cuda.current_stream().wait_stream(stream)
+    step(twin.tables, 0, ids_static, tpls[0].buffers, w_static)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step(pool.tables, 0, ids_static, pls[0].buffers, w_static)
+    torch.accelerator.synchronize(device)
+
+    def replay(ids, twin_ids):
+        ids_static.copy_(torch.tensor([ids], dtype=torch.int32, device=device))
+        graph.replay()
+        step(
+            twin.tables,
+            0,
+            torch.tensor([twin_ids], dtype=torch.int32, device=device),
+            tpls[0].buffers,
+            w_static,
+        )
+        torch.accelerator.synchronize(device)
+        for name in ("hot_phys", "row_key"):
+            assert torch.equal(getattr(pool.tables, name), getattr(twin.tables, name))
+        assert torch.equal(pls[0].buffers.safe_ids, tpls[0].buffers.safe_ids)
+
+    replay([3, 4], [3, 4])
+    assert bool(pool.tables.ok[0])
+    replay([E + 5, 4], [-1, 4])  # invalid lane: padding for the twin
+    assert int(pool.tables.error[0]) == 1 and not bool(pool.tables.ok[0])
+    replay([5, 6], [5, 6])  # clean replay keeps the sticky error
+    assert int(pool.tables.error[0]) == 1 and not bool(pool.tables.ok[0])
+    with pytest.raises(RuntimeError):
+        check_global_tables(pool.tables)
+    clear_error(pool.tables)
+    replay([7, 0], [7, 0])
+    assert bool(pool.tables.ok[0])
+    check_global_tables(pool.tables)
+
+
+def test_consumer_with_clamp_activation_only_sees_sanitized_routes(
+    dist_env,  # noqa: F811
+):
+    """The activation path with a clamp limit indexes the step map by
+    expert id (masked only by >= 0). The consumer receives the kernel's
+    safe_ids, so a step with an out-of-range or negative id produces the
+    same output as the same step with that lane as padding (the oracle);
+    checked by calling the consumer directly, without the assertion."""
+    import dataclasses
+
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
+        clear_error,
+        step,
+    )
+
+    device = torch.accelerator.current_accelerator()
+    pool, pls, _ = _three_layer_pool(device)
+    twin, tpls, _ = _three_layer_pool(device)
+    for p in (pls[0], tpls[0]):
+        cfg = p.experts.activation_config
+        p.experts.activation_config = dataclasses.replace(cfg, clamp_limit=7.0)
+    x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
+    w = torch.full((1, TOP_K), 0.5, dtype=torch.float32, device=device)
+    for bad, oracle in (
+        ([E + 3, 2], [-1, 2]),
+        ([1, -9], [1, -1]),
+        ([E + 1, E + 2], [-1, -1]),
+    ):
+        ids = torch.tensor([bad], dtype=torch.int32, device=device)
+        step(pool.tables, 0, ids, pls[0].buffers, w)
+        step(
+            twin.tables,
+            0,
+            torch.tensor([oracle], dtype=torch.int32, device=device),
+            tpls[0].buffers,
+            w,
+        )
+        safe = pls[0].buffers.safe_ids[: ids.numel()].view(ids.shape)
+        got = pls[0]._run_marlin(
+            x,
+            w,
+            safe,
+            ((pls[0].bank, pls[0].buffers.step_map, pls[0].bank_rows),),
+            decode=True,
+        )
+        want = tpls[0]._run_marlin(
+            x,
+            w,
+            torch.tensor([oracle], dtype=torch.int32, device=device),
+            ((tpls[0].bank, tpls[0].buffers.step_map, tpls[0].bank_rows),),
+            decode=True,
+        )
+        torch.accelerator.synchronize(device)
+        assert safe.tolist() == [oracle]
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert int(pool.tables.error[0]) == 1
+        clear_error(pool.tables)
 
 
 ASSERT_CASES = {
     "first_layer_oob_id": (0, [E + 3, 2], [0.5, 0.5], "eager"),
     "middle_layer_nan_weight": (1, [1, 2], [float("nan"), 0.5], "eager"),
     "last_layer_negative_id": (2, [1, -9], [0.5, 0.5], "eager"),
+    "single_layer_partial_oob_id": (1, [E + 3, 2], [0.5, 0.5], "single"),
     "graph_replay_oob_id": (0, [E + 3, 2], [0.5, 0.5], "graph"),
 }
 
@@ -322,6 +445,30 @@ def _run_assert_case(name):
     torch.accelerator.synchronize(device)
     ids = torch.tensor([bad_ids], dtype=torch.int32, device=device)
     w = torch.tensor([bad_w], dtype=torch.float32, device=device)
+    # Clean setup, capture and clean replay run outside the guarded region:
+    # any failure there is a real failure of this test.
+    graph = None
+    ids_static = None
+    if mode == "graph":
+        ids_static = good_ids.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with (
+            torch.cuda.stream(stream),
+            set_forward_context(None, cfgs[0], num_tokens=1),
+        ):
+            pls[0].apply(x, good_w, ids_static)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with (
+            set_forward_context(None, cfgs[0], num_tokens=1),
+            torch.cuda.graph(graph, stream=stream),
+        ):
+            pls[0].apply(x, good_w, ids_static)
+        graph.replay()
+        torch.accelerator.synchronize(device)  # clean replay passes
+    # Only the invalid input and its synchronization may raise, and only
+    # with the device-side assertion; anything else is a failure.
     try:
         if mode == "eager":
             for i in range(3):
@@ -332,30 +479,23 @@ def _run_assert_case(name):
                         ids if i == bad_layer else good_ids,
                     )
             torch.accelerator.synchronize(device)
+        elif mode == "single":
+            # Partial execution: one non-final layer, then synchronize.
+            with set_forward_context(None, cfgs[bad_layer], num_tokens=1):
+                pls[bad_layer].apply(x, w, ids)
+            torch.accelerator.synchronize(device)
         else:
-            ids_static = good_ids.clone()
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with (
-                torch.cuda.stream(stream),
-                set_forward_context(None, cfgs[0], num_tokens=1),
-            ):
-                pls[0].apply(x, good_w, ids_static)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with (
-                set_forward_context(None, cfgs[0], num_tokens=1),
-                torch.cuda.graph(graph, stream=stream),
-            ):
-                pls[0].apply(x, good_w, ids_static)
-            graph.replay()
-            torch.accelerator.synchronize(device)  # clean replay passes
+            assert graph is not None and ids_static is not None
             ids_static.copy_(ids)  # invalid input into the captured buffer
             graph.replay()
             torch.accelerator.synchronize(device)
     except RuntimeError as exc:
-        print(f"expected failure: {str(exc)[:160]}")
-        return 0
+        text = str(exc)
+        if "device-side assert" in text or "Expert pool: invalid routing" in text:
+            print(f"expected device assertion: {text[:160]}")
+            return 0
+        print(f"unexpected error: {text[:300]}")
+        return 4
     print("no failure raised")
     return 3
 
@@ -376,7 +516,7 @@ def test_invalid_routing_fails_at_synchronization_in_a_subprocess(
         timeout=600,
     )
     assert proc.returncode == 0, (name, proc.stdout[-2000:], proc.stderr[-2000:])
-    assert "expected failure" in proc.stdout
+    assert "expected device assertion" in proc.stdout
 
 
 if __name__ == "__main__":
