@@ -500,6 +500,17 @@ def _run_assert_case(name):
     return 3
 
 
+def _exit_now(code):
+    """After a device assertion the CUDA context is poisoned and interpreter
+    teardown can abort (SIGABRT); the verdict is already printed, so leave
+    without running any destructor."""
+    import os
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 @pytest.mark.parametrize("name", sorted(ASSERT_CASES))
 def test_invalid_routing_fails_at_synchronization_in_a_subprocess(
     dist_env,  # noqa: F811
@@ -515,7 +526,7 @@ def test_invalid_routing_fails_at_synchronization_in_a_subprocess(
         text=True,
         timeout=600,
     )
-    assert proc.returncode == 0, (name, proc.stdout[-2000:], proc.stderr[-2000:])
+    assert proc.returncode == 0, (name, proc.stdout[-3000:], proc.stderr[-6000:])
     assert "expected device assertion" in proc.stdout
 
 
@@ -524,4 +535,4 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--assert-case", required=True, choices=sorted(ASSERT_CASES))
-    sys.exit(_run_assert_case(ap.parse_args().assert_case))
+    _exit_now(_run_assert_case(ap.parse_args().assert_case))

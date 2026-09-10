@@ -258,8 +258,8 @@ class GlobalPoolTests(unittest.TestCase):
         # lanes are routed; safe_ids hides the invalid lanes; the sticky
         # error is set.
         for gate in (False, True):
-            pool, sources, buffers = self.setup()
-            ref_pool, ref_sources, ref_buffers = self.setup()
+            pool, sources, buffers = self.setup(staging=4)
+            ref_pool, ref_sources, ref_buffers = self.setup(staging=4)
             gp.set_gate(pool.tables, gate)
             gp.set_gate(ref_pool.tables, gate)
             b = self.run_step(pool, sources, buffers, 0, [9, 4, -7, 1])
@@ -274,8 +274,8 @@ class GlobalPoolTests(unittest.TestCase):
 
     def test_invalid_router_weights_make_the_lane_padding(self):
         for bad in (float("nan"), float("inf"), -float("inf"), -0.5):
-            pool, sources, buffers = self.setup()
-            ref_pool, ref_sources, ref_buffers = self.setup()
+            pool, sources, buffers = self.setup(staging=4)
+            ref_pool, ref_sources, ref_buffers = self.setup(staging=4)
             gp.step(
                 pool.tables,
                 0,
@@ -309,7 +309,7 @@ class GlobalPoolTests(unittest.TestCase):
             pool.snapshot()
         # Finite nonnegative weights, duplicates included, never set the
         # error; duplicate routes stay legal and resolve to one row.
-        pool, sources, buffers = self.setup()
+        pool, sources, buffers = self.setup(staging=4)
         gp.step(
             pool.tables,
             0,
