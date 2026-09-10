@@ -589,18 +589,21 @@ def _step_kernel():
         tl.store(staged_count_ptr, staged)
         tl.store(gather_count_ptr, promoted + staged)
         tl.debug_barrier()
-        for i in range(0, staged):
-            tl.store(gather_src_ptr + promoted + i, tl.load(staged_expert_ptr + i))
-            tl.store(gather_dst_ptr + promoted + i, tl.load(staged_row_ptr + i))
+        # The staged suffix is already compacted in first-occurrence order.
+        # Its experts are distinct, so both the suffix copy and map overlay
+        # can run in parallel. Inactive scratch lanes must not be accessed.
+        is_staged = lane < staged
+        staged_experts = tl.load(staged_expert_ptr + lane, mask=is_staged, other=0)
+        staged_rows = tl.load(staged_row_ptr + lane, mask=is_staged, other=0)
+        tl.store(gather_src_ptr + promoted + lane, staged_experts, mask=is_staged)
+        tl.store(gather_dst_ptr + promoted + lane, staged_rows, mask=is_staged)
         for start in range(0, num_experts, MAP_BLOCK):
             offs = start + tl.arange(0, MAP_BLOCK)
             in_range = offs < num_experts
             rows = tl.load(hot_phys_ptr + base + offs, mask=in_range, other=-1)
             tl.store(step_map_ptr + offs, rows, mask=in_range)
         tl.debug_barrier()
-        for i in range(0, staged):
-            expert = tl.load(staged_expert_ptr + i)
-            tl.store(step_map_ptr + expert, tl.load(staged_row_ptr + i))
+        tl.store(step_map_ptr + staged_experts, staged_rows, mask=is_staged)
         tl.debug_barrier()
         # Routes: the physical row of every ids lane through the step map.
         route = tl.load(step_map_ptr + safe, mask=valid, other=-1)
