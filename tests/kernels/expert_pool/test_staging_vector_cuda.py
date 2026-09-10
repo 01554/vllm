@@ -18,6 +18,7 @@ def test_staging_against_cpu_reference():
         / "benchmarks/kernels/expert_pool/bench_staging.py"
     )
     spec = importlib.util.spec_from_file_location("staging_bench", path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod.correctness([tables]) == 111
