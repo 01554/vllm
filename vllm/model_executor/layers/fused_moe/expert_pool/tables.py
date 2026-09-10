@@ -169,7 +169,12 @@ def set_gate(tables, enabled):
 
 
 def clear_error(tables):
-    """Reset the sticky device error (host side, after handling it)."""
+    """Reset the sticky device error (host side, after handling it).
+
+    This resets the flags only. If a consumer's device assertion has already
+    fired on the error, the CUDA context is poisoned and cannot be recovered
+    here; the process must be restarted (which is why the assertion tests
+    run in subprocesses)."""
     tables.error.zero_()
     tables.ok.fill_(True)
 
