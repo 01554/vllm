@@ -284,7 +284,7 @@ class PoolLayer:
                 sorted_ids, logical_ids, post_padded = moe_align_block_size(
                     routed, block, self.num_experts, None, ignore_invalid_experts=True
                 )
-                expert_ids = physical_block_experts(
+                expert_ids = physical_block_experts_device(
                     logical_ids, post_padded, block, expert_map, self.num_experts
                 )
             else:
