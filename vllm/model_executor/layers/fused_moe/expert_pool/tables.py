@@ -26,6 +26,7 @@ Ported from the lab expert tier (global_pool.py) without the control file.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,6 +57,7 @@ class GlobalTables:
     clock: Any  # [1] int64
     gate: Any  # [1] int32 promotions allowed
     error: Any  # [1] int32 sticky device error
+    ok: Any  # [1] bool, the inverse of error for one-launch device assertions
     promote_limit: Any  # [1] int32 max promotions per layer call, 0 = unlimited
     promote_interval: Any  # [1] int32 promote only every N forwards
     forwards: Any  # [1] int32 forwards seen with the gate open (layer 0 count)
@@ -81,6 +83,7 @@ class StepBuffers:
     gather_dst: Any  # [W] int32 bank rows
     gather_count: Any  # [1] int32
     routes: Any  # [W] int32 physical row per ids lane this step, -1 padding
+    safe_ids: Any  # [W] int32 ids with invalid lanes (range, weight) as -1
     staged_expert: Any  # [W] int32 (scratch for the map overlay)
     staged_row: Any  # [W] int32
     staged_count: Any  # [1] int32
@@ -128,6 +131,7 @@ def allocate_global_tables(device, num_experts, slots_per_layer, staging):
         clock=torch.zeros(1, dtype=torch.int64, device=device),
         gate=torch.zeros(1, dtype=torch.int32, device=device),
         error=torch.zeros(1, dtype=torch.int32, device=device),
+        ok=torch.ones(1, dtype=torch.bool, device=device),
         promote_limit=torch.zeros(1, dtype=torch.int32, device=device),
         promote_interval=torch.ones(1, dtype=torch.int32, device=device),
         forwards=torch.zeros(1, dtype=torch.int32, device=device),
@@ -151,6 +155,7 @@ def allocate_step_buffers(device, num_experts, width=PLAN_WIDTH):
         gather_dst=ints(width),
         gather_count=ints(1),
         routes=torch.full((width,), -1, dtype=torch.int32, device=device),
+        safe_ids=torch.full((width,), -1, dtype=torch.int32, device=device),
         staged_expert=ints(width),
         staged_row=ints(width),
         staged_count=ints(1),
@@ -161,6 +166,12 @@ def allocate_step_buffers(device, num_experts, width=PLAN_WIDTH):
 
 def set_gate(tables, enabled):
     tables.gate.fill_(1 if enabled else 0)
+
+
+def clear_error(tables):
+    """Reset the sticky device error (host side, after handling it)."""
+    tables.error.zero_()
+    tables.ok.fill_(True)
 
 
 CONTROL_MAX = 2**31 - 1  # device scalars are int32
@@ -225,7 +236,7 @@ def read_control(tables):
     return values
 
 
-def step_reference(tables, layer, ids, buffers):
+def step_reference(tables, layer, ids, buffers, weights=None):
     """Plan and flip one layer step on the host (torch, synchronizing).
 
     Returns (gathers, step_map) with gathers as (RAM row, bank row) pairs in
@@ -233,6 +244,13 @@ def step_reference(tables, layer, ids, buffers):
 
     - `ids` values outside [0, E) other than -1 set the sticky error and
       are skipped; -1 is padding.
+    - With `weights` (one per ids lane), a non-finite or negative weight on
+      a valid lane sets the sticky error and makes that lane invalid: it is
+      planned as padding (no table read or write, no ownership change), so
+      the tables after the step equal those of the same step with the lane
+      as -1. `buffers.safe_ids` holds the ids with every invalid lane as -1
+      for the consumer; `tables.ok` is the inverse of the error for the
+      caller's one-launch device assertion.
     - Distinct valid selections in first-occurrence order. With the gate
       open the clock advances and every selected resident row is stamped.
     - Recency lives on pool rows (FreeToken's usage-per-slot): each miss,
@@ -259,6 +277,17 @@ def step_reference(tables, layer, ids, buffers):
     if len(raw) > buffers.gather_src.shape[0] or len(raw) > len(staging_rows):
         raise ValueError("Step ids exceed the plan width or the staging rows")
     error = bool(int(tables.error[0]))
+    if weights is not None:
+        w = weights.reshape(-1).to(torch.float32).tolist()
+        if len(w) != len(raw):
+            raise ValueError("weights must have one value per ids lane")
+        for i, (value, weight) in enumerate(zip(raw, w)):
+            if 0 <= value < E and not (math.isfinite(weight) and weight >= 0):
+                error = True
+                raw[i] = -2  # invalid: planned as padding below
+    safe_ids = [-1] * buffers.safe_ids.shape[0]
+    for i, value in enumerate(raw):
+        safe_ids[i] = value if 0 <= value < E else -1
     selected: list[int] = []
     for value in raw:
         if value == -1:
@@ -340,6 +369,8 @@ def step_reference(tables, layer, ids, buffers):
     tables.forwards.fill_(forwards)
     write(tables.miss_count, miss_count, torch.int32)
     tables.error.fill_(1 if error else 0)
+    tables.ok.fill_(not error)
+    write(buffers.safe_ids, safe_ids, torch.int32)
     pairs = gathers + [(e, row) for e, row in staged]
     buffers.gather_count.fill_(len(pairs))
     buffers.promoted_count.fill_(len(gathers))
@@ -353,20 +384,31 @@ def step_reference(tables, layer, ids, buffers):
     return pairs, buffers.step_map
 
 
-def step(tables, layer, ids, buffers):
-    """Plan and flip one layer step: Triton on CUDA, the reference elsewhere."""
+def step(tables, layer, ids, buffers, weights=None):
+    """Plan and flip one layer step: Triton on CUDA, the reference elsewhere.
+
+    `weights` (optional, one per ids lane) are validated on the device: a
+    non-finite or negative weight on a valid lane sets the sticky error.
+    """
     if tables.hot_phys.device.type != "cuda":
-        step_reference(tables, layer, ids, buffers)
+        step_reference(tables, layer, ids, buffers, weights)
         return
     flat = ids.reshape(-1)
     if not flat.is_contiguous():
         raise ValueError("Global step requires contiguous ids")
+    if weights is not None:
+        weights = weights.reshape(-1)
+        if weights.numel() != flat.numel() or not weights.is_contiguous():
+            raise ValueError("Global step weights must match the ids lanes")
+    check_weights = weights is not None
+    weights_arg = weights if check_weights else buffers.routes
     width = buffers.gather_src.shape[0]
     if flat.numel() > width or flat.numel() > tables.staging_rows.shape[0]:
         raise ValueError("Step ids exceed the plan width or the staging rows")
     rows = tables.pool_rows
     _step_kernel()[(1,)](
         flat,
+        weights_arg,
         flat.numel(),
         layer,
         tables.hot_phys,
@@ -376,6 +418,7 @@ def step(tables, layer, ids, buffers):
         tables.clock,
         tables.gate,
         tables.error,
+        tables.ok,
         tables.promote_limit,
         tables.promote_interval,
         tables.forwards,
@@ -387,6 +430,7 @@ def step(tables, layer, ids, buffers):
         buffers.gather_dst,
         buffers.gather_count,
         buffers.routes,
+        buffers.safe_ids,
         buffers.staged_expert,
         buffers.staged_row,
         buffers.staged_count,
@@ -398,6 +442,7 @@ def step(tables, layer, ids, buffers):
         WIDTH=width,
         BLOCK_R=_next_power_of_two(rows),
         MAP_BLOCK=1024,
+        CHECK_WEIGHTS=check_weights,
         num_warps=8,
     )
 
@@ -453,6 +498,7 @@ def _step_kernel():
     @triton.jit
     def global_pool_step(
         ids_ptr,
+        weights_ptr,
         n,
         layer,
         hot_phys_ptr,
@@ -462,6 +508,7 @@ def _step_kernel():
         clock_ptr,
         gate_ptr,
         error_ptr,
+        ok_ptr,
         limit_ptr,
         interval_ptr,
         forwards_ptr,
@@ -473,6 +520,7 @@ def _step_kernel():
         gather_dst_ptr,
         gather_count_ptr,
         routes_ptr,
+        safe_ids_ptr,
         staged_expert_ptr,
         staged_row_ptr,
         staged_count_ptr,
@@ -484,6 +532,7 @@ def _step_kernel():
         WIDTH: tl.constexpr,
         BLOCK_R: tl.constexpr,
         MAP_BLOCK: tl.constexpr,
+        CHECK_WEIGHTS: tl.constexpr,
     ):
         never = 0x7FFFFFFFFFFFFFFF
         lane = tl.arange(0, WIDTH)
@@ -491,8 +540,20 @@ def _step_kernel():
         raw = tl.load(ids_ptr + lane, mask=present, other=-1).to(tl.int64)
         valid = present & (raw >= 0) & (raw < num_experts)
         bad = present & (raw != -1) & (~valid)
+        if CHECK_WEIGHTS:
+            # Router weights of valid lanes must be finite and nonnegative;
+            # a lane failing this becomes invalid (planned as padding) so no
+            # table is read or written for it; weights of padding lanes are
+            # never loaded.
+            w = tl.load(weights_ptr + lane, mask=valid, other=0.0).to(tl.float32)
+            w_ok = (w == w) & (w >= 0.0) & (w != float("inf"))
+            bad = bad | (valid & (~w_ok))
+            valid = valid & w_ok
         if tl.sum(bad.to(tl.int32), 0) > 0:
             tl.store(error_ptr, 1)
+            tl.store(ok_ptr, 0)
+        # Sanitized ids for the consumer: every invalid lane is padding.
+        tl.store(safe_ids_ptr + lane, tl.where(valid, raw, -1).to(tl.int32))
         safe = tl.where(valid, raw, 0)
         same = safe[:, None] == safe[None, :]
         earlier = lane[None, :] < lane[:, None]

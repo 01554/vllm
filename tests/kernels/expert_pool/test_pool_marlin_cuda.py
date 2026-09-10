@@ -9,6 +9,9 @@ logical-align + physical-remap path is exercised), and a wider batch must
 match through the bank + host-view partition path. The pool tables must
 stay consistent throughout."""
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -159,3 +162,226 @@ def test_two_layer_pool_decode_prefill_decode_matches_the_uncached_layers(
         run(0, x, _decode(order, device), 1)
     run(1, x, _decode([0, 1], device), 1)
     assert pls[0].decode_steps == 9 and pls[1].decode_steps == 4  # 1 gate-closed
+
+
+def _three_layer_pool(device):
+    """Three pool layers sharing one bank, as install_expert_pool builds them."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import set_gate
+
+    pool_cfgs, layers = [], []
+    for seed_offset in (0, 1, 2):
+        params = quantized_weights(device, seed_offset=seed_offset)
+        pool_cfgs.append(vllm_config(SLOTS))
+        layers.append(make_layer(pool_cfgs[-1], params, host_source=True))
+    for layer in layers:
+        for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
+            p = getattr(layer.routed_experts, name)
+            p.data = p.data.to(device)
+    model = torch.nn.ModuleDict({"a": layers[0], "b": layers[1], "c": layers[2]})
+    pool = install_expert_pool(model, device, max_decode_tokens=1)
+    assert pool is not None
+    set_gate(pool.tables, True)
+    pls = [layer.routed_experts.expert_pool_layer for layer in layers]
+    return pool, pls, pool_cfgs
+
+
+def test_invalid_lanes_are_padding_and_the_error_is_sticky_without_firing(
+    dist_env,  # noqa: F811
+):
+    """Device planner contract, checked with the step alone (no consumer, so
+    no device assertion fires and the CUDA context stays usable): an
+    out-of-range id, a negative non-sentinel id, and a non-finite router
+    weight each set the sticky error and the `ok` flag, leave the tables
+    identical to the same step with the lane as padding, route the other
+    lanes, and hide the lane in safe_ids; the error persists across later
+    clean steps until clear_error."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
+        check_global_tables,
+        clear_error,
+        step,
+    )
+
+    device = torch.accelerator.current_accelerator()
+    pool, pls, _ = _three_layer_pool(device)
+    ref_pool, ref_pls, _ = _three_layer_pool(device)
+    tables, ref_tables = pool.tables, ref_pool.tables
+
+    def run(p, layer, ids, weights):
+        step(
+            p.pool.tables,
+            layer,
+            torch.tensor([ids], dtype=torch.int32, device=device),
+            p.buffers,
+            torch.tensor([weights], dtype=torch.float32, device=device),
+        )
+        torch.accelerator.synchronize(device)
+
+    for layer, ids, weights, ref_ids in (
+        (0, [E + 3, 2], [0.5, 0.5], [-1, 2]),
+        (1, [1, -9], [0.5, 0.5], [1, -1]),
+        (2, [1, 2], [float("nan"), 0.5], [-1, 2]),
+    ):
+        run(pls[layer], layer, ids, weights)
+        run(ref_pls[layer], layer, ref_ids, [0.5, 0.5])
+        for name in ("hot_phys", "cold_phys", "row_key"):
+            assert torch.equal(getattr(tables, name), getattr(ref_tables, name)), name
+        assert torch.equal(pls[layer].buffers.routes, ref_pls[layer].buffers.routes)
+        assert pls[layer].buffers.safe_ids[:2].tolist() == ref_ids
+        assert int(tables.error[0]) == 1 and not bool(tables.ok[0])
+        assert int(ref_tables.error[0]) == 0 and bool(ref_tables.ok[0])
+        # Sticky across clean steps on other layers.
+        for other in range(3):
+            run(pls[other], other, [1, 2], [0.5, 0.5])
+            run(ref_pls[other], other, [1, 2], [0.5, 0.5])
+        assert int(tables.error[0]) == 1 and not bool(tables.ok[0])
+        with pytest.raises(RuntimeError):
+            check_global_tables(tables)
+        clear_error(tables)
+        check_global_tables(tables)
+        check_global_tables(ref_tables)
+
+
+def test_decode_graph_capture_and_replay_match_eager(dist_env):  # noqa: F811
+    """The decode path (step, copy, sanitized routes, one-launch assertion,
+    Marlin) is captured once and replayed with different valid inputs; every
+    replay matches the eager result on identically placed twin pools."""
+    from vllm.forward_context import set_forward_context
+
+    device = torch.accelerator.current_accelerator()
+    pool, pls, cfgs = _three_layer_pool(device)
+    twin, tpls, tcfgs = _three_layer_pool(device)
+    x_static = torch.zeros(1, K, dtype=torch.bfloat16, device=device)
+    ids_static = torch.zeros(1, TOP_K, dtype=torch.int32, device=device)
+    w_static = torch.full((1, TOP_K), 0.5, dtype=torch.float32, device=device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with (
+        torch.cuda.stream(stream),
+        set_forward_context(None, cfgs[0], num_tokens=1),
+    ):
+        for _ in range(2):  # warm up the kernels before capture
+            pls[0].apply(x_static, w_static, ids_static)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        set_forward_context(None, cfgs[0], num_tokens=1),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        out_static = pls[0].apply(x_static, w_static, ids_static)
+    # Mirror the two warm-up steps on the twin so placements agree.
+    with set_forward_context(None, tcfgs[0], num_tokens=1):
+        for _ in range(2):
+            tpls[0].apply(x_static, w_static, ids_static)
+        tpls[0].apply(x_static, w_static, ids_static)  # the capture's own step
+    torch.accelerator.synchronize(device)
+    for order in ([3, 4], [7, 0], [0, 0], [6, 1]):
+        x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
+        ids = torch.tensor([order], dtype=torch.int32, device=device)
+        x_static.copy_(x)
+        ids_static.copy_(ids)
+        graph.replay()
+        with set_forward_context(None, tcfgs[0], num_tokens=1):
+            want = tpls[0].apply(x, w_static, ids)
+        torch.accelerator.synchronize(device)
+        torch.testing.assert_close(out_static, want, rtol=2e-2, atol=2e-2)
+        assert bool(pool.tables.ok[0]) and bool(twin.tables.ok[0])
+
+
+ASSERT_CASES = {
+    "first_layer_oob_id": (0, [E + 3, 2], [0.5, 0.5], "eager"),
+    "middle_layer_nan_weight": (1, [1, 2], [float("nan"), 0.5], "eager"),
+    "last_layer_negative_id": (2, [1, -9], [0.5, 0.5], "eager"),
+    "graph_replay_oob_id": (0, [E + 3, 2], [0.5, 0.5], "graph"),
+}
+
+
+def _run_assert_case(name):
+    """Subprocess body: one invalid decode forward must fail at the caller's
+    synchronization (device assertion). Exits 0 only when it did."""
+    from tests.kernels.moe.modular_kernel_tools.parallel_utils import _set_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    cfg = vllm_config(0)
+    _set_vllm_config(cfg, 1, rank=0, local_rank=0)
+    device = torch.accelerator.current_accelerator()
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(device)
+    pool, pls, cfgs = _three_layer_pool(device)
+    bad_layer, bad_ids, bad_w, mode = ASSERT_CASES[name]
+    x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
+    good_ids = torch.tensor([[1, 2]], dtype=torch.int32, device=device)
+    good_w = torch.full((1, TOP_K), 0.5, dtype=torch.float32, device=device)
+    # A clean full forward first.
+    for i in range(3):
+        with set_forward_context(None, cfgs[i], num_tokens=1):
+            pls[i].apply(x, good_w, good_ids)
+    torch.accelerator.synchronize(device)
+    ids = torch.tensor([bad_ids], dtype=torch.int32, device=device)
+    w = torch.tensor([bad_w], dtype=torch.float32, device=device)
+    try:
+        if mode == "eager":
+            for i in range(3):
+                with set_forward_context(None, cfgs[i], num_tokens=1):
+                    pls[i].apply(
+                        x,
+                        w if i == bad_layer else good_w,
+                        ids if i == bad_layer else good_ids,
+                    )
+            torch.accelerator.synchronize(device)
+        else:
+            ids_static = good_ids.clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with (
+                torch.cuda.stream(stream),
+                set_forward_context(None, cfgs[0], num_tokens=1),
+            ):
+                pls[0].apply(x, good_w, ids_static)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with (
+                set_forward_context(None, cfgs[0], num_tokens=1),
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                pls[0].apply(x, good_w, ids_static)
+            graph.replay()
+            torch.accelerator.synchronize(device)  # clean replay passes
+            ids_static.copy_(ids)  # invalid input into the captured buffer
+            graph.replay()
+            torch.accelerator.synchronize(device)
+    except RuntimeError as exc:
+        print(f"expected failure: {str(exc)[:160]}")
+        return 0
+    print("no failure raised")
+    return 3
+
+
+@pytest.mark.parametrize("name", sorted(ASSERT_CASES))
+def test_invalid_routing_fails_at_synchronization_in_a_subprocess(
+    dist_env,  # noqa: F811
+    name,
+):
+    """The one-launch device assertion fires for an invalid lane at the
+    first, a middle, or the last layer, and inside a captured graph on
+    replay; each case runs in its own process because a device assertion
+    poisons the CUDA context."""
+    proc = subprocess.run(
+        [sys.executable, __file__, "--assert-case", name],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, (name, proc.stdout[-2000:], proc.stderr[-2000:])
+    assert "expected failure" in proc.stdout
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--assert-case", required=True, choices=sorted(ASSERT_CASES))
+    sys.exit(_run_assert_case(ap.parse_args().assert_case))
