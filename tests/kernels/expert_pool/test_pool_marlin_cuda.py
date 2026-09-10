@@ -490,20 +490,22 @@ def _run_assert_case(name):
             graph.replay()
             torch.accelerator.synchronize(device)
     except RuntimeError as exc:
+        # Leave from inside the handler: once the device assertion fired the
+        # CUDA context is poisoned, and unwinding out of this frame frees
+        # pinned/device tensors whose release re-raises and aborts the
+        # process (SIGABRT). The verdict is printed and flushed first.
         text = str(exc)
         if "device-side assert" in text or "Expert pool: invalid routing" in text:
             print(f"expected device assertion: {text[:160]}")
-            return 0
+            _exit_now(0)
         print(f"unexpected error: {text[:300]}")
-        return 4
+        _exit_now(4)
     print("no failure raised")
-    return 3
+    _exit_now(3)
 
 
 def _exit_now(code):
-    """After a device assertion the CUDA context is poisoned and interpreter
-    teardown can abort (SIGABRT); the verdict is already printed, so leave
-    without running any destructor."""
+    """Exit without running destructors (see _run_assert_case)."""
     import os
 
     sys.stdout.flush()
@@ -535,4 +537,4 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--assert-case", required=True, choices=sorted(ASSERT_CASES))
-    _exit_now(_run_assert_case(ap.parse_args().assert_case))
+    _run_assert_case(ap.parse_args().assert_case)  # exits from inside
