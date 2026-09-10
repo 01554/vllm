@@ -32,7 +32,7 @@ def check_outputs(graphs, outputs, ids, mapping, block):
     for graph in graphs:
         graph.replay()
     torch.accelerator.synchronize()
-    routes, rows = ids.cpu().tolist(), mapping.cpu().tolist()
+    routes, rows = ids.flatten().cpu().tolist(), mapping.cpu().tolist()
     expected: dict[int, list[int]] = {}
     for lane, expert in enumerate(routes):
         if 0 <= expert < len(rows) and 0 <= rows[expert] < 1024:
@@ -73,7 +73,10 @@ def main():
     records = []
     for lanes in (10, 64):
         for pattern in ("distinct", "duplicate", "padding"):
-            ids = torch.arange(lanes, device="cuda", dtype=torch.int64)
+            # Both implementations receive serving-shaped [tokens, top_k] IDs.
+            ids = torch.arange(lanes, device="cuda", dtype=torch.int64).reshape(
+                1, lanes
+            )
             if pattern == "duplicate":
                 ids.fill_(1)
             elif pattern == "padding":
