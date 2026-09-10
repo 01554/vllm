@@ -235,7 +235,143 @@ class GlobalPoolTests(unittest.TestCase):
     def test_invalid_ids_set_the_sticky_error(self):
         pool, sources, buffers = self.setup()
         self.run_step(pool, sources, buffers, 0, [9, 0])
+        self.assertFalse(bool(pool.tables.ok[0]))
         with self.assertRaises(RuntimeError):
+            pool.snapshot()
+        gp.clear_error(pool.tables)
+        self.assertTrue(bool(pool.tables.ok[0]))
+        pool.snapshot()
+
+    def assert_same_placement(self, pool, ref_pool):
+        self.assertEqual(
+            pool.tables.hot_phys.tolist(), ref_pool.tables.hot_phys.tolist()
+        )
+        self.assertEqual(
+            pool.tables.cold_phys.tolist(), ref_pool.tables.cold_phys.tolist()
+        )
+        self.assertEqual(pool.tables.row_key.tolist(), ref_pool.tables.row_key.tolist())
+        self.assertEqual(pool.tables.row_use.tolist(), ref_pool.tables.row_use.tolist())
+
+    def test_invalid_ids_are_planned_as_padding(self):
+        # Out-of-range ids never read or write a table: the placement after
+        # the step equals the same step with those lanes as -1; the valid
+        # lanes are routed; safe_ids hides the invalid lanes; the sticky
+        # error is set.
+        for gate in (False, True):
+            pool, sources, buffers = self.setup()
+            ref_pool, ref_sources, ref_buffers = self.setup()
+            gp.set_gate(pool.tables, gate)
+            gp.set_gate(ref_pool.tables, gate)
+            b = self.run_step(pool, sources, buffers, 0, [9, 4, -7, 1])
+            rb = self.run_step(ref_pool, ref_sources, ref_buffers, 0, [-1, 4, -1, 1])
+            self.assert_same_placement(pool, ref_pool)
+            self.assertEqual(b.routes.tolist(), rb.routes.tolist())
+            self.assertEqual(b.safe_ids.tolist(), [-1, 4, -1, 1])
+            self.assertEqual(b.step_map.tolist(), rb.step_map.tolist())
+            self.assertGreaterEqual(b.routes.tolist()[1], 0)
+            self.assertFalse(bool(pool.tables.ok[0]))
+            self.assertTrue(bool(ref_pool.tables.ok[0]))
+
+    def test_invalid_router_weights_make_the_lane_padding(self):
+        for bad in (float("nan"), float("inf"), -float("inf"), -0.5):
+            pool, sources, buffers = self.setup()
+            ref_pool, ref_sources, ref_buffers = self.setup()
+            gp.step(
+                pool.tables,
+                0,
+                torch.tensor([[0, 1, 3, -1]]),
+                buffers[0],
+                torch.tensor([[0.5, bad, 0.25, 0.0]], dtype=torch.float32),
+            )
+            gp.step(
+                ref_pool.tables,
+                0,
+                torch.tensor([[0, -1, 3, -1]]),
+                ref_buffers[0],
+                torch.tensor([[0.5, 0.0, 0.25, 0.0]], dtype=torch.float32),
+            )
+            self.assert_same_placement(pool, ref_pool)
+            self.assertEqual(buffers[0].routes.tolist(), ref_buffers[0].routes.tolist())
+            self.assertEqual(buffers[0].safe_ids.tolist(), [0, -1, 3, -1])
+            self.assertFalse(bool(pool.tables.ok[0]))
+            with self.assertRaises(RuntimeError):
+                pool.snapshot()
+            # The same weight on a padding lane is never loaded: no error.
+            pool, sources, buffers = self.setup()
+            gp.step(
+                pool.tables,
+                0,
+                torch.tensor([[0, -1]]),
+                buffers[0],
+                torch.tensor([[0.5, bad]], dtype=torch.float32),
+            )
+            self.assertTrue(bool(pool.tables.ok[0]))
+            pool.snapshot()
+        # Finite nonnegative weights, duplicates included, never set the
+        # error; duplicate routes stay legal and resolve to one row.
+        pool, sources, buffers = self.setup()
+        gp.step(
+            pool.tables,
+            0,
+            torch.tensor([[2, 2, 0, 2]]),
+            buffers[0],
+            torch.tensor([[0.7, 0.3, 0.0, 1.0]], dtype=torch.float32),
+        )
+        pool.snapshot()
+        self.assertEqual(buffers[0].safe_ids.tolist(), [2, 2, 0, 2])
+        self.assertEqual(len(set(buffers[0].routes.tolist())), 2)
+
+    def test_every_valid_route_is_present_after_the_step(self):
+        # The decode consumer uses safe_ids without a route mask: after a
+        # step every valid lane (hit, promoted, or staged) has a physical
+        # row in routes and in the step map, with the gate closed or open,
+        # with duplicates, padding, invalid sentinels and invalid weights,
+        # and when misses exceed the free rows (staging).
+        rng = random.Random(7)
+        for trial in range(40):
+            layers = rng.choice([1, 2, 3])
+            experts = rng.choice([4, 6, 8])
+            staging = rng.randint(1, 4)
+            slots = tuple(rng.randint(1, experts - 1) for _ in range(layers))
+            pool, sources, buffers = self.setup(layers, experts, slots, staging)
+            gp.set_gate(pool.tables, rng.random() < 0.5)
+            for _ in range(12):
+                layer = rng.randrange(layers)
+                ids = [
+                    rng.choice(
+                        [-1, -3, 99, rng.randrange(experts), rng.randrange(experts)]
+                    )
+                    for _ in range(staging)
+                ]
+                weights = [
+                    rng.choice([0.5, 1.0, 0.0, float("nan")]) for _ in range(staging)
+                ]
+                gp.step(
+                    pool.tables,
+                    layer,
+                    torch.tensor([ids]),
+                    buffers[layer],
+                    torch.tensor([weights], dtype=torch.float32),
+                )
+                pool_mod.copy_in(sources[layer], pool.bank, buffers[layer])
+                b = buffers[layer]
+                routes, safe, step_map = (
+                    b.routes.tolist(),
+                    b.safe_ids.tolist(),
+                    b.step_map.tolist(),
+                )
+                for lane, value in enumerate(ids):
+                    ok = 0 <= value < experts and weights[lane] == weights[lane]
+                    if ok:
+                        self.assertEqual(safe[lane], value)
+                        self.assertGreaterEqual(routes[lane], 0, (trial, ids, routes))
+                        self.assertGreaterEqual(
+                            step_map[value], 0, (trial, ids, step_map)
+                        )
+                    else:
+                        self.assertEqual(safe[lane], -1)
+                        self.assertEqual(routes[lane], -1)
+            gp.clear_error(pool.tables)
             pool.snapshot()
 
     def test_host_swap_while_gated_matches_the_tables(self):
