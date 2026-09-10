@@ -51,7 +51,7 @@ def equal(expected, actual):
             assert torch.equal(value.cpu(), getattr(b, name).cpu()), name
 
 
-def correctness(mods):
+def correctness(mods, check_weights=False):
     count = 0
     for width in (1, 16, 64):
         cases = [
@@ -68,9 +68,20 @@ def correctness(mods):
                 ref = state(mods[0], "cpu", width, gate)
                 for layer in (0, 1, 0):
                     ids = torch.tensor(values, dtype=torch.int64, device="cuda")
-                    mods[0].step_reference(ref[0], layer, ids.cpu(), ref[1])
+                    weights = (
+                        torch.full_like(ids, 0.5, dtype=torch.float32)
+                        if check_weights
+                        else None
+                    )
+                    mods[0].step_reference(
+                        ref[0],
+                        layer,
+                        ids.cpu(),
+                        ref[1],
+                        weights=None if weights is None else weights.cpu(),
+                    )
                     for m, (t, b) in zip(mods, states):
-                        m.step(t, layer, ids, b)
+                        m.step(t, layer, ids, b, weights=weights)
                     torch.accelerator.synchronize()
                     for actual in states:
                         equal(ref, actual)
@@ -83,11 +94,42 @@ def correctness(mods):
         mods[0].set_control(ref[0], promote_limit=1)
         values = list(range(32, 32 + width))
         ids = torch.tensor(values, dtype=torch.int64, device="cuda")
-        mods[0].step_reference(ref[0], 1, ids.cpu(), ref[1])
+        weights = (
+            torch.full_like(ids, 0.5, dtype=torch.float32) if check_weights else None
+        )
+        mods[0].step_reference(
+            ref[0],
+            1,
+            ids.cpu(),
+            ref[1],
+            weights=None if weights is None else weights.cpu(),
+        )
         for m, (t, b) in zip(mods, states):
-            m.step(t, 1, ids, b)
+            m.step(t, 1, ids, b, weights=weights)
             equal(ref, (t, b))
         count += 1
+    if check_weights:
+        # P1 filters bad weights before distinctness and staging compaction.
+        # Compare every table and buffer, including safe_ids and sticky ok/error.
+        for gate in (False, True):
+            for bad_weight in (float("nan"), float("inf"), -float("inf"), -0.5):
+                states = [state(m, "cuda", 16, gate) for m in mods]
+                ref = state(mods[0], "cpu", 16, gate)
+                for layer in (0, 1, 0):
+                    ids = torch.tensor([32, 32, 33, -1, 128, 0], device="cuda")
+                    weights = torch.tensor(
+                        [bad_weight, 0.5, 0.5, bad_weight, bad_weight, 0.5],
+                        device="cuda",
+                    )
+                    mods[0].step_reference(
+                        ref[0], layer, ids.cpu(), ref[1], weights=weights.cpu()
+                    )
+                    for m, (t, b) in zip(mods, states):
+                        m.step(t, layer, ids, b, weights=weights)
+                    torch.accelerator.synchronize()
+                    for actual in states:
+                        equal(ref, actual)
+                    count += 1
     return count
 
 
@@ -113,6 +155,11 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--batches", type=int, default=30)
     p.add_argument("--replays", type=int, default=100)
+    p.add_argument(
+        "--check-weights",
+        action="store_true",
+        help="Use P1 serving weight validation specialization",
+    )
     args = p.parse_args()
     if args.batches < 1 or args.replays < 1:
         p.error("batches and replays must be positive")
@@ -127,7 +174,7 @@ def main():
         "cuda": torch.version.cuda,
     }
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    count = correctness(mods)
+    count = correctness(mods, args.check_weights)
     (args.output / "correctness.json").write_text(json.dumps({"passed": count}))
     for width in (16, 64):
         for pattern in ("all_hit", "one_staged", "all_staged"):
@@ -143,11 +190,16 @@ def main():
                 else list(range(512 - width, 512))
             )
             ids = torch.tensor(values, dtype=torch.int64, device="cuda")
+            weights = (
+                torch.full_like(ids, 0.5, dtype=torch.float32)
+                if args.check_weights
+                else None
+            )
             graphs, keepalive = [], []
             for i, (m, (t, b)) in enumerate(zip(mods, states)):
                 wrapped = CaptureKernel(m._step_kernel())
                 m._KERNELS["step"] = wrapped
-                m.step(t, 0, ids, b)
+                m.step(t, 0, ids, b, weights=weights)
                 compiled = wrapped.compiled
                 prefix = args.output / f"{width}-{pattern}-{i}"
                 for kind, contents in compiled.asm.items():
@@ -170,10 +222,10 @@ def main():
                 stream.wait_stream(torch.cuda.current_stream())
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
-                    m.step(t, 0, ids, b)
+                    m.step(t, 0, ids, b, weights=weights)
                 torch.cuda.current_stream().wait_stream(stream)
                 graphs.append(graph)
-                keepalive.append((t, b, ids, stream))
+                keepalive.append((t, b, ids, weights, stream))
             for _ in range(20):
                 for g in graphs:
                     g.replay()
