@@ -36,8 +36,9 @@ Compare medians and raw batch variation; check all-hit regressions, register and
 spill changes, and dynamic loop removal in generated code. Only a worthwhile
 result should proceed to a separate, same-condition serving test and Draft PR.
 
-This independent integration applies #49 to P1; it does not include P2 or change
-upstream #56177. The only production delta from P1 is the two suffix loops.
+This branch bundles the P1 staging experiment with small decode alignment;
+see ../README_pool_bundle.md. It does not change upstream #56177. The staging
+component changes only the two suffix loops.
 P1 invalid-weight filtering, safe_ids, per-call assertion and physical remap are
 unchanged. The weighted comparison checks 135 state transitions against the CPU
 reference and both implementations, including invalid weights before duplicate

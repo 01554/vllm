@@ -1,8 +1,8 @@
 # Small decode alignment experiment
 
 Fork-side experiment based on `205983f839f5155c0ebd066dd84e77f3ec41bc84`.
-Not part of upstream PR #56177. Do not combine with vector staging or other
-optimizations for the first comparison.
+Not part of upstream PR #56177. This branch bundles the separately measured
+small alignment and vector staging experiments; see README_pool_bundle.md.
 
 The candidate replaces logical alignment plus physical remap only for decode
 with 1..64 lanes and bank rows > logical experts. Wide batches retain the
