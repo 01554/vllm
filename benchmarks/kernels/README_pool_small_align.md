@@ -40,3 +40,8 @@ the GPU run. In particular the single-CTA initialize/barrier/scatter sequence
 requires review. Do not infer serving improvement from kernel duration sums.
 Any subsequent serving comparison keeps the existing 5% adoption and FT95%
 criteria, with fresh runs and unchanged inputs/configuration.
+
+The runner replays both retained graphs before and after timing, checking route
+groups, per-group padded block counts, and output counts against the input.
+Candidate unused tails are checked as well. A failure stops the run and writes
+`invalid.json` with `timing_valid=false`; no final timing report is produced.

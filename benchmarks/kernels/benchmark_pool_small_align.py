@@ -27,6 +27,44 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.triton_utils import triton
 
 
+def check_outputs(graphs, outputs, ids, mapping, block):
+    """Replay retained graphs and validate semantic groups outside timing."""
+    for graph in graphs:
+        graph.replay()
+    torch.accelerator.synchronize()
+    routes, rows = ids.cpu().tolist(), mapping.cpu().tolist()
+    expected: dict[int, list[int]] = {}
+    for lane, expert in enumerate(routes):
+        if 0 <= expert < len(rows) and 0 <= rows[expert] < 1024:
+            expected.setdefault(rows[expert], []).append(lane)
+    expected_count = sum(triton.cdiv(len(v), block) * block for v in expected.values())
+    for index, result in enumerate(outputs):
+        sorted_ids, blocks, count = [tensor.cpu() for tensor in result]
+        n = int(count.item())
+        assert n == expected_count and n <= sorted_ids.numel()
+        assert n // block <= blocks.numel()
+        actual: dict[int, list[int]] = {}
+        block_counts: dict[int, int] = {}
+        for offset in range(0, n, block):
+            row = int(blocks[offset // block].item())
+            group = sorted_ids[offset : offset + block].tolist()
+            assert row in expected
+            block_counts[row] = block_counts.get(row, 0) + 1
+            assert all(0 <= lane <= len(routes) for lane in group)
+            actual.setdefault(row, []).extend(
+                lane for lane in group if lane < len(routes)
+            )
+        assert {row: sorted(lanes) for row, lanes in actual.items()} == expected
+        assert block_counts == {
+            row: triton.cdiv(len(group), block) for row, group in expected.items()
+        }
+        # Reference allocation may contain unused block entries. The candidate
+        # additionally promises deterministic padding throughout its allocation.
+        if index == 1:
+            assert bool((sorted_ids[n:] == len(routes)).all())
+            assert bool((blocks[n // block :] == -1).all())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -86,6 +124,38 @@ def main():
                 json.dumps(dict(n_regs=compiled.n_regs, n_spills=compiled.n_spills))
             )
             samples = [[], []]
+
+            def validate(
+                phase,
+                graphs=graphs,
+                outputs=outputs,
+                ids=ids,
+                mapping=mapping,
+                block=block,
+                lanes=lanes,
+                pattern=pattern,
+                samples=samples,
+            ):
+                try:
+                    check_outputs(graphs, outputs, ids, mapping, block)
+                except Exception as exc:
+                    (args.output / "invalid.json").write_text(
+                        json.dumps(
+                            dict(
+                                lanes=lanes,
+                                pattern=pattern,
+                                phase=phase,
+                                timing_valid=False,
+                                error=repr(exc),
+                                samples_us=samples,
+                            ),
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                    raise
+
+            validate("before_timing")
             for batch in range(30):
                 for index in (0, 1) if batch % 2 == 0 else (1, 0):
                     start = torch.cuda.Event(enable_timing=True)
@@ -96,11 +166,15 @@ def main():
                     end.record()
                     end.synchronize()
                     samples[index].append(start.elapsed_time(end) * 1000 / 100)
+            validate("after_timing")
             records.append(
                 dict(
                     lanes=lanes,
                     pattern=pattern,
                     block=block,
+                    correctness_before=True,
+                    correctness_after=True,
+                    timing_valid=True,
                     samples_us=samples,
                     medians_us=[statistics.median(s) for s in samples],
                 )
