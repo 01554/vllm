@@ -66,7 +66,8 @@ def test_small_alignment_preserves_route_groups_on_graph_replay(lanes, block):
     experts = 512
     mapping = torch.arange(experts, device="cuda", dtype=torch.int32) + experts
     mapping[3] = -1
-    ids = torch.zeros(lanes, device="cuda", dtype=torch.int64)
+    # Match serving topk_ids [tokens, top_k]; the CUDA reference reads size(1).
+    ids = torch.zeros((1, lanes), device="cuda", dtype=torch.int64)
     small_align(ids, mapping, block, 2 * experts)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -90,7 +91,7 @@ def test_small_alignment_preserves_route_groups_on_graph_replay(lanes, block):
         [i % 7 for i in range(lanes)],
         [-1 if i % 3 == 0 else i for i in range(lanes)],
     ):
-        ids.copy_(torch.tensor(values, device="cuda"))
+        ids.copy_(torch.tensor([values], device="cuda"))
         graph.replay()
         routed = mask_routes(ids, mapping)
         sorted_ids, logical, count = moe_align_block_size(
