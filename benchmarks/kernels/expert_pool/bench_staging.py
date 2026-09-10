@@ -71,7 +71,7 @@ def correctness(mods):
                     mods[0].step_reference(ref[0], layer, ids.cpu(), ref[1])
                     for m, (t, b) in zip(mods, states):
                         m.step(t, layer, ids, b)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     for actual in states:
                         equal(ref, actual)
                     count += 1
@@ -177,7 +177,7 @@ def main():
             for _ in range(20):
                 for g in graphs:
                     g.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             equal(states[0], states[1])
             raw = [[], []]
             for batch in range(args.batches):
