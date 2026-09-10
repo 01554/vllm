@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from vllm.model_executor.layers.fused_moe.expert_pool.pool import GlobalPool, copy_in
+from vllm.model_executor.layers.fused_moe.expert_pool.small_align import small_align
 from vllm.model_executor.layers.fused_moe.expert_pool.tables import (
     TENSORS,
     StepBuffers,
@@ -281,12 +282,21 @@ class PoolLayer:
                 # promoted, or staged), so the mask is the identity.
                 if not decode:
                     routed = mask_routes(ids, expert_map)
-                sorted_ids, logical_ids, post_padded = moe_align_block_size(
-                    routed, block, self.num_experts, None, ignore_invalid_experts=True
-                )
-                expert_ids = physical_block_experts_device(
-                    logical_ids, post_padded, block, expert_map, self.num_experts
-                )
+                if decode and 0 < routed.numel() <= 64:
+                    sorted_ids, expert_ids, post_padded = small_align(
+                        routed, expert_map, block, slots
+                    )
+                else:
+                    sorted_ids, logical_ids, post_padded = moe_align_block_size(
+                        routed,
+                        block,
+                        self.num_experts,
+                        None,
+                        ignore_invalid_experts=True,
+                    )
+                    expert_ids = physical_block_experts_device(
+                        logical_ids, post_padded, block, expert_map, self.num_experts
+                    )
             else:
                 sorted_ids, expert_ids, post_padded = moe_align_block_size(
                     ids,

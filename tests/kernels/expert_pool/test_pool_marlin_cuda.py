@@ -50,6 +50,63 @@ pytestmark = [
 SLOTS = 4  # of E=8 experts resident per layer at start; top_k=2 staging rows
 
 
+@pytest.mark.parametrize("lanes", [1, 10, 64])
+@pytest.mark.parametrize("block", [8, 16, 32, 48, 64])
+def test_small_alignment_preserves_route_groups_on_graph_replay(lanes, block):
+    """Grouping, duplicate lanes and padding survive changed graph inputs."""
+    from vllm.model_executor.layers.fused_moe.expert_pool.layer import (
+        mask_routes,
+        physical_block_experts_device,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_pool.small_align import small_align
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    experts = 512
+    mapping = torch.arange(experts, device="cuda", dtype=torch.int32) + experts
+    mapping[3] = -1
+    ids = torch.zeros(lanes, device="cuda", dtype=torch.int64)
+    small_align(ids, mapping, block, 2 * experts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = small_align(ids, mapping, block, 2 * experts)
+
+    def groups(result):
+        sorted_ids, blocks, count = [t.cpu() for t in result]
+        n = count.item()
+        assert n % block == 0 and 0 <= n <= lanes * block
+        groups_by_row: dict[int, list[int]] = {}
+        for offset in range(0, n, block):
+            row = blocks[offset // block].item()
+            group = sorted_ids[offset : offset + block].tolist()
+            assert all(0 <= i <= lanes for i in group)
+            groups_by_row.setdefault(row, []).extend(i for i in group if i < lanes)
+        return n, {k: sorted(v) for k, v in groups_by_row.items()}
+
+    for values in (
+        [-1] * lanes,
+        [2] * lanes,
+        [i % 7 for i in range(lanes)],
+        [-1 if i % 3 == 0 else i for i in range(lanes)],
+    ):
+        ids.copy_(torch.tensor(values, device="cuda"))
+        graph.replay()
+        routed = mask_routes(ids, mapping)
+        sorted_ids, logical, count = moe_align_block_size(
+            routed, block, experts, None, ignore_invalid_experts=True
+        )
+        reference = (
+            sorted_ids,
+            physical_block_experts_device(logical, count, block, mapping, experts),
+            count,
+        )
+        assert groups(actual) == groups(reference)
+        n = actual[2].item()
+        assert torch.all(actual[0][n:] == lanes)
+        assert torch.all(actual[1][n // block :] == -1)
+
+
 def _decode(order, device):
     logits = torch.full((1, E), -10.0, device=device)
     logits[0, order[0]] = 3.0
