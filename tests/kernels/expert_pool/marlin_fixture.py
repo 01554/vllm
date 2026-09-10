@@ -36,10 +36,20 @@ def vllm_config(pool_rows: int) -> VllmConfig:
     return cfg
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def dist_env():
+    """Per test: the suite's teardown destroys the distributed groups after
+    each test, so (re)initialize whenever the groups are missing."""
+    from vllm.distributed import parallel_state
+
     cfg = vllm_config(0)
-    _set_vllm_config(cfg, 1, rank=0, local_rank=0)
+    try:
+        parallel_state.get_pcp_group()
+        initialized = True
+    except AssertionError:
+        initialized = False
+    if not initialized:
+        _set_vllm_config(cfg, 1, rank=0, local_rank=0)
     if not is_workspace_manager_initialized():
         init_workspace_manager(torch.accelerator.current_accelerator())
     return cfg

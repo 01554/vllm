@@ -57,6 +57,69 @@ def physical_block_experts(
     return torch.where(valid, expert_map[safe.long()], torch.full_like(logical_ids, -1))
 
 
+_BLOCK_ROWS_KERNEL: dict[str, Any] = {}
+
+
+def _block_rows_kernel():
+    """Triton twin of physical_block_experts: one launch instead of the
+    torch chain (arange, compare, where, clamp, index, where)."""
+    if "kernel" in _BLOCK_ROWS_KERNEL:
+        return _BLOCK_ROWS_KERNEL["kernel"]
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def block_rows(
+        logical_ptr,
+        post_padded_ptr,
+        expert_map_ptr,
+        out_ptr,
+        n_blocks,
+        block,
+        num_experts,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        in_range = offs < n_blocks
+        post_padded = tl.load(post_padded_ptr)
+        used = in_range & ((offs * block) < post_padded)
+        logical = tl.load(logical_ptr + offs, mask=used, other=0)
+        safe = tl.minimum(tl.maximum(logical, 0), num_experts - 1)
+        rows = tl.load(expert_map_ptr + safe, mask=used, other=-1)
+        tl.store(out_ptr + offs, tl.where(used, rows, -1), mask=in_range)
+
+    _BLOCK_ROWS_KERNEL["kernel"] = block_rows
+    return block_rows
+
+
+def physical_block_experts_device(
+    logical_ids: torch.Tensor,
+    post_padded: torch.Tensor,
+    block: int,
+    expert_map: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """physical_block_experts as one kernel launch (CUDA); the torch version
+    is the reference elsewhere and in tests."""
+    if logical_ids.device.type != "cuda":
+        return physical_block_experts(
+            logical_ids, post_padded, block, expert_map, num_experts
+        )
+    out = torch.empty_like(logical_ids)
+    n = logical_ids.numel()
+    BLOCK = 1024
+    _block_rows_kernel()[((n + BLOCK - 1) // BLOCK,)](
+        logical_ids,
+        post_padded,
+        expert_map,
+        out,
+        n,
+        block,
+        num_experts,
+        BLOCK=BLOCK,
+    )
+    return out
+
+
 def marlin_block_size(tokens, top_k, local_experts, global_experts, input_dtype):
     """The stock fused_marlin_moe M-block choice for one expert partition."""
     estimated = math.ceil(tokens * local_experts / global_experts)
@@ -114,17 +177,38 @@ class PoolLayer:
     def apply(
         self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
     ) -> torch.Tensor:
-        self._check_routes(x, weights, ids)
+        self._check_route_shapes(x, weights, ids)
         lanes = ids.shape[0] * ids.shape[1]
         if lanes <= self.width and lanes <= self.staging_rows:
             self.decode_steps += 1
-            step(self.pool.tables, self.index, ids, self.buffers)
+            tables = self.pool.tables
+            # The step kernel validates every lane (id range before any
+            # table read, router weight finite and nonnegative) into the
+            # sticky device error; invalid lanes are planned as padding, so
+            # no table is read or written for them, and `safe_ids` carries
+            # the sanitized routes that every consumer below (align, Marlin,
+            # activation) receives: no raw id reaches them. One device
+            # assertion per call, a single launch on the `ok` flag, keeps
+            # the detection path of the previous per-layer assertion chain
+            # for full forwards, single-layer and partial executions alike.
+            step(tables, self.index, ids, self.buffers, weights)
+            torch._assert_async(
+                tables.ok,
+                "Expert pool: invalid routing (id out of range, or non-finite/"
+                "negative router weight)",
+            )
             copy_in(self.host, self.bank, self.buffers)
+            safe = self.buffers.safe_ids[:lanes].view(ids.shape)
             return self._run_marlin(
-                x, weights, ids, ((self.bank, self.buffers.step_map, self.bank_rows),)
+                x,
+                weights,
+                safe,
+                ((self.bank, self.buffers.step_map, self.bank_rows),),
+                decode=True,
             )
         # Wider batches (prefill): resident rows from the bank, the rest read
         # straight from the pinned host source through its accelerator view.
+        self._check_routes_device(weights, ids)
         self.partition_steps += 1
         return self._run_marlin(
             x,
@@ -136,7 +220,8 @@ class PoolLayer:
             ),
         )
 
-    def _check_routes(self, x, weights, ids) -> None:
+    def _check_route_shapes(self, x, weights, ids) -> None:
+        # Host-side, no kernels: shapes and dtypes only.
         if (
             x.ndim != 2
             or ids.ndim != 2
@@ -146,6 +231,10 @@ class PoolLayer:
             or ids.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError("Unexpected pool routing/input shape or dtype")
+
+    def _check_routes_device(self, weights, ids) -> None:
+        # Partition path (wide batches): the per-call device assertion.
+        # The decode path folds the same conditions into the step kernel.
         allowed = (ids >= -1) & (ids < self.num_experts)
         finite = torch.isfinite(weights) & (weights >= 0)
         torch._assert_async(
@@ -154,7 +243,7 @@ class PoolLayer:
             "finite/nonnegative",
         )
 
-    def _run_marlin(self, x, weights, ids, partitions):
+    def _run_marlin(self, x, weights, ids, partitions, decode=False):
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             _fused_marlin_moe,
             marlin_moe_intermediate_size,
@@ -187,11 +276,15 @@ class PoolLayer:
             if slots > self.num_experts:
                 # Align by logical id (absent experts already padding), then
                 # map the blocks to rows; the align op never sees a row id.
-                routed = mask_routes(ids, expert_map)
+                # On the decode path `ids` are the step's sanitized routes
+                # and every valid route is present in the step map (hit,
+                # promoted, or staged), so the mask is the identity.
+                if not decode:
+                    routed = mask_routes(ids, expert_map)
                 sorted_ids, logical_ids, post_padded = moe_align_block_size(
                     routed, block, self.num_experts, None, ignore_invalid_experts=True
                 )
-                expert_ids = physical_block_experts(
+                expert_ids = physical_block_experts_device(
                     logical_ids, post_padded, block, expert_map, self.num_experts
                 )
             else:
@@ -258,4 +351,5 @@ __all__ = [
     "marlin_block_size",
     "mask_routes",
     "physical_block_experts",
+    "physical_block_experts_device",
 ]

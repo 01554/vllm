@@ -10,6 +10,7 @@ from vllm.model_executor.layers.fused_moe.expert_pool.layer import (
     marlin_block_size,
     mask_routes,
     physical_block_experts,
+    physical_block_experts_device,
 )
 from vllm.model_executor.layers.fused_moe.expert_pool.tables import TENSORS
 
@@ -44,3 +45,38 @@ def test_copy_rows_reference_copies_every_tensor_in_order():
     for n in TENSORS:
         assert torch.equal(dst[n][2], src[n][6]) and torch.equal(dst[n][0], src[n][1])
         assert int(dst[n][1].sum()) == 0
+
+
+def test_physical_block_experts_device_falls_back_to_torch_on_cpu():
+    expert_map = torch.tensor([10, -1, 12], dtype=torch.int32)
+    logical = torch.tensor([2, 0, 7, 2], dtype=torch.int32)
+    post_padded = torch.tensor([16], dtype=torch.int32)
+    a = physical_block_experts(logical, post_padded, 8, expert_map, 3)
+    b = physical_block_experts_device(logical, post_padded, 8, expert_map, 3)
+    assert torch.equal(a, b)
+
+
+def test_physical_block_experts_kernel_matches_torch_on_cuda():
+    if not torch.cuda.is_available():
+        return
+    import random
+
+    device = torch.device("cuda")
+    rng = random.Random(11)
+    for _ in range(20):
+        E = rng.choice([8, 64, 512])
+        bank_rows = E + rng.randint(1, 3 * E)  # bank larger than the expert count
+        n_blocks = rng.randint(1, 300)
+        block = rng.choice([8, 16, 32, 64])
+        # Garbage ids (out of range, negative) beyond post_padded and inside.
+        logical = torch.randint(-5, E + 5, (n_blocks,), dtype=torch.int32)
+        post_padded = torch.tensor(
+            [rng.randint(0, n_blocks * block)], dtype=torch.int32
+        )
+        expert_map = torch.randint(0, bank_rows, (E,), dtype=torch.int32)
+        expert_map[torch.rand(E) < 0.3] = -1  # absent experts
+        ref = physical_block_experts(logical, post_padded, block, expert_map, E)
+        got = physical_block_experts_device(
+            logical.to(device), post_padded.to(device), block, expert_map.to(device), E
+        ).cpu()
+        assert torch.equal(ref, got)
